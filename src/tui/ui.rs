@@ -2,6 +2,7 @@
 //! nothing. `draw` returns how the details pane was laid out, so the app can scroll it.
 
 use super::app::{App, Focus, LogLine, Overlay, Stage};
+use super::form::FormField;
 use crate::output;
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number};
@@ -18,6 +19,9 @@ use std::collections::VecDeque;
 
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 20;
+
+const LABEL_WIDTH: usize = 14;
+const VALUE_WIDTH: usize = 26;
 
 /// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
 /// when the results are not on screen.
@@ -43,10 +47,18 @@ pub fn draw(
         Constraint::Length(3),
     ])
     .areas(area);
-    let summary = format!(
-        "{} | {} corporations | Filters: {}",
-        app.region, app.corporations, app.filters
+    let corporations = if app.corporations == 1 {
+        "corporation"
+    } else {
+        "corporations"
+    };
+    let mut summary = format!(
+        "{} | {} {} | Filters: {}",
+        app.region, app.corporations, corporations, app.filters
     );
+    if app.stale {
+        summary = format!("{} | {}", app.stage_text(), summary);
+    }
     let inner_width = usize::from(header.width.saturating_sub(2));
     frame.render_widget(
         Paragraph::new(truncate(&summary, inner_width))
@@ -59,6 +71,10 @@ pub fn draw(
             draw_log(frame, body, app);
             (0, 0)
         }
+        Overlay::Filters => {
+            draw_form(frame, body, app, sdata);
+            (0, 0)
+        }
         _ if app.report.is_some() => draw_results(frame, body, app, sdata),
         _ => {
             draw_progress(frame, body, app);
@@ -68,7 +84,7 @@ pub fn draw(
     if app.overlay == Overlay::Help {
         draw_help(frame, area);
     }
-    draw_footer(frame, footer, stats);
+    draw_footer(frame, footer, stats, app.overlay == Overlay::Filters);
     layout
 }
 
@@ -147,6 +163,166 @@ fn log_lines(log: &VecDeque<LogLine>, height: usize, scroll: usize) -> Vec<Line<
         .collect()
 }
 
+/// The filter form, shown in place of the results while it is open. Each field has a row, and the
+/// space under the rows holds the notes for the focused field.
+fn draw_form(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
+    let block = Block::bordered().title(" Filters ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = usize::from(inner.width);
+    let mut lines: Vec<Line> = FormField::ALL
+        .iter()
+        .map(|&field| form_row(app, field, sdata, width))
+        .collect();
+    let room = usize::from(inner.height).saturating_sub(lines.len());
+    lines.extend(
+        form_notes(app, sdata, width, room)
+            .into_iter()
+            .map(|(text, style)| Line::from(Span::styled(text, style))),
+    );
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The notes under the field rows: the general error, the focused field's error or else its
+/// valid values, and the matches for a name field. Notes beyond `room` are left out.
+fn form_notes(app: &App, sdata: &StaticData, width: usize, room: usize) -> Vec<(String, Style)> {
+    let red = Style::new().red();
+    let dark_gray = Style::new().dark_gray();
+    let focus = app.form.focus;
+    let error = app.form.error_for(focus);
+    let mut notes: Vec<(String, Style)> = Vec::new();
+    if let Some(error) = app.form.general_error() {
+        notes.extend(wrap_text(error, width).into_iter().map(|row| (row, red)));
+    }
+    if let Some(error) = &error {
+        notes.extend(wrap_text(error, width).into_iter().map(|row| (row, red)));
+    }
+    if let Some(matches) = suggestions(app, sdata) {
+        notes.extend(
+            wrap_text(&matches, width)
+                .into_iter()
+                .map(|row| (row, dark_gray)),
+        );
+    }
+    if error.is_none() {
+        let text = hint(focus, sdata);
+        notes.extend(
+            wrap_text(&text, width)
+                .into_iter()
+                .map(|row| (row, dark_gray)),
+        );
+    }
+    fit(notes, room, width)
+}
+
+/// Keeps the first `room` notes. When some are cut, the last one kept ends with an ellipsis.
+fn fit(mut notes: Vec<(String, Style)>, room: usize, width: usize) -> Vec<(String, Style)> {
+    if notes.len() > room {
+        notes.truncate(room);
+        if let Some((text, _)) = notes.last_mut() {
+            *text = truncate(&format!("{}…", text), width);
+        }
+    }
+    notes
+}
+
+fn form_row(app: &App, field: FormField, sdata: &StaticData, width: usize) -> Line<'static> {
+    let focused = app.form.focus == field;
+    let label_style = if focused {
+        Style::new().bold().yellow()
+    } else {
+        Style::new()
+    };
+    let value = if field == FormField::Expire {
+        if app.form.expire {
+            "[x] yes".to_string()
+        } else {
+            "[ ] no".to_string()
+        }
+    } else if focused {
+        let mut text = tail(app.form.text(field), VALUE_WIDTH - 1);
+        text.push('_');
+        text
+    } else {
+        truncate(app.form.text(field), VALUE_WIDTH - 1)
+    };
+    let detail_width = width.saturating_sub(LABEL_WIDTH + VALUE_WIDTH + 2);
+    let (detail, style) = match app.form.error_for(field) {
+        Some(error) => (error, Style::new().red()),
+        None => (hint(field, sdata), Style::new().dark_gray()),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{:<width$}", field.label(), width = LABEL_WIDTH),
+            label_style,
+        ),
+        Span::raw(format!("{:<width$}", value, width = VALUE_WIDTH)),
+        Span::raw("  "),
+        Span::styled(truncate(&detail, detail_width), style),
+    ])
+}
+
+/// The valid values of a field, shown beside it when it has no error.
+fn hint(field: FormField, sdata: &StaticData) -> String {
+    match field {
+        FormField::Corporations => "IDs or names, comma-separated. Blank for all.".to_string(),
+        FormField::Region => "ID or name. Blank for The Forge.".to_string(),
+        FormField::Security => {
+            "+0.5 at least, -0.5 at most, =0.5 exactly. Blank for any.".to_string()
+        }
+        FormField::AgentLevel => "1 to 5. Blank for any.".to_string(),
+        FormField::Division => format!(
+            "One of: {}. Blank for any.",
+            sdata.division_names().join(", ")
+        ),
+        FormField::Type => format!(
+            "One of: {}. Blank for any.",
+            sdata.agent_type_names().join(", ")
+        ),
+        FormField::Faction => format!(
+            "One of: {}. Blank for any.",
+            sdata.faction_names().join(", ")
+        ),
+        FormField::System => "Name or ID. Blank for all systems.".to_string(),
+        FormField::Depth => "Offers per group, 1 or more. Blank for 10.".to_string(),
+        FormField::Expire => {
+            "Space toggles. Ignore cached responses and call the API again.".to_string()
+        }
+    }
+}
+
+/// Up to five names that contain what is typed into the focused name field. None for the other
+/// fields, and while a name field is empty.
+fn suggestions(app: &App, sdata: &StaticData) -> Option<String> {
+    let query = app.form.name_query()?.to_lowercase();
+    let mut names: Vec<String> = match app.form.focus {
+        FormField::Corporations => sdata
+            .corporation_ids()
+            .map(|id| corp_name(sdata, id))
+            .filter(|name| name.to_lowercase().contains(&query))
+            .collect(),
+        FormField::Region => sdata
+            .region_names()
+            .filter(|name| name.to_lowercase().contains(&query))
+            .cloned()
+            .collect(),
+        FormField::System => sdata
+            .system_names()
+            .filter(|name| name.to_lowercase().contains(&query))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    };
+    names.sort();
+    names.dedup();
+    names.truncate(5);
+    Some(if names.is_empty() {
+        "No matches".to_string()
+    } else {
+        format!("Matches: {}", names.join(", "))
+    })
+}
+
 fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> (usize, usize) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(area);
@@ -157,19 +333,25 @@ fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) ->
     draw_details(frame, details, app, sdata)
 }
 
-fn pane_block(title: &str, focused: bool) -> Block<'static> {
+/// A bordered pane. Its title says so when the results it shows are stale.
+fn pane_block(name: &str, focused: bool, app: &App) -> Block<'static> {
+    let title = if app.stale {
+        format!(" {} (stale) ", name)
+    } else {
+        format!(" {} ", name)
+    };
     let color = if focused {
         Color::Yellow
     } else {
         Color::DarkGray
     };
     Block::bordered()
-        .title(title.to_string())
+        .title(title)
         .border_style(Style::new().fg(color))
 }
 
 fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
-    let block = pane_block(" Groups ", app.focus == Focus::Groups);
+    let block = pane_block("Groups", app.focus == Focus::Groups, app);
     let groups = app.groups();
     if groups.is_empty() {
         frame.render_widget(
@@ -223,6 +405,16 @@ fn truncate(text: &str, width: usize) -> String {
     format!("{}…", kept)
 }
 
+/// The last `width` characters of `text`, with an ellipsis when the start is cut.
+fn tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().skip(count - width.saturating_sub(1)).collect();
+    format!("…{}", kept)
+}
+
 fn corp_name(sdata: &StaticData, corp_id: i32) -> String {
     sdata
         .corporation_name(corp_id)
@@ -238,7 +430,7 @@ fn item_name(sdata: &StaticData, type_id: i32) -> String {
 }
 
 fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
-    let block = pane_block(" Offers ", app.focus == Focus::Offers);
+    let block = pane_block("Offers", app.focus == Focus::Offers, app);
     let Some(group) = app.selected_group() else {
         frame.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -289,7 +481,7 @@ fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData) -> Row<'stat
 
 /// Draws the details pane, wrapped to its width, and returns (rows, rows on screen).
 fn draw_details(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> (usize, usize) {
-    let block = pane_block(" Details ", app.focus == Focus::Details);
+    let block = pane_block("Details", app.focus == Focus::Details, app);
     let width = usize::from(area.width.saturating_sub(2)).max(1);
     let visible = usize::from(area.height.saturating_sub(2));
     let lines: Vec<Line<'static>> = detail_entries(app, sdata)
@@ -305,7 +497,7 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) ->
 
 /// Splits `text` into rows of at most `width` characters, breaking at spaces where it can. A
 /// word longer than a row is cut into pieces.
-fn wrap(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -340,7 +532,13 @@ fn wrap(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     if !current.is_empty() || rows.is_empty() {
         rows.push(current);
     }
-    rows.into_iter()
+    rows
+}
+
+/// The rows of `wrap_text`, each styled.
+fn wrap(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrap_text(text, width)
+        .into_iter()
         .map(|row| Line::from(Span::styled(row, style)))
         .collect()
 }
@@ -438,6 +636,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "move the selection, or scroll the details",
         ),
         ("PgUp, PgDn", "move a page at a time"),
+        ("f", "edit the filters; Enter runs them, Esc cancels"),
         ("l", "show or hide the full log"),
         ("?", "show or hide this help"),
         ("Esc", "close the log or this help"),
@@ -458,7 +657,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     );
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats) {
+fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, in_form: bool) {
+    let keys = if in_form {
+        "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
+    } else {
+        "Tab panes  Up/Down move  PgUp/PgDn page  f filters  l log  ? help  q quit"
+    };
     let lines = vec![
         Line::from(format!(
             "In-flight: {} | Waiting: {} | Rate limit: {} | Errors: {}",
@@ -471,7 +675,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats) {
             "Cache: {} hits, {} misses, {} writes",
             stats.cache_hits, stats.cache_misses, stats.cache_writes
         )),
-        Line::from("Tab panes  Up/Down move  PgUp/PgDn page  l log  ? help  q quit").dark_gray(),
+        Line::from(keys).dark_gray(),
     ];
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -500,5 +704,20 @@ mod tests {
     fn truncate_ends_a_cut_with_an_ellipsis() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    #[test]
+    fn tail_keeps_the_end_of_long_text() {
+        assert_eq!(tail("abcdef", 4), "…def");
+        assert_eq!(tail("abc", 4), "abc");
+    }
+
+    #[test]
+    fn notes_past_the_room_are_cut_with_an_ellipsis() {
+        let note = |text: &str| (text.to_string(), Style::new());
+        let kept = fit(vec![note("one"), note("two"), note("three")], 2, 10);
+        assert_eq!(kept, vec![note("one"), note("two…")]);
+        assert_eq!(fit(vec![note("one")], 2, 10), vec![note("one")]);
+        assert!(fit(vec![note("one")], 0, 10).is_empty());
     }
 }

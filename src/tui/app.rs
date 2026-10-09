@@ -1,9 +1,11 @@
-//! The state of the `--tui` view. Run events and key presses go in, and the new state comes
-//! out. Nothing here touches the terminal, so these rules can be tested directly.
+//! The state of the `--tui` view. Run events, key presses, and applied filters go in, and the
+//! new state comes out. Nothing here touches the terminal, so these rules can be tested
+//! directly.
 
+use super::form::FilterForm;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eve_lpstore::OfferResult;
-use eve_lpstore::report::{Event, Group, Report};
+use eve_lpstore::report::{Event, Group, LpStoreOptions, Report};
 use eve_lpstore::static_data::AgentFilter;
 use std::collections::VecDeque;
 
@@ -47,12 +49,24 @@ pub enum Overlay {
     None,
     Log,
     Help,
+    Filters,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Continue,
     Quit,
+    Apply,
+}
+
+/// What a run was started with, as the header and the detail pane show it.
+#[derive(Debug, Clone)]
+pub struct RunInfo {
+    pub region: String,
+    pub corporations: usize,
+    pub filters: String,
+    pub depth: usize,
+    pub agent_filter: AgentFilter,
 }
 
 pub struct App {
@@ -61,6 +75,11 @@ pub struct App {
     pub filters: String,
     pub depth: usize,
     pub agent_filter: AgentFilter,
+    /// The options the current run was started with.
+    pub applied: LpStoreOptions,
+    pub form: FilterForm,
+    /// Whether the report on screen comes from an earlier run than the one in progress.
+    pub stale: bool,
     pub stage: Stage,
     pub log: VecDeque<LogLine>,
     pub report: Option<Report>,
@@ -75,19 +94,17 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
-        region: String,
-        corporations: usize,
-        filters: String,
-        depth: usize,
-        agent_filter: AgentFilter,
-    ) -> Self {
+    pub fn new(info: RunInfo, applied: LpStoreOptions) -> Self {
+        let form = FilterForm::from_options(&applied);
         Self {
-            region,
-            corporations,
-            filters,
-            depth,
-            agent_filter,
+            region: info.region,
+            corporations: info.corporations,
+            filters: info.filters,
+            depth: info.depth,
+            agent_filter: info.agent_filter,
+            applied,
+            form,
+            stale: false,
             stage: Stage::Starting,
             log: VecDeque::new(),
             report: None,
@@ -149,6 +166,7 @@ impl App {
         self.stage = Stage::Finished {
             groups: report.groups.len(),
         };
+        self.stale = false;
         self.report = Some(report);
         self.focus = Focus::Groups;
         self.group = 0;
@@ -158,6 +176,46 @@ impl App {
 
     pub fn fail(&mut self) {
         self.stage = Stage::Failed;
+    }
+
+    /// Switches the view to a new run. Earlier results stay on screen, marked stale, until
+    /// this run finishes.
+    pub fn start_run(&mut self, info: RunInfo) {
+        self.region = info.region;
+        self.corporations = info.corporations;
+        self.filters = info.filters;
+        self.agent_filter = info.agent_filter;
+        self.apply_depth(info.depth);
+        self.stale = self.report.is_some();
+        self.stage = Stage::Starting;
+        self.close_form();
+        let text = format!("Started a run with {}", self.filters);
+        self.push_log(LogLine {
+            text,
+            is_error: false,
+        });
+    }
+
+    /// Changes how many offers each group lists. The run itself is unchanged.
+    pub fn apply_depth(&mut self, depth: usize) {
+        self.depth = depth;
+        let max = self.offer_count().saturating_sub(1);
+        self.offer = self.offer.min(max);
+    }
+
+    pub fn set_applied(&mut self, applied: LpStoreOptions) {
+        self.applied = applied;
+    }
+
+    pub fn open_form(&mut self) {
+        self.form = FilterForm::from_options(&self.applied);
+        self.overlay = Overlay::Filters;
+    }
+
+    pub fn close_form(&mut self) {
+        if self.overlay == Overlay::Filters {
+            self.overlay = Overlay::None;
+        }
     }
 
     pub fn push_log(&mut self, line: LogLine) {
@@ -229,6 +287,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::Continue;
         }
+        if self.overlay == Overlay::Filters {
+            return self.on_form_key(key);
+        }
         if is_quit(&key) {
             return Action::Quit;
         }
@@ -236,6 +297,7 @@ impl App {
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Char('?') => self.toggle(Overlay::Help),
             KeyCode::Char('l') => self.toggle(Overlay::Log),
+            KeyCode::Char('f') => self.open_form(),
             _ if self.overlay == Overlay::Help => {}
             KeyCode::Tab => {
                 if self.overlay == Overlay::None && self.report.is_some() {
@@ -246,6 +308,28 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
             KeyCode::PageUp => self.navigate(-(PAGE as isize)),
             KeyCode::PageDown => self.navigate(PAGE as isize),
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// While the form is open, keys go to it, so `q` types a letter. Only Ctrl+C quits.
+    fn on_form_key(&mut self, key: KeyEvent) -> Action {
+        if is_ctrl_c(&key) {
+            return Action::Quit;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.close_form(),
+            KeyCode::Enter => return Action::Apply,
+            KeyCode::Tab | KeyCode::Down => self.form.next_field(),
+            KeyCode::BackTab | KeyCode::Up => self.form.previous_field(),
+            KeyCode::Backspace => self.form.backspace(),
+            KeyCode::Char('u') if ctrl => self.form.clear_focused(),
+            KeyCode::Char(c) if plain => self.form.type_char(c),
             _ => {}
         }
         Action::Continue
@@ -300,13 +384,16 @@ fn shift(value: usize, delta: isize, max: usize) -> usize {
     (value as isize + delta).clamp(0, max as isize) as usize
 }
 
-/// Whether a key press asks to quit: `q`, or Ctrl+C, which raw mode delivers as a key event.
+/// Whether a key press quits outside the form: `q`, or Ctrl+C.
 fn is_quit(key: &KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('q') => key.modifiers.is_empty(),
-        KeyCode::Char('c') => key.modifiers.contains(KeyModifiers::CONTROL),
-        _ => false,
+        _ => is_ctrl_c(key),
     }
+}
+
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 #[cfg(test)]
@@ -319,6 +406,24 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn info(depth: usize) -> RunInfo {
+        RunInfo {
+            region: "The Forge".to_string(),
+            corporations: 3,
+            filters: "none".to_string(),
+            depth,
+            agent_filter: AgentFilter::default(),
+        }
+    }
+
+    fn new_app(depth: usize) -> App {
+        App::new(info(depth), LpStoreOptions::default())
     }
 
     fn offer(isk_per_lp: f64) -> OfferResult {
@@ -356,13 +461,7 @@ mod tests {
     }
 
     fn app_with(groups: Vec<Group>, depth: usize) -> App {
-        let mut app = App::new(
-            "The Forge".to_string(),
-            3,
-            "none".to_string(),
-            depth,
-            AgentFilter::default(),
-        );
+        let mut app = new_app(depth);
         app.finish(Report { groups });
         app
     }
@@ -394,13 +493,7 @@ mod tests {
 
     #[test]
     fn progress_events_move_the_stage_forward() {
-        let mut app = App::new(
-            "The Forge".to_string(),
-            3,
-            "none".to_string(),
-            10,
-            AgentFilter::default(),
-        );
+        let mut app = new_app(10);
         assert_eq!(app.stage, Stage::Starting);
         app.on_event(&Event::FetchStarted { corporations: 3 }, None);
         assert_eq!(app.stage, Stage::Fetching { done: 0, total: 3 });
@@ -413,13 +506,7 @@ mod tests {
 
     #[test]
     fn a_failed_run_says_so() {
-        let mut app = App::new(
-            "The Forge".to_string(),
-            3,
-            "none".to_string(),
-            10,
-            AgentFilter::default(),
-        );
+        let mut app = new_app(10);
         app.fail();
         assert_eq!(app.stage, Stage::Failed);
         assert_eq!(app.stage_text(), "The run stopped unexpectedly");
@@ -427,13 +514,7 @@ mod tests {
 
     #[test]
     fn log_keeps_only_the_newest_lines() {
-        let mut app = App::new(
-            "The Forge".to_string(),
-            3,
-            "none".to_string(),
-            10,
-            AgentFilter::default(),
-        );
+        let mut app = new_app(10);
         for i in 0..LOG_LIMIT + 10 {
             app.push_log(LogLine {
                 text: format!("line {}", i),
@@ -506,13 +587,7 @@ mod tests {
 
     #[test]
     fn log_view_scrolls_back_through_the_log() {
-        let mut app = App::new(
-            "The Forge".to_string(),
-            3,
-            "none".to_string(),
-            10,
-            AgentFilter::default(),
-        );
+        let mut app = new_app(10);
         for i in 0..5 {
             app.push_log(LogLine {
                 text: format!("line {}", i),
@@ -543,17 +618,72 @@ mod tests {
 
     #[test]
     fn tab_only_switches_panes_in_the_results() {
-        let mut app = App::new(
-            "The Forge".to_string(),
-            3,
-            "none".to_string(),
-            10,
-            AgentFilter::default(),
-        );
+        let mut app = new_app(10);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Groups);
         app.finish(Report { groups: Vec::new() });
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Offers);
+    }
+
+    #[test]
+    fn q_is_a_letter_in_the_form() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(app.overlay, Overlay::Filters);
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Continue);
+        assert_eq!(app.form.corporations, "q");
+        assert_eq!(app.on_key(ctrl('c')), Action::Quit);
+    }
+
+    #[test]
+    fn escape_closes_the_form_and_discards_the_edits() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_key(press(KeyCode::Char('x')));
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(app.form.corporations, "");
+    }
+
+    #[test]
+    fn enter_asks_for_the_form_to_be_applied() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Apply);
+    }
+
+    #[test]
+    fn f_opens_the_form_from_any_view() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('l')));
+        app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(app.overlay, Overlay::Filters);
+    }
+
+    #[test]
+    fn a_new_run_keeps_the_old_results_stale_until_it_finishes() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.start_run(info(10));
+        assert!(app.stale);
+        assert_eq!(app.stage, Stage::Starting);
+        assert_eq!(app.groups().len(), 1, "the old results stay on screen");
+        app.finish(Report {
+            groups: vec![group(2, &[3.0])],
+        });
+        assert!(!app.stale);
+        assert_eq!(app.groups()[0].corp_ids, vec![2]);
+    }
+
+    #[test]
+    fn a_depth_change_keeps_the_offer_in_range() {
+        let mut app = app_with(vec![group(1, &[5.0, 4.0, 3.0, 2.0])], 4);
+        app.on_key(press(KeyCode::Tab));
+        app.on_key(press(KeyCode::PageDown));
+        assert_eq!(app.offer, 3);
+        app.apply_depth(2);
+        assert_eq!(app.offer, 1);
+        assert_eq!(app.offer_count(), 2);
     }
 }

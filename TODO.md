@@ -46,13 +46,13 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 4: Filter editing
 
-- [ ] Filter form (`f`): text fields for corporations, region, security, agent level, division, type, faction, system, and depth, plus an `--expire` toggle. Each field shows its valid values. Tab and Shift+Tab move between fields, Enter applies, and Esc cancels.
-- [ ] While the form is open, keys go to the form, so typing `q` enters a letter.
-- [ ] Apply validates every field first. If any field fails, its error shows inline and nothing runs.
-- [ ] Apply on success cancels the running pipeline and starts a new run with a new run id. Results from the previous run stay visible, marked stale, until the new run finishes.
-- [ ] Each run builds its own `EsiClient`, because the default cache offset depends on the number of corps. The status counters therefore reset for each run.
-- [ ] Depth changes re-render only. The pipeline uses depth only when printing.
-- [ ] Name suggestions for corporations, systems, and regions. Systems need a new `StaticData` accessor, since system names aren't exposed yet. This can be cut from v1 to keep the first version smaller.
+- [x] Filter form (`f`): text fields for corporations, region, security, agent level, division, type, faction, system, and depth, plus an `--expire` toggle. Each field shows its valid values. Tab and Shift+Tab move between fields, Enter applies, and Esc cancels.
+- [x] While the form is open, keys go to the form, so typing `q` enters a letter.
+- [x] Apply validates every field first. If any field fails, its error shows inline and nothing runs.
+- [x] Apply on success cancels the running pipeline and starts a new run with a new run id. Results from the previous run stay visible, marked stale, until the new run finishes.
+- [x] Each run builds its own `EsiClient`, because the default cache offset depends on the number of corps. The status counters therefore reset for each run.
+- [x] Depth changes re-render only. The pipeline uses depth only when printing.
+- [x] Name suggestions for corporations, systems, and regions. Systems need a new `StaticData` accessor, since system names aren't exposed yet. This can be cut from v1 to keep the first version smaller.
 
 #### Phase 5: Tests and docs
 

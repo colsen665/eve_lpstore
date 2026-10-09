@@ -55,7 +55,7 @@ pub struct OptionError {
 
 /// The options for `--lpstores`, as typed. Every value is text, so the command line and
 /// the TUI form go through the same checks.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LpStoreOptions {
     /// Corporations as a comma-separated list of IDs or names. Without it, every corporation is used.
     pub lpstore: Option<String>,

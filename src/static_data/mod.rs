@@ -292,9 +292,9 @@ impl StaticData {
         self.regions.get(&name.to_lowercase()).copied()
     }
 
-    /// Get all known region names.
+    /// Get all known region names, with their proper capitalization.
     pub fn region_names(&self) -> impl Iterator<Item = &String> {
-        self.regions.keys()
+        self.region_names_by_id.values()
     }
 
     /// Look up a region name by region ID.
@@ -319,6 +319,11 @@ impl StaticData {
 
     pub fn corporation_ids(&self) -> impl Iterator<Item = i32> {
         self.corporations.values().copied()
+    }
+
+    /// Get all known solar system names.
+    pub fn system_names(&self) -> impl Iterator<Item = &String> {
+        self.systems.values().map(|(name, _)| name)
     }
 
     /// Look up a type name by type ID.
