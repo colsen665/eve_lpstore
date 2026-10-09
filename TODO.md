@@ -12,16 +12,16 @@ Assumptions:
 
 #### Phase 1: Separate the pipeline from printing
 
-CLI output stays the same, except that it now prints every filter error. This phase can ship on its own.
+CLI output stays the same, except that it prints every filter error, and lists corporations in ID order within each group when `--lpstore` is not given. This phase can ship on its own.
 
-- [ ] Before changing code, save a baseline `--lpstores` output. Set `--cache-minutes` high enough that both runs read the same cached responses.
-- [ ] Move filter parsing and validation into the library. Put the options in one struct and collect every error with its field name.
-- [ ] Move the pipeline into `src/report/`. It returns errors instead of calling `std::process::exit`, and it returns a `Report` with groups sorted best first.
-  - [ ] Break ties by the group's first corp ID. Today, ties depend on task completion order, so the output can change between runs.
-- [ ] Emit progress events on a `tokio::sync::mpsc` channel. Each event carries a run id.
-- [ ] Send the 7 cache `println!` calls in `src/esi/mod.rs` through a log sink set on `EsiClientBuilder`.
-- [ ] Move `format_number`, `format_isk`, and `group_digits` into `src/format.rs`.
-- [ ] Make the CLI print from `Report` and progress events. It reverses the group order to match today's output and reprints the same progress lines. Diff against the baseline, ignoring timing numbers.
+- [x] Before changing code, save a baseline `--lpstores` output. Set `--cache-minutes` high enough that both runs read the same cached responses.
+- [x] Move filter parsing and validation into the library. Put the options in one struct and collect every error with its field name.
+- [x] Move the pipeline into `src/report/`. It returns errors instead of calling `std::process::exit`, and it returns a `Report` with groups sorted best first.
+  - [x] Break ties by the group's first corp ID. Today, ties depend on task completion order, so the output can change between runs.
+- [x] Emit progress events on a `tokio::sync::mpsc` channel. Each event carries a run id.
+- [x] Send the 7 cache `println!` calls in `src/esi/mod.rs` through a log sink set on `EsiClientBuilder`.
+- [x] Move `format_number`, `format_isk`, and `group_digits` into `src/format.rs`.
+- [x] Make the CLI print from `Report` and progress events. It reverses the group order to match today's output and reprints the same progress lines. Diff against the baseline, ignoring timing numbers.
 
 #### Phase 2: Dependencies, `--tui`, and terminal setup
 

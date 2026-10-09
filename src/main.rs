@@ -1,8 +1,9 @@
-use eve_lpstore::esi::loyalty::LoyaltyOffer;
-use std::sync::Arc;
+mod output;
+
 use eve_lpstore::esi::ClientStats;
-use eve_lpstore::static_data::{AgentFilter, SecurityFilter};
-use eve_lpstore::{EsiClient, LpStore, OfferError, OfferResult, StaticData};
+use eve_lpstore::report::{self, LpStoreOptions, OptionError};
+use eve_lpstore::{EsiClient, StaticData};
+use std::sync::Arc;
 
 fn print_status(s: &ClientStats) {
     let now = chrono::Local::now().format("%H:%M:%S");
@@ -119,182 +120,87 @@ async fn main() {
         i += 1;
     }
 
+    let value = |flag: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     let status = args.iter().any(|a| a == "--status");
     let expire = args.iter().any(|a| a == "--expire");
     let clear_cache = args.iter().any(|a| a == "--clear-cache");
     let verbose = args.iter().any(|a| a == "--verbose");
-    let agent_division: Option<String> = args
-        .iter()
-        .position(|a| a == "--agent-division")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let system: Option<String> = args
-        .iter()
-        .position(|a| a == "--system")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let faction: Option<String> = args
-        .iter()
-        .position(|a| a == "--faction")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let agent_type: Option<String> = args
-        .iter()
-        .position(|a| a == "--agent-type")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let agent_level: Option<i32> = match args
-        .iter()
-        .position(|a| a == "--agent-level")
-        .and_then(|i| args.get(i + 1))
-    {
-        Some(value) => match value.parse::<i32>() {
-            Ok(level) if (1..=5).contains(&level) => Some(level),
-            _ => {
-                eprintln!(
-                    "Invalid --agent-level value '{}': expected a whole number from 1 to 5",
-                    value
-                );
-                std::process::exit(1);
-            }
-        },
-        None => None,
+    let options = LpStoreOptions {
+        lpstore: value("--lpstore"),
+        region: value("--region"),
+        security: value("--security"),
+        agent_level: value("--agent-level"),
+        agent_division: value("--agent-division"),
+        agent_type: value("--agent-type"),
+        faction: value("--faction"),
+        system: value("--system"),
+        cache_minutes: value("--cache-minutes"),
+        concurrency: value("--concurrency"),
+        max_inflight: value("--max-inflight"),
+        depth: value("--depth"),
+        expire,
+        verbose,
     };
-    let security_filter: Option<SecurityFilter> = match args
-        .iter()
-        .position(|a| a == "--security")
-        .and_then(|i| args.get(i + 1))
-    {
-        Some(value) => match SecurityFilter::parse(value) {
-            Ok(filter) => Some(filter),
-            Err(e) => {
-                eprintln!("Invalid --security value '{}': {}", value, e);
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-    let lpstore: Option<String> = args
-        .iter()
-        .position(|a| a == "--lpstore")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let region: Option<String> = args
-        .iter()
-        .position(|a| a == "--region")
-        .and_then(|i| args.get(i + 1))
-        .cloned();
-    let cache_minutes: Option<u64> = match args
-        .iter()
-        .position(|a| a == "--cache-minutes")
-        .and_then(|i| args.get(i + 1))
-    {
-        Some(value) => match value.parse() {
-            Ok(minutes) => Some(minutes),
-            Err(_) => {
-                eprintln!("Invalid --cache-minutes value '{}': expected a whole number", value);
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-    let cache_offset = std::time::Duration::from_secs(cache_minutes.unwrap_or(0) * 60);
-    let concurrency: usize = match args
-        .iter()
-        .position(|a| a == "--concurrency")
-        .and_then(|i| args.get(i + 1))
-    {
-        Some(value) => match value.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                eprintln!(
-                    "Invalid --concurrency value '{}': expected a whole number of at least 1",
-                    value
-                );
-                std::process::exit(1);
-            }
-        },
-        None => 2 * tokio::runtime::Handle::current().metrics().num_workers(),
-    };
-    let max_inflight: usize = match args
-        .iter()
-        .position(|a| a == "--max-inflight")
-        .and_then(|i| args.get(i + 1))
-    {
-        Some(value) => match value.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                eprintln!(
-                    "Invalid --max-inflight value '{}': expected a whole number of at least 1",
-                    value
-                );
-                std::process::exit(1);
-            }
-        },
-        None => 4,
-    };
-
-    let depth: usize = match args
-        .iter()
-        .position(|a| a == "--depth")
-        .and_then(|i| args.get(i + 1))
-    {
-        Some(value) => match value.parse::<usize>() {
-            Ok(n) if n >= 1 => n,
-            _ => {
-                eprintln!("Invalid --depth value '{}': expected a whole number of at least 1", value);
-                std::process::exit(1);
-            }
-        },
-        None => 10,
-    };
-
-    // Handle --clear-cache
-    if clear_cache {
-        let cache_dir = "cache";
-        if std::path::Path::new(cache_dir).exists() {
-            match std::fs::remove_dir_all(cache_dir) {
-                Ok(_) => println!("Cache directory '{}' cleared", cache_dir),
-                Err(e) => eprintln!("Failed to clear cache: {}", e),
-            }
-        } else {
-            println!("Cache directory '{}' does not exist", cache_dir);
-        }
-    }
-
     if args.iter().any(|a| a == "--example") {
-        if let Err(e) = run_example(status, expire, verbose, region.as_deref(), cache_offset, max_inflight).await {
+        let parsed = match options.parse() {
+            Ok(parsed) => parsed,
+            Err(errors) => exit_with_errors(errors),
+        };
+        if clear_cache {
+            clear_cache_dir();
+        }
+        let cache_offset = std::time::Duration::from_secs(parsed.cache_minutes.unwrap_or(0) * 60);
+        if let Err(e) = run_example(
+            status,
+            expire,
+            verbose,
+            options.region.as_deref(),
+            cache_offset,
+            parsed.max_inflight,
+        )
+        .await
+        {
             eprintln!("Example failed: {}", e);
             std::process::exit(1);
         }
     } else if args.iter().any(|a| a == "--lpstores") {
-        if let Err(e) = run_lpstores(
-            status,
-            expire,
-            verbose,
-            lpstore.as_deref(),
-            region.as_deref(),
-            cache_minutes,
-            concurrency,
-            max_inflight,
-            security_filter,
-            agent_level,
-            agent_division,
-            agent_type,
-            faction,
-            depth,
-            system,
-        )
-        .await
-        {
-            eprintln!("Expenses example failed: {}", e);
-            std::process::exit(1);
+        run_lpstores(status, options, clear_cache).await;
+    } else {
+        if let Err(errors) = options.parse() {
+            exit_with_errors(errors);
         }
-    } else if !clear_cache {
-        println!(
-            "Usage: {} [--example|--lpstores] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <op><level>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
-            args[0]
-        );
+        if clear_cache {
+            clear_cache_dir();
+        } else {
+            println!(
+                "Usage: {} [--example|--lpstores] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <op><level>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
+                args[0]
+            );
+        }
+    }
+}
+
+fn exit_with_errors(errors: Vec<OptionError>) -> ! {
+    for error in errors {
+        eprintln!("{}", error.message);
+    }
+    std::process::exit(1);
+}
+
+fn clear_cache_dir() {
+    let cache_dir = "cache";
+    if std::path::Path::new(cache_dir).exists() {
+        match std::fs::remove_dir_all(cache_dir) {
+            Ok(_) => println!("Cache directory '{}' cleared", cache_dir),
+            Err(e) => eprintln!("Failed to clear cache: {}", e),
+        }
+    } else {
+        println!("Cache directory '{}' does not exist", cache_dir);
     }
 }
 
@@ -365,6 +271,7 @@ async fn run_example(
         .verbose(verbose)
         .cache_expiry_offset(cache_offset)
         .max_inflight(max_inflight)
+        .log(|message| println!("{}", message))
         .build();
 
     // Spawn status monitoring task if --status is set
@@ -406,58 +313,7 @@ async fn run_example(
     Ok(())
 }
 
-/// Insert thousands separators into a string of digits.
-fn group_digits(digits: &str) -> String {
-    let mut grouped = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(c);
-    }
-    grouped
-}
-
-/// Format a number with thousands separators and the given number of decimals.
-fn format_number(value: f64, decimals: usize) -> String {
-    let text = format!("{:.*}", decimals, value.abs());
-    let sign = if value < 0.0 { "-" } else { "" };
-    match text.split_once('.') {
-        Some((int_part, frac_part)) => format!("{}{}.{}", sign, group_digits(int_part), frac_part),
-        None => format!("{}{}", sign, group_digits(&text)),
-    }
-}
-
-/// Format an ISK amount, shown in millions or billions when large enough.
-fn format_isk(value: f64) -> String {
-    let magnitude = value.abs();
-    if magnitude >= 1e9 {
-        format!("{:.2} billion ISK", value / 1e9)
-    } else if magnitude >= 1e6 {
-        format!("{:.2} million ISK", value / 1e6)
-    } else {
-        format!("{} ISK", format_number(value, 2))
-    }
-}
-
-async fn run_lpstores(
-    status: bool,
-    expire: bool,
-    verbose: bool,
-    lpstore: Option<&str>,
-    region: Option<&str>,
-    cache_minutes: Option<u64>,
-    concurrency: usize,
-    max_inflight: usize,
-    security_filter: Option<SecurityFilter>,
-    agent_level: Option<i32>,
-    agent_division: Option<String>,
-    agent_type: Option<String>,
-    faction: Option<String>,
-    depth: usize,
-    system: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Load static data for corporation and type names
+async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool) {
     let sdata = match StaticData::load(false).await {
         Ok(data) => data,
         Err(e) => {
@@ -465,371 +321,27 @@ async fn run_lpstores(
             std::process::exit(1);
         }
     };
-
-    // Resolve the corporations to process: the comma-separated --lpstore list, or all of them.
-    // Every entry is resolved before any offers are fetched, so an unknown name exits early.
-    let mut corp_ids: Vec<i32> = match lpstore {
-        Some(val) => val
-            .split(',')
-            .map(|entry| entry.trim())
-            .filter(|entry| !entry.is_empty())
-            .map(|entry| match entry.parse::<i32>() {
-                Ok(id) => id,
-                Err(_) => match sdata.corporation_id(entry) {
-                    Some(id) => id,
-                    None => {
-                        eprintln!("Corporation '{}' not found", entry);
-                        std::process::exit(1);
-                    }
-                },
-            })
-            .collect(),
-        None => sdata.corporation_ids().collect(),
+    let resolved = match options.resolve(&sdata) {
+        Ok(resolved) => resolved,
+        Err(errors) => exit_with_errors(errors),
     };
-    // Drop corporations without a matching agent before any offers are fetched
-    let division_id = match agent_division.as_deref() {
-        Some(name) => match sdata.division_id(name) {
-            Some(id) => Some(id),
-            None => {
-                eprintln!(
-                    "Unknown --agent-division '{}'. Valid divisions: {}",
-                    name,
-                    sdata.division_names().join(", ")
-                );
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-    let agent_type_id = match agent_type.as_deref() {
-        Some(name) => match sdata.agent_type_id(name) {
-            Some(id) => Some(id),
-            None => {
-                eprintln!(
-                    "Unknown --agent-type '{}'. Valid types: {}",
-                    name,
-                    sdata.agent_type_names().join(", ")
-                );
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-    let agent_filter = AgentFilter {
-        security: security_filter,
-        level: agent_level,
-        division_id,
-        agent_type_id,
-    };
-    let faction_id = match faction.as_deref() {
-        Some(name) => match sdata.faction_id(name) {
-            Some(id) => Some(id),
-            None => {
-                eprintln!(
-                    "Unknown --faction '{}'. Valid factions: {}",
-                    name,
-                    sdata.faction_names().join(", ")
-                );
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-    let agent_filtering = security_filter.is_some()
-        || agent_level.is_some()
-        || division_id.is_some()
-        || agent_type_id.is_some();
-    if agent_filtering || faction_id.is_some() {
-        let before = corp_ids.len();
-        corp_ids.retain(|&id| {
-            faction_id.map_or(true, |f| sdata.corporation_in_faction(id, f))
-                && (!agent_filtering || sdata.corporation_passes(id, &agent_filter))
-        });
-        println!(
-            "Filtered to {} corporations by agent, security, and faction filters ({} removed)",
-            corp_ids.len(),
-            before - corp_ids.len()
-        );
+    if clear_cache {
+        clear_cache_dir();
     }
+    output::print_resolution(&resolved);
 
-    let multiple = corp_ids.len() > 1;
-
-    // Without --cache-minutes, --lpstores extends cache reuse by one minute per corporation
-    let cache_offset = std::time::Duration::from_secs(
-        cache_minutes.unwrap_or(corp_ids.len() as u64) * 60,
-    );
-    let esi = Arc::new(
-        EsiClient::builder()
-            .cache_dir("cache")
-            .expire(expire)
-            .verbose(verbose)
-            .cache_expiry_offset(cache_offset)
-            .max_inflight(max_inflight)
-            .build(),
-    );
-
-    // Resolve the region from --region, or default to The Forge
-    let region_id = match region {
-        Some(val) => match val.parse::<i32>() {
-            Ok(id) => id,
-            Err(_) => match sdata.region_id(val) {
-                Some(id) => id,
-                None => {
-                    eprintln!("Region '{}' not found", val);
-                    std::process::exit(1);
-                }
-            },
-        },
-        None => 10000002,
-    };
-    let region_label = match sdata.region_name(region_id) {
-        Some(name) => format!("{} ({})", name, region_id),
-        None => region_id.to_string(),
-    };
-    println!("Region: {}", region_label);
-
-    if multiple {
-        println!("Processing {} corporations...", corp_ids.len());
-    }
-
-    // Spawn status monitoring task if --status is set
-    let status_task = if status {
-        Some(esi.spawn_status_monitor(print_status))
-    } else {
-        None
-    };
-
-    let corp_label = |corp_id: i32| match sdata.corporation_name(corp_id) {
-        Some(name) => format!("{} ({})", name, corp_id),
-        None => corp_id.to_string(),
-    };
-
-    // Restrict buy and sell orders to NPC stations in the given system
-    let locations: Option<Arc<std::collections::HashSet<i64>>> = match system.as_deref() {
-        Some(value) => match sdata.system_id(value) {
-            Some(system_id) => {
-                let stations = sdata.station_ids_in_system(system_id);
-                println!("Pricing from {} NPC stations in {}", stations.len(), value);
-                Some(Arc::new(stations))
-            }
-            None => {
-                eprintln!("Unknown --system '{}'", value);
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
-
-    // One shared pool bounds the offer fetches, the groups, and their offer subtasks together
-    let pool = Arc::new(tokio::sync::Semaphore::new(concurrency));
-
-    // Fetch offers for every corporation through the pool
-    let mut fetches = tokio::task::JoinSet::new();
-    let corp_count = corp_ids.len();
-    let mut fetch_errors = 0usize;
-    let fetch_start = std::time::Instant::now();
-    let fetch_before = esi.status();
-    println!("Fetching loyalty offers for {} corporations...", corp_count);
-    for (index, corp_id) in corp_ids.into_iter().enumerate() {
-        let permit = pool
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore is never closed");
-        let client = esi.clone();
-        fetches.spawn(async move {
-            let _permit = permit;
-            (index, corp_id, client.loyalty().offers(corp_id).await)
-        });
-    }
-    let mut fetched = Vec::new();
-    println!("Waiting for {} loyalty offer fetches to finish...", fetches.len());
-    while let Some(joined) = fetches.join_next().await {
-        match joined {
-            Ok(item) => fetched.push(item),
-            Err(e) => {
-                fetch_errors += 1;
-                eprintln!("Failed to fetch loyalty offers: {}", e);
-            }
+    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let client = Arc::new(resolved.client(0, events.clone()));
+    let status_task = status.then(|| client.spawn_status_monitor(print_status));
+    let printing = async {
+        while let Some(run_event) = received.recv().await {
+            output::print_event(&run_event.event, &sdata);
         }
-    }
-    fetched.sort_by_key(|(index, _, _)| *index);
-
-    // Group corporations whose offers are identical
-    let mut groups: Vec<(Vec<i32>, Vec<i32>, Vec<LoyaltyOffer>)> = Vec::new();
-    for (_, corp_id, result) in fetched {
-        let offers = match result {
-            Ok(offers) => offers,
-            Err(e) => {
-                fetch_errors += 1;
-                eprintln!("Failed to fetch loyalty offers for corporation {}: {}", corp_label(corp_id), e);
-                continue;
-            }
-        };
-        let mut key: Vec<i32> = offers.iter().map(|o| o.offer_id).collect();
-        key.sort_unstable();
-        match groups.iter_mut().find(|(k, _, _)| *k == key) {
-            Some((_, corps, _)) => corps.push(corp_id),
-            None => groups.push((key, vec![corp_id], offers)),
-        }
-    }
-    let fetch_after = esi.status();
-    println!(
-        "Fetched loyalty offers for {} corporations in {:.2}s, {} errors, {} cache hits, {} cache misses, {} cache writes",
-        corp_count,
-        fetch_start.elapsed().as_secs_f64(),
-        fetch_errors,
-        fetch_after.cache_hits.saturating_sub(fetch_before.cache_hits),
-        fetch_after.cache_misses.saturating_sub(fetch_before.cache_misses),
-        fetch_after.cache_writes.saturating_sub(fetch_before.cache_writes)
-    );
-
-    // Every group is priced before printing so the groups can be ordered by their best offer
-    let mut tasks = tokio::task::JoinSet::new();
-    let group_count = groups.len();
-    let mut group_failures = 0usize;
-    let price_start = std::time::Instant::now();
-    let price_before = esi.status();
-    println!("Pricing {} groups...", group_count);
-    for (_, group_corp_ids, offers) in groups {
-        let permit = pool
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore is never closed");
-        let lp = LpStore::new(esi.clone(), pool.clone());
-        let group_locations = locations.clone();
-        let offer_count = offers.len();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let (results, errors) = lp.offer_results(offers, region_id, group_locations).await;
-            (group_corp_ids, offer_count, results, errors)
-        });
-    }
-    let mut priced: Vec<(Vec<i32>, usize, Vec<OfferResult>, Vec<OfferError>)> = Vec::new();
-    println!("Waiting for {} groups to finish pricing...", tasks.len());
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(item) => priced.push(item),
-            Err(e) => {
-                group_failures += 1;
-                eprintln!("Failed to price a group: {}", e);
-            }
-        }
-    }
-    let offer_errors: usize = priced.iter().map(|(_, _, _, errors)| errors.len()).sum();
-    let price_after = esi.status();
-    println!(
-        "Priced {} groups in {:.2}s, {} offer errors, {} group failures, {} cache hits, {} cache misses, {} cache writes",
-        group_count,
-        price_start.elapsed().as_secs_f64(),
-        offer_errors,
-        group_failures,
-        price_after.cache_hits.saturating_sub(price_before.cache_hits),
-        price_after.cache_misses.saturating_sub(price_before.cache_misses),
-        price_after.cache_writes.saturating_sub(price_before.cache_writes)
-    );
-
-    // Groups are ordered by their top offer's ISK per LP, so the most profitable prints last
-    let top_isk_per_lp = |results: &Vec<OfferResult>| {
-        results
-            .first()
-            .and_then(|r| r.isk_per_lp)
-            .unwrap_or(f64::NEG_INFINITY)
     };
-    priced.sort_by(|(_, _, a, _), (_, _, b, _)| {
-        top_isk_per_lp(a)
-            .partial_cmp(&top_isk_per_lp(b))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let (report_data, ()) = tokio::join!(report::run(&resolved, client, 0, events), printing);
+    output::print_report(&report_data, &resolved, &sdata);
 
-    for (group_corp_ids, offer_count, results, errors) in priced {
-        if multiple {
-            println!("\n=== Processing corporations ===");
-            for &id in &group_corp_ids {
-                let systems = sdata.corporation_systems(id, &agent_filter);
-                let mut line = corp_label(id);
-                if !systems.is_empty() {
-                    let shown: Vec<String> = systems
-                        .iter()
-                        .take(10)
-                        .map(|(name, true_sec)| format!("{} ({:.2})", name, true_sec))
-                        .collect();
-                    line.push_str(": ");
-                    line.push_str(&shown.join(", "));
-                    if systems.len() > 10 {
-                        line.push_str(", ...");
-                    }
-                }
-                println!("{}", line);
-            }
-        }
-        println!("Loyalty offers: {} found", offer_count);
-        for e in &errors {
-            eprintln!("Failed to price offer {}: {}", e.offer_id, e.error);
-        }
-
-        println!("Top {} offers by ISK per LP (descending):", results.len().min(depth));
-        for (rank, r) in results.iter().take(depth).enumerate() {
-            let item_name = sdata
-                .type_name(r.offer.type_id)
-                .cloned()
-                .unwrap_or_else(|| format!("Type {}", r.offer.type_id));
-            let reward_str = r
-                .reward
-                .map(|v| format_number(v, 2))
-                .unwrap_or_else(|| "n/a".to_string());
-            let unit_cost_str = r
-                .unit_cost
-                .map(|v| format_number(v, 2))
-                .unwrap_or_else(|| "n/a".to_string());
-            let profit_per_unit_str = match (r.reward, r.unit_cost) {
-                (Some(reward), Some(unit_cost)) => format_number(reward - unit_cost, 2),
-                _ => "n/a".to_string(),
-            };
-            let isk_per_lp_str = r
-                .isk_per_lp
-                .map(|v| format_number(v, 2))
-                .unwrap_or_else(|| "n/a".to_string());
-            println!(
-                "{}. {}: LP={}, units per redemption={}, reward={}, unit cost={}, profit per unit={}, ISK/LP={}",
-                rank + 1,
-                item_name,
-                format_number(r.offer.lp_cost as f64, 0),
-                format_number(r.offer.quantity as f64, 0),
-                reward_str,
-                unit_cost_str,
-                profit_per_unit_str,
-                isk_per_lp_str
-            );
-            match r.within_10 {
-                Some((volume, profit)) => println!(
-                    "   Volume within 10% of best bid: {}, total profit: {}",
-                    format_number(volume as f64, 0),
-                    format_isk(profit)
-                ),
-                None => println!("   Volume within 10% of best bid: n/a, total profit: n/a"),
-            }
-            for item in &r.breakdown.item_expenses {
-                let name = sdata
-                    .type_name(item.type_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("Type {}", item.type_id));
-                println!(
-                    "   {}: {} x {} ISK = {} ISK",
-                    name,
-                    format_number(item.quantity as f64, 0),
-                    format_number(item.best_price, 2),
-                    format_number(item.total_cost, 2)
-                );
-            }
-        }
-    }
-
-    // Stop the status monitoring task
     if let Some(task) = status_task {
         task.abort();
     }
-
-    Ok(())
 }

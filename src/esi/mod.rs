@@ -81,6 +81,22 @@ const DEFAULT_BASE_URL: &str = "https://esi.evetech.net";
 const DEFAULT_DATASOURCE: &str = "tranquility";
 const DEFAULT_LANGUAGE: &str = "en";
 
+/// Receives the client's verbose log lines.
+#[derive(Clone)]
+pub struct LogSink(Arc<dyn Fn(String) + Send + Sync>);
+
+impl LogSink {
+    fn send(&self, message: String) {
+        (self.0)(message)
+    }
+}
+
+impl std::fmt::Debug for LogSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LogSink")
+    }
+}
+
 /// Configuration for the ESI client.
 #[derive(Debug, Clone)]
 pub struct EsiConfig {
@@ -95,6 +111,7 @@ pub struct EsiConfig {
     pub verbose: bool,
     pub cache_expiry_offset: Duration,
     pub max_inflight: usize,
+    pub log: Option<LogSink>,
 }
 
 impl Default for EsiConfig {
@@ -111,6 +128,7 @@ impl Default for EsiConfig {
             verbose: false,
             cache_expiry_offset: Duration::ZERO,
             max_inflight: 4,
+            log: None,
         }
     }
 }
@@ -182,6 +200,11 @@ impl EsiClientBuilder {
         self
     }
 
+    pub fn log(mut self, sink: impl Fn(String) + Send + Sync + 'static) -> Self {
+        self.config.log = Some(LogSink(Arc::new(sink)));
+        self
+    }
+
     pub fn build(self) -> EsiClient {
         EsiClient::new(self.config)
     }
@@ -219,6 +242,13 @@ impl EsiClient {
             stats: Arc::new(Mutex::new(ClientStats::new())),
             inflight: Mutex::new(HashMap::new()),
             request_permits,
+        }
+    }
+
+    /// Sends a verbose log line to the configured sink, if there is one.
+    fn verbose_log(&self, message: String) {
+        if let Some(sink) = &self.config.log {
+            sink.send(message);
         }
     }
 
@@ -442,14 +472,14 @@ impl EsiClient {
             Some(dir) => dir,
             None => {
                 if self.config.verbose {
-                    println!("[CACHE MISS] {} (caching disabled)", url.path());
+                    self.verbose_log(format!("[CACHE MISS] {} (caching disabled)", url.path()));
                 }
                 return None;
             }
         };
         if self.config.expire {
             if self.config.verbose {
-                println!("[CACHE MISS] {} (--expire forced)", url.path());
+                self.verbose_log(format!("[CACHE MISS] {} (--expire forced)", url.path()));
             }
             return None;
         }
@@ -458,7 +488,7 @@ impl EsiClient {
             Some(info) => info,
             None => {
                 if self.config.verbose {
-                    println!("[CACHE MISS] {} (no entry info)", url.path());
+                    self.verbose_log(format!("[CACHE MISS] {} (no entry info)", url.path()));
                 }
                 return None;
             }
@@ -470,7 +500,7 @@ impl EsiClient {
             Ok(entries) => entries,
             Err(_) => {
                 if self.config.verbose {
-                    println!("[CACHE MISS] {} (cache dir not found)", url.path());
+                    self.verbose_log(format!("[CACHE MISS] {} (cache dir not found)", url.path()));
                 }
                 return None;
             }
@@ -513,10 +543,12 @@ impl EsiClient {
                         let expiry_dt = chrono::DateTime::from_timestamp(effective_expiry as i64, 0)
                             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                             .unwrap_or_else(|| effective_expiry.to_string());
-                        println!(
+                        self.verbose_log(format!(
                             "[CACHE HIT] {} → expires {} (in {}s)",
-                            url.path(), expiry_dt, remaining
-                        );
+                            url.path(),
+                            expiry_dt,
+                            remaining
+                        ));
                     }
                     return Some(value);
                 } else {
@@ -538,12 +570,12 @@ impl EsiClient {
                 "no matching entry"
             };
             let expected_file = format!("{}_{}_<expiry_timestamp>.json", entry_type, entry_id);
-            println!(
+            self.verbose_log(format!(
                 "[CACHE MISS] {} ({}) — expected file: {}",
                 url.path(),
                 reason,
                 expected_file
-            );
+            ));
         }
         None
     }
@@ -606,13 +638,13 @@ impl EsiClient {
             let expiry_dt = chrono::DateTime::from_timestamp(expiry as i64, 0)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                 .unwrap_or_else(|| expiry.to_string());
-            println!(
+            self.verbose_log(format!(
                 "[CACHE WRITE] {} → {} → expires {} (in {}s)",
                 url.path(),
                 filename,
                 expiry_dt,
                 remaining
-            );
+            ));
         }
 
         Ok(())

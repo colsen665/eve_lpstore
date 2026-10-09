@@ -1,6 +1,8 @@
 pub mod esi;
 pub mod expenses;
+pub mod format;
 pub mod lpstore;
+pub mod report;
 pub mod static_data;
 mod tasks;
 
