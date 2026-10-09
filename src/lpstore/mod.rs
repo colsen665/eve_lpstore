@@ -146,12 +146,7 @@ async fn price_offer(
             Some(best.map_or(price, |b| b.max(price)))
         });
     let unit_cost = (offer.quantity > 0).then(|| breakdown.total_isk / offer.quantity as f64);
-    let isk_per_lp = match (reward, unit_cost) {
-        (Some(reward), Some(unit_cost)) if offer.lp_cost > 0 => {
-            Some((reward - unit_cost) / offer.lp_cost as f64)
-        }
-        _ => None,
-    };
+    let isk_per_lp = redemption_isk_per_lp(reward, &offer, breakdown.total_isk);
     let within_10 = match (reward, unit_cost) {
         (Some(best), Some(unit_cost)) => {
             let threshold = best * 0.9;
@@ -178,4 +173,55 @@ async fn price_offer(
         isk_per_lp,
         within_10,
     })
+}
+
+/// ISK per LP for one redemption. The reward is per unit, so it is multiplied by the units the
+/// redemption gives. `total_isk` already covers the whole redemption.
+fn redemption_isk_per_lp(reward: Option<f64>, offer: &LoyaltyOffer, total_isk: f64) -> Option<f64> {
+    let reward = reward?;
+    (offer.quantity > 0 && offer.lp_cost > 0)
+        .then(|| (reward * offer.quantity as f64 - total_isk) / offer.lp_cost as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offer(quantity: i32, lp_cost: i32) -> LoyaltyOffer {
+        LoyaltyOffer {
+            offer_id: 1,
+            type_id: 1,
+            quantity,
+            lp_cost,
+            isk_cost: 0.0,
+            required_items: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn isk_per_lp_is_for_the_whole_redemption() {
+        let ten_units = offer(10, 100);
+        assert_eq!(
+            redemption_isk_per_lp(Some(1000.0), &ten_units, 5000.0),
+            Some(50.0)
+        );
+        let one_unit = offer(1, 100);
+        assert_eq!(
+            redemption_isk_per_lp(Some(1000.0), &one_unit, 500.0),
+            Some(5.0)
+        );
+    }
+
+    #[test]
+    fn isk_per_lp_matches_sisters_combat_scanner_probe() {
+        let probe = offer(10, 1800);
+        let value = redemption_isk_per_lp(Some(457_900.0), &probe, 1_649_000.0).unwrap();
+        assert!((value - 1627.78).abs() < 0.01, "got {}", value);
+    }
+
+    #[test]
+    fn isk_per_lp_needs_a_reward_and_lp_cost() {
+        assert_eq!(redemption_isk_per_lp(None, &offer(10, 100), 0.0), None);
+        assert_eq!(redemption_isk_per_lp(Some(1.0), &offer(10, 0), 0.0), None);
+    }
 }
