@@ -27,11 +27,14 @@ const VALUE_WIDTH: usize = 26;
 const DONATION_ADDRESS: &str = "bc1qyc55ddky2ehdnty2c48nvxxugjw2xdpxk956x7";
 
 /// The offers pane is at least this many columns wide, including its borders. Narrower panes
-/// leave out the volume column. The spread column shows in both.
-const WIDE_OFFERS: u16 = 66;
+/// leave out the volume and imbalance columns. The spread column shows in both.
+const WIDE_OFFERS: u16 = 70;
 
 /// The spread is the fourth offers column, after the rank, the item, and the ISK per LP.
 const SPREAD_COLUMN: usize = 3;
+
+/// The imbalance follows the spread, and only exists in the wide layout.
+const IMBALANCE_COLUMN: usize = 4;
 
 /// A spread up to this percentage means the market is tight enough to trust the best bid.
 const SPREAD_TIGHT: f64 = 10.0;
@@ -39,6 +42,10 @@ const SPREAD_TIGHT: f64 = 10.0;
 /// A spread past this percentage means the best bid is probably a single stale order, and the
 /// ISK per LP built on it is optimistic.
 const SPREAD_WIDE: f64 = 50.0;
+
+/// An imbalance at least this far from balanced is strong enough to colour. Closer to even than
+/// this stays yellow, so a book that favours nobody is not reported as a win.
+const IMBALANCE_STRONG: f64 = 25.0;
 
 /// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
 /// when the results are not on screen.
@@ -478,17 +485,26 @@ fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-/// The offers table's column titles and widths. The volume column only appears when `wide`, and
-/// the spread shows in both. These have to agree in length with `offer_cells`.
+/// The offers table's column titles and widths. The imbalance and volume columns only appear when
+/// `wide`, and the spread shows in both. These have to agree in length with `offer_cells`.
 fn offer_columns(wide: bool) -> (Vec<&'static str>, Vec<Constraint>) {
     if wide {
         (
-            vec!["#", "Item", "ISK/LP", "Spread", "Vol ±10%", "Profit ±10%"],
+            vec![
+                "#",
+                "Item",
+                "ISK/LP",
+                "Spread",
+                "Imbal",
+                "Vol ±10%",
+                "Profit ±10%",
+            ],
             vec![
                 Constraint::Length(4),
                 Constraint::Min(12),
                 Constraint::Length(12),
                 Constraint::Length(8),
+                Constraint::Length(6),
                 Constraint::Length(10),
                 Constraint::Length(11),
             ],
@@ -513,18 +529,20 @@ fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData, wide: bool) 
         .into_iter()
         .enumerate()
         .map(|(column, text)| {
-            if column == SPREAD_COLUMN {
-                Cell::from(text).style(spread_style(result.spread))
-            } else {
-                Cell::from(text)
-            }
+            // The imbalance column only exists in the wide layout, where index 4 is the volume.
+            let style = match column {
+                SPREAD_COLUMN => spread_style(result.spread),
+                IMBALANCE_COLUMN if wide => imbalance_style(result.imbalance),
+                _ => Style::new(),
+            };
+            Cell::from(text).style(style)
         })
         .collect::<Vec<_>>();
     Row::new(cells)
 }
 
-/// The cells of an offer row. The volume within 10% of the best bid is left out when `wide` is
-/// false, and the profit is the total on that volume.
+/// The cells of an offer row. The imbalance and the volume within 10% of the best bid are left out
+/// when `wide` is false, and the profit is the total on that volume.
 fn offer_cells(rank: usize, result: &OfferResult, item: String, wide: bool) -> Vec<String> {
     let isk_per_lp = result
         .isk_per_lp
@@ -541,6 +559,7 @@ fn offer_cells(rank: usize, result: &OfferResult, item: String, wide: bool) -> V
         format_spread(result.spread),
     ];
     if wide {
+        cells.push(format_imbalance(result.imbalance));
         cells.push(volume);
     }
     cells.push(profit);
@@ -568,6 +587,31 @@ fn spread_style(spread: Option<f64>) -> Style {
         Some(value) if value <= SPREAD_TIGHT => Style::new().green(),
         Some(value) if value <= SPREAD_WIDE => Style::new().yellow(),
         Some(_) => Style::new().red(),
+    }
+}
+
+/// The imbalance as a signed whole percentage. The sign always shows, so a bid-heavy book reads as
+/// `+73%` rather than looking like a plain magnitude, and a value that rounds to zero shows
+/// without a sign instead of as `-0%`.
+fn format_imbalance(imbalance: Option<f64>) -> String {
+    match imbalance.map(|value| value.round()) {
+        None => "n/a".to_string(),
+        Some(rounded) if rounded == 0.0 => "0%".to_string(),
+        Some(rounded) if rounded > 0.0 => format!("+{:.0}%", rounded),
+        Some(rounded) => format!("{:.0}%", rounded),
+    }
+}
+
+/// The colour of an imbalance. Green when buyers outweigh sellers, which is what an LP holder
+/// selling into the market wants, and red when a wall of sellers sits over thin bids. A book too
+/// close to even to favour either side stays yellow, and a missing one is dim rather than
+/// alarming, since a reward nobody sells is not the same thing as a bad market.
+fn imbalance_style(imbalance: Option<f64>) -> Style {
+    match imbalance {
+        None => Style::new().dark_gray(),
+        Some(value) if value >= IMBALANCE_STRONG => Style::new().green(),
+        Some(value) if value <= -IMBALANCE_STRONG => Style::new().red(),
+        Some(_) => Style::new().yellow(),
     }
 }
 
@@ -717,6 +761,17 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
                     None => "Volume within 10% of best bid: n/a, total profit: n/a".to_string(),
                 },
                 plain,
+            ));
+            lines.push((
+                match result.book_depth {
+                    Some((_, ask)) => format!(
+                        "Volume within 10% of best ask: {} | Imbalance: {}",
+                        format_number(ask as f64, 0),
+                        format_imbalance(result.imbalance)
+                    ),
+                    None => "Volume within 10% of best ask: n/a | Imbalance: n/a".to_string(),
+                },
+                imbalance_style(result.imbalance),
             ));
             lines.push(("Items:".to_string(), plain));
             for item in &result.breakdown.item_expenses {
@@ -891,7 +946,11 @@ mod tests {
         assert_eq!(truncate("abc", 4), "abc");
     }
 
-    fn priced_offer(spread: Option<f64>, within_10: Option<(i64, f64)>) -> OfferResult {
+    fn priced_offer(
+        spread: Option<f64>,
+        imbalance: Option<f64>,
+        within_10: Option<(i64, f64)>,
+    ) -> OfferResult {
         OfferResult {
             offer: LoyaltyOffer {
                 offer_id: 1,
@@ -914,6 +973,12 @@ mod tests {
             // The ask that goes with the spread, so the fixture stays internally consistent.
             best_ask: spread.map(|s| 457_900.0 * (1.0 + s / 100.0)),
             spread,
+            // A book of 100 units split to match the imbalance, for the same reason.
+            book_depth: imbalance.map(|percent| {
+                let bid = (100.0 + percent) / 2.0;
+                (bid as i64, 100 - bid as i64)
+            }),
+            imbalance,
             within_10,
         }
     }
@@ -929,37 +994,73 @@ mod tests {
 
     #[test]
     fn wide_offer_rows_show_the_volume_and_the_profit_within_10_percent() {
-        let result = priced_offer(Some(12.5), Some((2_474_600, 3_980_000_000.0)));
+        let result = priced_offer(Some(12.5), Some(50.0), Some((2_474_600, 3_980_000_000.0)));
         let cells = offer_cells(0, &result, "Sisters Combat Scanner Probe".to_string(), true);
-        assert_eq!(cells.len(), 6);
+        assert_eq!(cells.len(), 7);
         assert_eq!(cells[3], "12.50%");
-        assert_eq!(cells[4], "2,474,600");
-        assert_eq!(cells[5], "3.98B");
+        assert_eq!(cells[4], "+50%");
+        assert_eq!(cells[5], "2,474,600");
+        assert_eq!(cells[6], "3.98B");
     }
 
     #[test]
-    fn narrow_offer_rows_leave_out_the_volume() {
-        let result = priced_offer(Some(12.5), Some((2_474_600, 3_980_000_000.0)));
+    fn narrow_offer_rows_leave_out_the_imbalance_and_the_volume() {
+        let result = priced_offer(Some(12.5), Some(50.0), Some((2_474_600, 3_980_000_000.0)));
         let cells = offer_cells(0, &result, "Probe".to_string(), false);
         assert_eq!(cells.len(), 5);
         assert_eq!(cells[3], "12.50%");
+        // The profit, not the imbalance, is what follows the spread in a narrow pane.
         assert_eq!(cells[4], "3.98B");
     }
 
     #[test]
     fn offers_without_a_reward_show_n_a() {
-        let result = priced_offer(Some(12.5), None);
+        let result = priced_offer(Some(12.5), Some(50.0), None);
         let cells = offer_cells(0, &result, "Probe".to_string(), true);
         assert_eq!(cells[3], "12.50%");
-        assert_eq!(cells[4], "n/a");
+        assert_eq!(cells[4], "+50%");
         assert_eq!(cells[5], "n/a");
+        assert_eq!(cells[6], "n/a");
     }
 
     #[test]
     fn the_spread_column_shows_n_a_without_an_ask() {
-        let result = priced_offer(None, Some((100, 1000.0)));
+        let result = priced_offer(None, None, Some((100, 1000.0)));
         let cells = offer_cells(0, &result, "Probe".to_string(), true);
         assert_eq!(cells[3], "n/a");
+    }
+
+    #[test]
+    fn the_imbalance_column_shows_n_a_without_both_sides() {
+        let result = priced_offer(Some(12.5), None, Some((100, 1000.0)));
+        let cells = offer_cells(0, &result, "Probe".to_string(), true);
+        assert_eq!(cells[4], "n/a");
+    }
+
+    #[test]
+    fn the_imbalance_shows_its_sign_and_never_a_negative_zero() {
+        assert_eq!(format_imbalance(Some(73.4)), "+73%");
+        assert_eq!(format_imbalance(Some(-73.4)), "-73%");
+        assert_eq!(format_imbalance(Some(100.0)), "+100%");
+        assert_eq!(format_imbalance(Some(-100.0)), "-100%");
+        assert_eq!(format_imbalance(Some(0.0)), "0%");
+        assert_eq!(format_imbalance(Some(-0.4)), "0%");
+        assert_eq!(format_imbalance(None), "n/a");
+    }
+
+    #[test]
+    fn the_imbalance_colour_follows_the_bands() {
+        assert_eq!(imbalance_style(Some(100.0)), Style::new().green());
+        assert_eq!(
+            imbalance_style(Some(IMBALANCE_STRONG)),
+            Style::new().green()
+        );
+        assert_eq!(imbalance_style(Some(10.0)), Style::new().yellow());
+        assert_eq!(imbalance_style(Some(0.0)), Style::new().yellow());
+        assert_eq!(imbalance_style(Some(-10.0)), Style::new().yellow());
+        assert_eq!(imbalance_style(Some(-IMBALANCE_STRONG)), Style::new().red());
+        assert_eq!(imbalance_style(Some(-100.0)), Style::new().red());
+        assert_eq!(imbalance_style(None), Style::new().dark_gray());
     }
 
     #[test]
@@ -988,7 +1089,7 @@ mod tests {
     fn the_offer_columns_match_the_cells_in_both_layouts() {
         // The titles, the widths, and the cells are three parallel lists, and a row that
         // disagrees with the other two renders misaligned.
-        let result = priced_offer(Some(12.5), Some((100, 1000.0)));
+        let result = priced_offer(Some(12.5), Some(50.0), Some((100, 1000.0)));
         for wide in [true, false] {
             let (titles, widths) = offer_columns(wide);
             let cells = offer_cells(0, &result, "Probe".to_string(), wide);
@@ -997,25 +1098,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_narrow_offer_columns_fit_the_smallest_pane() {
-        // The offers pane gets 68% of an 80-column terminal. Its borders take two columns and the
-        // "> " highlight takes two more, which leaves the rest for the cells.
-        let (_, widths) = offer_columns(false);
-        let needed: u16 = widths
+    /// The pane columns a layout needs: the sum of its column widths, plus two for the borders and
+    /// two for the "> " highlight. `Min` counts at its floor, and `Item` is the only column that
+    /// can grow past what is asked for here.
+    fn columns_needed(widths: &[Constraint]) -> u16 {
+        widths
             .iter()
             .map(|column| match column {
                 Constraint::Length(columns) | Constraint::Min(columns) => *columns,
                 _ => 0,
             })
             .sum::<u16>()
-            + 4;
+            + 4
+    }
+
+    #[test]
+    fn the_narrow_offer_columns_fit_the_smallest_pane() {
+        // The offers pane gets 68% of an 80-column terminal.
+        let (_, widths) = offer_columns(false);
+        let needed = columns_needed(&widths);
         let pane = MIN_WIDTH * 68 / 100;
         assert!(
             needed <= pane,
             "the narrow columns need {} of the {} available",
             needed,
             pane
+        );
+    }
+
+    #[test]
+    fn the_wide_offer_columns_fit_the_pane_they_switch_on_at() {
+        // The wide layout only engages once the pane reaches WIDE_OFFERS, so it has to fit at
+        // exactly that width rather than only on larger terminals.
+        let (_, widths) = offer_columns(true);
+        let needed = columns_needed(&widths);
+        assert!(
+            needed <= WIDE_OFFERS,
+            "the wide columns need {} of the {} available",
+            needed,
+            WIDE_OFFERS
         );
     }
 

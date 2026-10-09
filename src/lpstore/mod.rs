@@ -20,6 +20,11 @@ pub struct OfferResult {
     /// The bid/ask spread on the reward as a percentage of the best bid, or `None` when one side
     /// of the market is missing.
     pub spread: Option<f64>,
+    /// Volume within 10% of the touch on each side, as (bid, ask), or `None` when one side of the
+    /// market is missing.
+    pub book_depth: Option<(i64, i64)>,
+    /// How lopsided that volume is, from -100 to +100, or `None` when either side is empty.
+    pub imbalance: Option<f64>,
     pub within_10: Option<(i64, f64)>,
 }
 
@@ -144,16 +149,11 @@ async fn price_offer(
     let quote = quote.expect("reward lookup always produces an output");
 
     let breakdown = breakdown_from(&offer, item_expenses);
-    let reward = quote
-        .buy_orders
-        .iter()
-        .map(|o| o.price)
-        .fold(None, |best: Option<f64>, price| {
-            Some(best.map_or(price, |b| b.max(price)))
-        });
+    let reward = quote.best_bid();
+    let best_ask = quote.best_ask();
     let unit_cost = (offer.quantity > 0).then(|| breakdown.total_isk / offer.quantity as f64);
     let isk_per_lp = redemption_isk_per_lp(reward, &offer, breakdown.total_isk);
-    let spread = spread_percent(reward, quote.best_ask);
+    let spread = spread_percent(reward, best_ask);
     let within_10 = match (reward, unit_cost) {
         (Some(best), Some(unit_cost)) => {
             let threshold = best * 0.9;
@@ -172,6 +172,23 @@ async fn price_offer(
         }
         _ => None,
     };
+    // The bid side is the volume `within_10` already counted, so the two cannot disagree. The ask
+    // side is the sellers within the same band, mirrored above the best ask. Both sides have to be
+    // present, so a reward nobody sells leaves the book unknown rather than looking all-buyers.
+    let book_depth = match (within_10, best_ask) {
+        (Some((bid_depth, _)), Some(best_ask)) => {
+            let ceiling = best_ask * 1.1;
+            let ask_depth: i64 = quote
+                .ask_orders
+                .iter()
+                .filter(|o| o.price <= ceiling)
+                .map(|o| o.volume_remain as i64)
+                .sum();
+            Some((bid_depth, ask_depth))
+        }
+        _ => None,
+    };
+    let imbalance = book_depth.and_then(|(bid, ask)| imbalance_percent(bid, ask));
 
     Ok(OfferResult {
         offer,
@@ -179,8 +196,10 @@ async fn price_offer(
         reward,
         unit_cost,
         isk_per_lp,
-        best_ask: quote.best_ask,
+        best_ask,
         spread,
+        book_depth,
+        imbalance,
         within_10,
     })
 }
@@ -203,6 +222,18 @@ fn redemption_isk_per_lp(reward: Option<f64>, offer: &LoyaltyOffer, total_isk: f
 fn spread_percent(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64> {
     let bid = best_bid.filter(|bid| *bid > 0.0)?;
     Some((best_ask? - bid) / bid * 100.0)
+}
+
+/// How lopsided the book is near the touch, from -100 when only sellers remain to +100 when only
+/// buyers do. Positive favours an LP holder, who is always selling: the buyers behind the best bid
+/// outweigh the sellers competing to undercut it. Negative means thin bids under a wall of
+/// sellers, so the reward driving the ISK per LP is hard to actually realize.
+///
+/// `None` unless both sides have volume, so a reward nobody sells reads as unknown rather than as
+/// an overwhelming bid.
+fn imbalance_percent(bid_depth: i64, ask_depth: i64) -> Option<f64> {
+    (bid_depth > 0 && ask_depth > 0)
+        .then(|| (bid_depth - ask_depth) as f64 / (bid_depth + ask_depth) as f64 * 100.0)
 }
 
 #[cfg(test)]
@@ -268,5 +299,24 @@ mod tests {
     #[test]
     fn spread_needs_a_positive_bid() {
         assert_eq!(spread_percent(Some(0.0), Some(250.0)), None);
+    }
+
+    #[test]
+    fn imbalance_is_positive_when_buyers_outweigh_sellers() {
+        assert_eq!(imbalance_percent(75, 25), Some(50.0));
+        assert_eq!(imbalance_percent(25, 75), Some(-50.0));
+    }
+
+    #[test]
+    fn a_balanced_book_is_zero() {
+        assert_eq!(imbalance_percent(50, 50), Some(0.0));
+    }
+
+    #[test]
+    fn imbalance_needs_volume_on_both_sides() {
+        // A reward nobody sells is unknown, not an overwhelming bid.
+        assert_eq!(imbalance_percent(100, 0), None);
+        assert_eq!(imbalance_percent(0, 100), None);
+        assert_eq!(imbalance_percent(0, 0), None);
     }
 }

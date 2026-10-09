@@ -8,9 +8,9 @@ fn in_locations(locations: Option<&HashSet<i64>>, location_id: i64) -> bool {
     locations.map_or(true, |set| set.contains(&location_id))
 }
 
-/// A buy order for an item in a region.
+/// One order on either side of the market for an item in a region.
 #[derive(Debug, Clone)]
-pub struct BuyOrder {
+pub struct BookOrder {
     pub price: f64,
     pub volume_remain: i32,
 }
@@ -19,9 +19,33 @@ pub struct BuyOrder {
 #[derive(Debug, Clone)]
 pub struct MarketQuote {
     /// The buy orders the reward can sell into.
-    pub buy_orders: Vec<BuyOrder>,
-    /// The lowest sell price, or `None` when nothing sells it.
-    pub best_ask: Option<f64>,
+    pub buy_orders: Vec<BookOrder>,
+    /// The sell orders competing to sell it. Empty when nothing sells it, which is not an error:
+    /// the offer still prices, and only the ask side of the comparison is unknown.
+    pub ask_orders: Vec<BookOrder>,
+}
+
+impl MarketQuote {
+    /// The highest buy price, which is what the reward actually sells for. `None` when nobody is
+    /// buying it.
+    pub fn best_bid(&self) -> Option<f64> {
+        self.buy_orders
+            .iter()
+            .map(|o| o.price)
+            .fold(None, |best: Option<f64>, price| {
+                Some(best.map_or(price, |b| b.max(price)))
+            })
+    }
+
+    /// The lowest sell price, or `None` when nothing sells the reward.
+    pub fn best_ask(&self) -> Option<f64> {
+        self.ask_orders
+            .iter()
+            .map(|o| o.price)
+            .fold(None, |best: Option<f64>, price| {
+                Some(best.map_or(price, |b| b.min(price)))
+            })
+    }
 }
 
 /// The calculated market cost of a single required item.
@@ -65,9 +89,9 @@ pub struct ExpensesEndpoint<'a> {
 impl<'a> ExpensesEndpoint<'a> {
     /// Both sides of the market for a reward type in the given region.
     ///
-    /// The buy orders are what the reward can sell into. The best ask is what buying one would
-    /// cost, and is `None` when nothing sells it. That is not an error: the offer still prices,
-    /// and only the spread is unknown.
+    /// The buy orders are what the reward can sell into, and the sell orders are the competition
+    /// to sell it. An empty ask side is not an error: the offer still prices, and only the
+    /// comparisons that need a sell price come back unknown.
     pub async fn reward_quote(
         &self,
         type_id: i32,
@@ -80,25 +104,20 @@ impl<'a> ExpensesEndpoint<'a> {
             .orders(region_id, Some(type_id))
             .await?;
 
-        let buy_orders = orders
-            .iter()
-            .filter(|o| o.is_buy_order && in_locations(locations, o.location_id))
-            .map(|o| BuyOrder {
-                price: o.price,
-                volume_remain: o.volume_remain,
-            })
-            .collect();
-        let best_ask = orders
-            .iter()
-            .filter(|o| !o.is_buy_order && in_locations(locations, o.location_id))
-            .map(|o| o.price)
-            .fold(None, |best: Option<f64>, price| {
-                Some(best.map_or(price, |b| b.min(price)))
-            });
+        let side = |is_buy: bool| {
+            orders
+                .iter()
+                .filter(move |o| o.is_buy_order == is_buy && in_locations(locations, o.location_id))
+                .map(|o| BookOrder {
+                    price: o.price,
+                    volume_remain: o.volume_remain,
+                })
+                .collect()
+        };
 
         Ok(MarketQuote {
-            buy_orders,
-            best_ask,
+            buy_orders: side(true),
+            ask_orders: side(false),
         })
     }
 

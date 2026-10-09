@@ -469,6 +469,8 @@ mod tests {
             isk_per_lp: Some(isk_per_lp),
             best_ask: None,
             spread: None,
+            book_depth: None,
+            imbalance: None,
             within_10: None,
         }
     }
