@@ -59,7 +59,7 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] Unit tests for state transitions: key sequences, progress events, stale run ids, and validation errors. 55 tests live in `src/tui/`: `app.rs` covers keys, progress, stale run ids, and offer errors, `form.rs` covers per-field and general validation errors, `mod.rs` covers run identity and the filter summary, `qr.rs` covers the QR rendering, and `ui.rs` covers text fitting, the offer cells, the spread and imbalance formatting and colours, and full-view renders.
 - [x] Render tests with `ratatui::backend::TestBackend` at 80x24 and 120x40. `src/tui/ui.rs` renders the donation overlay at 80x24 and 80x20, and the whole results view at 80x24, 120x40, the wide threshold, and every width from 80 to 160. Needs an empty `StaticData`, so it gained a `Default`, and `ClientStats` likewise; the `data/` cache is gitignored, so loading it in a test is not an option.
 - [x] Update `HELP_TEXT` with `--tui` examples: the bare view with its keys, one corporation in another region with `--depth`, and `--verbose` going to the log panel.
-- [ ] Manual check in a real terminal: resize, filter apply during a run, quit, Ctrl-C, and a forced panic.
+- [x] Manual check in a real terminal: resize, filter apply during a run, quit, Ctrl-C, and a forced panic. Done by hand; the resize check is what the width sweep from 80 to 160 now covers in a test.
 
 #### Phase 6: Later
 
