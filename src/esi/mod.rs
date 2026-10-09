@@ -15,8 +15,8 @@ use tokio::sync::{OnceCell, Semaphore};
 
 type PageResult = Result<(serde_json::Value, Option<u32>), EsiError>;
 
-/// Statistics about outstanding API calls.
-#[derive(Debug, Clone)]
+/// Statistics about outstanding API calls. The default is a client that has made no requests.
+#[derive(Debug, Clone, Default)]
 pub struct ClientStats {
     pub in_flight: usize,
     pub waiting: usize,
@@ -58,22 +58,6 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.0.lock().unwrap().in_flight -= 1;
-    }
-}
-
-impl ClientStats {
-    fn new() -> Self {
-        Self {
-            in_flight: 0,
-            waiting: 0,
-            rate_limit_remain: None,
-            rate_limit_reset: None,
-            total_requests: 0,
-            total_errors: 0,
-            cache_hits: 0,
-            cache_misses: 0,
-            cache_writes: 0,
-        }
     }
 }
 
@@ -239,7 +223,7 @@ impl EsiClient {
         Self {
             http,
             config,
-            stats: Arc::new(Mutex::new(ClientStats::new())),
+            stats: Arc::new(Mutex::new(ClientStats::default())),
             inflight: Mutex::new(HashMap::new()),
             request_permits,
         }

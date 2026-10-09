@@ -26,9 +26,12 @@ const VALUE_WIDTH: usize = 26;
 
 const DONATION_ADDRESS: &str = "bc1qyc55ddky2ehdnty2c48nvxxugjw2xdpxk956x7";
 
-/// The offers pane is at least this many columns wide, including its borders. Narrower panes
-/// leave out the volume and imbalance columns. The spread column shows in both.
-const WIDE_OFFERS: u16 = 70;
+/// The offers pane is at least this many columns wide, including its borders, for the wide layout.
+/// Narrower panes leave out the imbalance and volume columns. The spread column shows in both.
+///
+/// This is measured, not derived: at 72 the last column's header is cut, and at 73 it is not. The
+/// render tests below are what keep it honest.
+const WIDE_OFFERS: u16 = 73;
 
 /// The spread is the fourth offers column, after the rank, the item, and the ISK per LP.
 const SPREAD_COLUMN: usize = 3;
@@ -514,7 +517,9 @@ fn offer_columns(wide: bool) -> (Vec<&'static str>, Vec<Constraint>) {
             vec!["#", "Item", "ISK/LP", "Spread", "Profit ±10%"],
             vec![
                 Constraint::Length(4),
-                Constraint::Min(12),
+                // A lower floor than the wide layout, so the fixed columns keep their width at an
+                // 80-column terminal. Item is the only column that can shrink.
+                Constraint::Min(10),
                 Constraint::Length(12),
                 Constraint::Length(8),
                 Constraint::Length(11),
@@ -921,8 +926,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, in_form: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::RunInfo;
     use eve_lpstore::ExpenseBreakdown;
     use eve_lpstore::esi::loyalty::LoyaltyOffer;
+    use eve_lpstore::report::{LpStoreOptions, Report};
+    use eve_lpstore::static_data::AgentFilter;
 
     fn texts(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(|line| line.to_string()).collect()
@@ -1098,54 +1106,11 @@ mod tests {
         }
     }
 
-    /// The pane columns a layout needs: the sum of its column widths, plus two for the borders and
-    /// two for the "> " highlight. `Min` counts at its floor, and `Item` is the only column that
-    /// can grow past what is asked for here.
-    fn columns_needed(widths: &[Constraint]) -> u16 {
-        widths
-            .iter()
-            .map(|column| match column {
-                Constraint::Length(columns) | Constraint::Min(columns) => *columns,
-                _ => 0,
-            })
-            .sum::<u16>()
-            + 4
-    }
-
-    #[test]
-    fn the_narrow_offer_columns_fit_the_smallest_pane() {
-        // The offers pane gets 68% of an 80-column terminal.
-        let (_, widths) = offer_columns(false);
-        let needed = columns_needed(&widths);
-        let pane = MIN_WIDTH * 68 / 100;
-        assert!(
-            needed <= pane,
-            "the narrow columns need {} of the {} available",
-            needed,
-            pane
-        );
-    }
-
-    #[test]
-    fn the_wide_offer_columns_fit_the_pane_they_switch_on_at() {
-        // The wide layout only engages once the pane reaches WIDE_OFFERS, so it has to fit at
-        // exactly that width rather than only on larger terminals.
-        let (_, widths) = offer_columns(true);
-        let needed = columns_needed(&widths);
-        assert!(
-            needed <= WIDE_OFFERS,
-            "the wide columns need {} of the {} available",
-            needed,
-            WIDE_OFFERS
-        );
-    }
-
-    fn screen_text(width: u16, height: u16) -> String {
+    /// The whole screen after drawing `f`, as every cell's symbol in reading order.
+    fn rendered(width: u16, height: u16, f: impl FnOnce(&mut Frame)) -> String {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| draw_donate(frame, frame.area()))
-            .unwrap();
+        terminal.draw(f).unwrap();
         terminal
             .backend()
             .buffer()
@@ -1153,6 +1118,126 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// An app sitting on the results view with one group of `offers`. The static data is empty, so
+    /// names fall back to their IDs, which is enough to test how the view is laid out.
+    fn results_app(offers: Vec<OfferResult>, depth: usize) -> App {
+        let info = RunInfo {
+            region: "The Forge".to_string(),
+            corporations: 1,
+            filters: "none".to_string(),
+            depth,
+            agent_filter: AgentFilter::default(),
+        };
+        let mut app = App::new(info, LpStoreOptions::default());
+        app.finish(Report {
+            groups: vec![Group {
+                corp_ids: vec![1000002],
+                offer_count: offers.len(),
+                results: offers,
+                errors: Vec::new(),
+            }],
+        });
+        app
+    }
+
+    /// The whole `--tui` view rendered at `width` x `height`, as one string.
+    fn view_text(app: &App, width: u16, height: u16) -> String {
+        let sdata = StaticData::default();
+        let stats = ClientStats::default();
+        rendered(width, height, |frame| {
+            draw(frame, app, &sdata, &stats);
+        })
+    }
+
+    /// One offer with a known spread, imbalance, volume, and profit, so a test can look for the
+    /// exact strings that have to survive the layout.
+    fn one_priced_offer() -> Vec<OfferResult> {
+        vec![priced_offer(
+            Some(12.5),
+            Some(50.0),
+            Some((2_474_600, 3_980_000_000.0)),
+        )]
+    }
+
+    #[test]
+    fn the_wide_offers_table_shows_every_column_at_120x40() {
+        let app = results_app(one_priced_offer(), 10);
+        let text = view_text(&app, 120, 40);
+        for title in [
+            "Item",
+            "ISK/LP",
+            "Spread",
+            "Imbal",
+            "Vol ±10%",
+            "Profit ±10%",
+        ] {
+            assert!(text.contains(title), "the column {title:?} did not render");
+        }
+        for value in ["12.50%", "+50%", "2,474,600", "3.98B"] {
+            assert!(text.contains(value), "the value {value:?} did not render");
+        }
+    }
+
+    #[test]
+    fn the_narrow_offers_table_fits_the_smallest_terminal() {
+        // The smallest terminal the view accepts has to show the last column in full. It did not
+        // until `Item`'s floor dropped, and nothing caught it because no test rendered the results.
+        let app = results_app(one_priced_offer(), 10);
+        let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT + 4);
+        assert!(
+            text.contains("Spread") && text.contains("12.50%"),
+            "the spread column shows in both layouts"
+        );
+        assert!(
+            text.contains("Profit ±10%") && text.contains("3.98B"),
+            "the last column was cut at {}x{}",
+            MIN_WIDTH,
+            MIN_HEIGHT + 4
+        );
+        assert!(!text.contains("Imbal"), "the imbalance is wide only");
+        assert!(!text.contains("Vol ±10%"), "the volume is wide only");
+    }
+
+    #[test]
+    fn the_wide_offers_table_survives_the_terminal_it_switches_on_at() {
+        // The offers pane is 68% of the terminal, so this is about the narrowest terminal whose
+        // pane reaches WIDE_OFFERS. Every column has to survive at the threshold, which is where an
+        // over-wide one first cuts the last column's header off.
+        let width = (f64::from(WIDE_OFFERS) / 0.68).ceil() as u16;
+        let app = results_app(one_priced_offer(), 10);
+        let text = view_text(&app, width, 24);
+        assert!(
+            text.contains("Imbal"),
+            "the wide layout did not engage at {} columns",
+            width
+        );
+        assert!(
+            text.contains("Profit ±10%") && text.contains("3.98B"),
+            "the last column was cut at {} columns",
+            width
+        );
+    }
+
+    #[test]
+    fn no_terminal_width_cuts_the_last_offers_column() {
+        // Both layouts were truncating "Profit ±10%" at their own minimum widths, and the gap
+        // between them was not obvious from the column arithmetic. Every width the view accepts has
+        // to show the last column in full, whichever layout it picks.
+        for width in MIN_WIDTH..=160 {
+            let app = results_app(one_priced_offer(), 10);
+            let text = view_text(&app, width, MIN_HEIGHT + 4);
+            assert!(
+                text.contains("Profit ±10%") && text.contains("3.98B"),
+                "the last offers column was cut at {} columns",
+                width
+            );
+        }
+    }
+
+    fn screen_text(width: u16, height: u16) -> String {
+        rendered(width, height, |frame| draw_donate(frame, frame.area()))
     }
 
     #[test]

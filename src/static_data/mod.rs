@@ -247,6 +247,11 @@ impl AgentFilter {
 ///
 /// Data is cached locally at `data/regions.json`, `data/corporations.json`, and `data/types.json`.
 /// The cache is only downloaded when explicitly forced or when no cache file exists.
+///
+/// The default is an empty cache: every lookup misses and callers fall back to IDs. That is a
+/// usable value, and it lets the `--tui` view be render-tested without the `data/` files, which
+/// are gitignored and downloaded on demand.
+#[derive(Default)]
 pub struct StaticData {
     regions: HashMap<String, i32>,
     region_names_by_id: HashMap<i32, String>,
