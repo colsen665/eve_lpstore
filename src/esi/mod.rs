@@ -508,6 +508,7 @@ impl EsiClient {
 
         let mut found_expired = false;
         let mut found_corrupt = false;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let filename = entry.file_name().to_string_lossy().to_string();
@@ -516,17 +517,19 @@ impl EsiClient {
                 continue;
             }
 
-            // Extract expiry timestamp from filename (last segment before .json)
-            let expiry_str = filename
-                .strip_prefix(&expected_prefix)?
-                .strip_suffix(".json")?;
-            let expiry: u64 = expiry_str.parse().ok()?;
+            // Extract expiry timestamp from filename (last segment before .json). Files for
+            // other URLs that share the prefix, such as page 2, are skipped.
+            let Some(expiry_str) = filename
+                .strip_prefix(&expected_prefix)
+                .and_then(|rest| rest.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(expiry) = expiry_str.parse::<u64>() else {
+                continue;
+            };
 
             // Check if cache is still valid, allowing the configured extra minutes past expiry
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()?
-                .as_secs();
             let effective_expiry = expiry + self.config.cache_expiry_offset.as_secs();
             if now < effective_expiry {
                 // Cache is valid, read and return
@@ -759,4 +762,43 @@ impl EsiClient {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("eve_lpstore_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn page_one_is_found_past_its_page_siblings() {
+        let dir = scratch_dir("page_one");
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let base = "markets_10000002_orders_datasource_tranquility_language_en";
+        std::fs::write(dir.join(format!("{}_{}.json", base, expiry)), "[1]").unwrap();
+        for page in 2..12 {
+            let name = format!("{}_page_{}_{}.json", base, page, expiry);
+            std::fs::write(dir.join(name), format!("[{}]", page)).unwrap();
+        }
+
+        let client = EsiClient::builder()
+            .cache_dir(dir.to_string_lossy().to_string())
+            .build();
+        let url = url::Url::parse(
+            "https://esi.evetech.net/markets/10000002/orders/?datasource=tranquility&language=en",
+        )
+        .unwrap();
+
+        assert_eq!(client.check_cache(&url).await, Some(serde_json::json!([1])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
