@@ -63,7 +63,6 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 6: Later
 
-- [ ] Sort toggles for ISK per LP, profit, and volume, plus spread and imbalance now that both are on `OfferResult`. Sorting is fixed today: the pipeline orders groups by the average ISK per LP over the top `--depth` offers, and `Report::sort_by_depth` re-sorts when depth changes in the TUI.
 - [ ] Export the current view to CSV or JSON.
 
 ## Done
