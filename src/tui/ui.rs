@@ -459,11 +459,10 @@ fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
         .collect();
     let (titles, widths) = if wide {
         (
-            vec!["#", "Item", "LP", "ISK/LP", "Vol ±10%", "Profit ±10%"],
+            vec!["#", "Item", "ISK/LP", "Vol ±10%", "Profit ±10%"],
             vec![
                 Constraint::Length(4),
                 Constraint::Min(12),
-                Constraint::Length(8),
                 Constraint::Length(12),
                 Constraint::Length(10),
                 Constraint::Length(11),
@@ -471,11 +470,10 @@ fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
         )
     } else {
         (
-            vec!["#", "Item", "LP", "ISK/LP", "Profit ±10%"],
+            vec!["#", "Item", "ISK/LP", "Profit ±10%"],
             vec![
                 Constraint::Length(4),
                 Constraint::Min(12),
-                Constraint::Length(8),
                 Constraint::Length(12),
                 Constraint::Length(11),
             ],
@@ -507,12 +505,7 @@ fn offer_cells(rank: usize, result: &OfferResult, item: String, wide: bool) -> V
         Some((volume, profit)) => (format_number(volume as f64, 0), short_isk(profit)),
         None => ("n/a".to_string(), "n/a".to_string()),
     };
-    let mut cells = vec![
-        (rank + 1).to_string(),
-        item,
-        format_number(result.offer.lp_cost as f64, 0),
-        isk_per_lp,
-    ];
+    let mut cells = vec![(rank + 1).to_string(), item, isk_per_lp];
     if wide {
         cells.push(volume);
     }
@@ -869,25 +862,25 @@ mod tests {
     fn wide_offer_rows_show_the_volume_and_the_profit_within_10_percent() {
         let result = priced_offer(Some((2_474_600, 3_980_000_000.0)));
         let cells = offer_cells(0, &result, "Sisters Combat Scanner Probe".to_string(), true);
-        assert_eq!(cells.len(), 6);
-        assert_eq!(cells[4], "2,474,600");
-        assert_eq!(cells[5], "3.98B");
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[3], "2,474,600");
+        assert_eq!(cells[4], "3.98B");
     }
 
     #[test]
     fn narrow_offer_rows_leave_out_the_volume() {
         let result = priced_offer(Some((2_474_600, 3_980_000_000.0)));
         let cells = offer_cells(0, &result, "Probe".to_string(), false);
-        assert_eq!(cells.len(), 5);
-        assert_eq!(cells[4], "3.98B");
+        assert_eq!(cells.len(), 4);
+        assert_eq!(cells[3], "3.98B");
     }
 
     #[test]
     fn offers_without_a_reward_show_n_a() {
         let result = priced_offer(None);
         let cells = offer_cells(0, &result, "Probe".to_string(), true);
+        assert_eq!(cells[3], "n/a");
         assert_eq!(cells[4], "n/a");
-        assert_eq!(cells[5], "n/a");
     }
 
     fn screen_text(width: u16, height: u16) -> String {
