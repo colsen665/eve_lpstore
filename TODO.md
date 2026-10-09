@@ -33,16 +33,16 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 3: Results view
 
-- [ ] Keep app state in `src/tui/app.rs` as plain data with update functions (event in, state out), with no terminal I/O. Rendering goes in `src/tui/ui.rs`.
-- [ ] Progress view, shown until the first run finishes: gauges for fetch and pricing, plus recent log lines.
-- [ ] Results layout, using the CLI's grouping:
-  - [ ] Groups pane on the left: each group's top ISK per LP, offer count, and corp names, best first.
-  - [ ] Offers pane on the right: the selected group's top `--depth` offers, with the CLI's columns.
-  - [ ] Detail pane: the group's corps with their agent systems, as the CLI prints them, plus the selected offer's breakdown, within-10% volume, and profit.
-- [ ] Status bar: in flight, waiting, rate limit, errors, and cache hits, misses, and writes.
-- [ ] Log panel (`l`): cache lines under `--verbose`, plus fetch and pricing errors.
-- [ ] Keys: arrows or j/k to move, Tab to switch panes, PgUp/PgDn to scroll, `?` for help, and `q` to quit. Ctrl-C also quits. Quitting aborts the current run.
-- [ ] Show a "terminal too small" message below a minimum size.
+- [x] Keep app state in `src/tui/app.rs` as plain data with update functions (event in, state out), with no terminal I/O. Rendering goes in `src/tui/ui.rs`.
+- [x] Progress view, shown until the first run finishes: gauges for fetch and pricing, plus recent log lines.
+- [x] Results layout, using the CLI's grouping:
+  - [x] Groups pane on the left: each group's top ISK per LP, offer count, and corp names, best first.
+  - [x] Offers pane on the right: the selected group's top `--depth` offers, with the CLI's key columns (LP, ISK/LP, profit per unit). Reward, unit cost, units, and the within-10% figures are in the detail pane, because the table has no room for them beside the groups list.
+  - [x] Detail pane: the group's corps with their agent systems, as the CLI prints them, plus the selected offer's breakdown, within-10% volume, and profit.
+- [x] Status bar: in flight, waiting, rate limit, errors, and cache hits, misses, and writes.
+- [x] Log panel (`l`): cache lines under `--verbose`, plus fetch and pricing errors.
+- [x] Keys: arrows or j/k to move, Tab to switch panes, PgUp/PgDn to scroll, `?` for help, and `q` to quit. Ctrl-C also quits. Quitting aborts the current run.
+- [x] Show a "terminal too small" message below 80x20.
 
 #### Phase 4: Filter editing
 

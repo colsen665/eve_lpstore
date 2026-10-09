@@ -2,6 +2,7 @@ use eve_lpstore::StaticData;
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number};
 use eve_lpstore::report::{Event, Report, Resolved};
+use eve_lpstore::static_data::AgentFilter;
 
 /// The text for one event, and whether it is an error.
 pub struct Message {
@@ -14,6 +15,25 @@ fn corp_label(sdata: &StaticData, corp_id: i32) -> String {
         Some(name) => format!("{} ({})", name, corp_id),
         None => corp_id.to_string(),
     }
+}
+
+/// A corporation with its agent systems, as the CLI prints it.
+pub fn corp_line(sdata: &StaticData, corp_id: i32, filter: &AgentFilter) -> String {
+    let systems = sdata.corporation_systems(corp_id, filter);
+    let mut line = corp_label(sdata, corp_id);
+    if !systems.is_empty() {
+        let shown: Vec<String> = systems
+            .iter()
+            .take(10)
+            .map(|(name, true_sec)| format!("{} ({:.2})", name, true_sec))
+            .collect();
+        line.push_str(": ");
+        line.push_str(&shown.join(", "));
+        if systems.len() > 10 {
+            line.push_str(", ...");
+        }
+    }
+    line
 }
 
 /// Prints what was resolved from the options, before the run starts.
@@ -110,15 +130,23 @@ pub fn print_event(event: &Event, sdata: &StaticData) {
     }
 }
 
-/// The client's counters on one line, shared by `--status` and the TUI footer.
-pub fn status_text(s: &ClientStats) -> String {
-    let rate_limit_str = match (s.rate_limit_remain, s.rate_limit_reset) {
+/// The rate limit as the CLI and the TUI show it.
+pub fn rate_limit_text(s: &ClientStats) -> String {
+    match (s.rate_limit_remain, s.rate_limit_reset) {
         (Some(remain), Some(reset)) => format!("{}/200 (resets in {}s)", remain, reset),
         _ => "unknown".to_string(),
-    };
+    }
+}
+
+/// The client's counters on one line, shared by `--status` and the TUI footer.
+pub fn status_text(s: &ClientStats) -> String {
     format!(
         "In-flight: {} | Waiting: {} | Rate limit: {} | Total: {} | Errors: {}",
-        s.in_flight, s.waiting, rate_limit_str, s.total_requests, s.total_errors
+        s.in_flight,
+        s.waiting,
+        rate_limit_text(s),
+        s.total_requests,
+        s.total_errors
     )
 }
 
@@ -130,21 +158,7 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
         if multiple {
             println!("\n=== Processing corporations ===");
             for &id in &group.corp_ids {
-                let systems = sdata.corporation_systems(id, &resolved.agent_filter);
-                let mut line = corp_label(sdata, id);
-                if !systems.is_empty() {
-                    let shown: Vec<String> = systems
-                        .iter()
-                        .take(10)
-                        .map(|(name, true_sec)| format!("{} ({:.2})", name, true_sec))
-                        .collect();
-                    line.push_str(": ");
-                    line.push_str(&shown.join(", "));
-                    if systems.len() > 10 {
-                        line.push_str(", ...");
-                    }
-                }
-                println!("{}", line);
+                println!("{}", corp_line(sdata, id, &resolved.agent_filter));
             }
         }
         println!("Loyalty offers: {} found", group.offer_count);

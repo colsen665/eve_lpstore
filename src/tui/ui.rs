@@ -1,0 +1,504 @@
+//! Drawing the `--tui` view. These functions read the app state and draw it, and they change
+//! nothing. `draw` returns how the details pane was laid out, so the app can scroll it.
+
+use super::app::{App, Focus, LogLine, Overlay, Stage};
+use crate::output;
+use eve_lpstore::esi::ClientStats;
+use eve_lpstore::format::{format_isk, format_number};
+use eve_lpstore::report::Group;
+use eve_lpstore::{OfferResult, StaticData};
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+};
+use std::collections::VecDeque;
+
+pub const MIN_WIDTH: u16 = 80;
+pub const MIN_HEIGHT: u16 = 20;
+
+/// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
+/// when the results are not on screen.
+pub fn draw(
+    frame: &mut Frame,
+    app: &App,
+    sdata: &StaticData,
+    stats: &ClientStats,
+) -> (usize, usize) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        let message = format!(
+            "Terminal too small: need {}x{}, have {}x{}",
+            MIN_WIDTH, MIN_HEIGHT, area.width, area.height
+        );
+        frame.render_widget(Paragraph::new(message).red(), area);
+        return (0, 0);
+    }
+
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    let summary = format!(
+        "{} | {} corporations | Filters: {}",
+        app.region, app.corporations, app.filters
+    );
+    let inner_width = usize::from(header.width.saturating_sub(2));
+    frame.render_widget(
+        Paragraph::new(truncate(&summary, inner_width))
+            .block(Block::bordered().title(" LP store ")),
+        header,
+    );
+
+    let layout = match app.overlay {
+        Overlay::Log => {
+            draw_log(frame, body, app);
+            (0, 0)
+        }
+        _ if app.report.is_some() => draw_results(frame, body, app, sdata),
+        _ => {
+            draw_progress(frame, body, app);
+            (0, 0)
+        }
+    };
+    if app.overlay == Overlay::Help {
+        draw_help(frame, area);
+    }
+    draw_footer(frame, footer, stats);
+    layout
+}
+
+fn draw_progress(frame: &mut Frame, area: Rect, app: &App) {
+    let [stage, fetch, pricing, log] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    let style = if app.stage == Stage::Failed {
+        Style::new().red()
+    } else {
+        Style::new()
+    };
+    frame.render_widget(Paragraph::new(app.stage_text()).style(style), stage);
+
+    let ((fetch_done, fetch_total), (price_done, price_total)) = app.gauges();
+    gauge(
+        frame,
+        fetch,
+        "Fetching loyalty offers",
+        fetch_done,
+        fetch_total,
+    );
+    gauge(frame, pricing, "Pricing groups", price_done, price_total);
+
+    let height = usize::from(log.height.saturating_sub(2));
+    let lines = log_lines(&app.log, height, 0);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Recent log (l for all) ")),
+        log,
+    );
+}
+
+fn gauge(frame: &mut Frame, area: Rect, title: &str, done: usize, total: usize) {
+    let (ratio, label) = if total == 0 {
+        (0.0, "waiting".to_string())
+    } else {
+        (
+            (done as f64 / total as f64).min(1.0),
+            format!("{} / {}", done, total),
+        )
+    };
+    let widget = Gauge::default()
+        .block(Block::bordered().title(format!(" {} ", title)))
+        .gauge_style(Style::new().fg(Color::Cyan))
+        .ratio(ratio)
+        .label(label);
+    frame.render_widget(widget, area);
+}
+
+fn draw_log(frame: &mut Frame, area: Rect, app: &App) {
+    let height = usize::from(area.height.saturating_sub(2));
+    let lines = log_lines(&app.log, height, app.log_scroll);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Log (l or Esc to close) ")),
+        area,
+    );
+}
+
+/// The newest `height` lines, skipping the `scroll` newest. Errors are red.
+fn log_lines(log: &VecDeque<LogLine>, height: usize, scroll: usize) -> Vec<Line<'static>> {
+    let end = log.len().saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+    log.range(start..end)
+        .map(|line| {
+            let style = if line.is_error {
+                Style::new().red()
+            } else {
+                Style::new()
+            };
+            Line::from(Span::styled(line.text.clone(), style))
+        })
+        .collect()
+}
+
+fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> (usize, usize) {
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(area);
+    let [offers, details] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Min(0)]).areas(right);
+    draw_groups(frame, left, app, sdata);
+    draw_offers(frame, offers, app, sdata);
+    draw_details(frame, details, app, sdata)
+}
+
+fn pane_block(title: &str, focused: bool) -> Block<'static> {
+    let color = if focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+    Block::bordered()
+        .title(title.to_string())
+        .border_style(Style::new().fg(color))
+}
+
+fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
+    let block = pane_block(" Groups ", app.focus == Focus::Groups);
+    let groups = app.groups();
+    if groups.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No loyalty offers were found.").block(block),
+            area,
+        );
+        return;
+    }
+    // Inside the borders, less the two columns of the highlight symbol.
+    let names_width = usize::from(area.width.saturating_sub(4));
+    let items: Vec<ListItem> = groups
+        .iter()
+        .map(|group| group_item(group, sdata, names_width))
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::new().reversed())
+        .highlight_symbol("> ");
+    let mut state = ListState::default().with_selected(Some(app.group));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// A group takes two lines: its ISK per LP and offer count, then its corporations.
+fn group_item(group: &Group, sdata: &StaticData, names_width: usize) -> ListItem<'static> {
+    let isk = group
+        .results
+        .first()
+        .and_then(|result| result.isk_per_lp)
+        .map(|value| format_number(value, 2))
+        .unwrap_or_else(|| "n/a".to_string());
+    let names: Vec<String> = group
+        .corp_ids
+        .iter()
+        .map(|&id| corp_name(sdata, id))
+        .collect();
+    ListItem::new(vec![
+        Line::from(format!("{} ISK/LP | {} offers", isk, group.offer_count)),
+        Line::from(Span::styled(
+            truncate(&names.join(", "), names_width),
+            Style::new().dark_gray(),
+        )),
+    ])
+}
+
+/// Cuts `text` to `width` characters, ending a cut with an ellipsis.
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{}…", kept)
+}
+
+fn corp_name(sdata: &StaticData, corp_id: i32) -> String {
+    sdata
+        .corporation_name(corp_id)
+        .cloned()
+        .unwrap_or_else(|| corp_id.to_string())
+}
+
+fn item_name(sdata: &StaticData, type_id: i32) -> String {
+    sdata
+        .type_name(type_id)
+        .cloned()
+        .unwrap_or_else(|| format!("Type {}", type_id))
+}
+
+fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
+    let block = pane_block(" Offers ", app.focus == Focus::Offers);
+    let Some(group) = app.selected_group() else {
+        frame.render_widget(Paragraph::new("").block(block), area);
+        return;
+    };
+    let rows: Vec<Row> = group
+        .results
+        .iter()
+        .take(app.depth)
+        .enumerate()
+        .map(|(rank, result)| offer_row(rank, result, sdata))
+        .collect();
+    let header = Row::new(["#", "Item", "LP", "ISK/LP", "Profit/unit"]).style(Style::new().bold());
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Min(12),
+            Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(14),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .row_highlight_style(Style::new().reversed())
+    .highlight_symbol("> ");
+    let mut state = TableState::default().with_selected(Some(app.offer));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData) -> Row<'static> {
+    let profit = match (result.reward, result.unit_cost) {
+        (Some(reward), Some(unit_cost)) => format_number(reward - unit_cost, 2),
+        _ => "n/a".to_string(),
+    };
+    let isk_per_lp = result
+        .isk_per_lp
+        .map(|value| format_number(value, 2))
+        .unwrap_or_else(|| "n/a".to_string());
+    Row::new(vec![
+        (rank + 1).to_string(),
+        item_name(sdata, result.offer.type_id),
+        format_number(result.offer.lp_cost as f64, 0),
+        isk_per_lp,
+        profit,
+    ])
+}
+
+/// Draws the details pane, wrapped to its width, and returns (rows, rows on screen).
+fn draw_details(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> (usize, usize) {
+    let block = pane_block(" Details ", app.focus == Focus::Details);
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let visible = usize::from(area.height.saturating_sub(2));
+    let lines: Vec<Line<'static>> = detail_entries(app, sdata)
+        .iter()
+        .flat_map(|(text, style)| wrap(text, width, *style))
+        .collect();
+    let rows = lines.len();
+    let scroll = app.detail_scroll.min(rows.saturating_sub(visible));
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    (rows, visible)
+}
+
+/// Splits `text` into rows of at most `width` characters, breaking at spaces where it can. A
+/// word longer than a row is cut into pieces.
+fn wrap(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split(' ') {
+        let len = word.chars().count();
+        let joined = if current.is_empty() {
+            len
+        } else {
+            current.chars().count() + 1 + len
+        };
+        if joined <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            continue;
+        }
+        if !current.is_empty() {
+            rows.push(std::mem::take(&mut current));
+        }
+        let chars: Vec<char> = word.chars().collect();
+        let mut pieces = chars.chunks(width).peekable();
+        while let Some(piece) = pieces.next() {
+            let piece: String = piece.iter().collect();
+            if pieces.peek().is_some() {
+                rows.push(piece);
+            } else {
+                current = piece;
+            }
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows.into_iter()
+        .map(|row| Line::from(Span::styled(row, style)))
+        .collect()
+}
+
+/// The text of the details pane, one entry per logical line. `wrap` turns each entry into one
+/// or more screen rows.
+fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
+    let plain = Style::new();
+    let bold = Style::new().bold();
+    let Some(group) = app.selected_group() else {
+        return Vec::new();
+    };
+    let mut lines = vec![("Corporations".to_string(), bold)];
+    for &id in &group.corp_ids {
+        lines.push((output::corp_line(sdata, id, &app.agent_filter), plain));
+    }
+    lines.push((String::new(), plain));
+
+    match app.selected_offer() {
+        Some(result) => {
+            lines.push((
+                format!("Offer: {}", item_name(sdata, result.offer.type_id)),
+                bold,
+            ));
+            lines.push((
+                format!(
+                    "LP cost: {} | Units per redemption: {}",
+                    format_number(result.offer.lp_cost as f64, 0),
+                    format_number(result.offer.quantity as f64, 0)
+                ),
+                plain,
+            ));
+            lines.push((
+                format!(
+                    "Reward: {} | Unit cost: {} | Profit per unit: {}",
+                    optional(result.reward),
+                    optional(result.unit_cost),
+                    match (result.reward, result.unit_cost) {
+                        (Some(reward), Some(unit_cost)) => format_number(reward - unit_cost, 2),
+                        _ => "n/a".to_string(),
+                    }
+                ),
+                plain,
+            ));
+            lines.push((
+                format!(
+                    "ISK/LP: {} | ISK cost: {} | Total ISK: {}",
+                    optional(result.isk_per_lp),
+                    format_number(result.breakdown.isk_cost, 2),
+                    format_number(result.breakdown.total_isk, 2)
+                ),
+                plain,
+            ));
+            lines.push((
+                match result.within_10 {
+                    Some((volume, profit)) => format!(
+                        "Volume within 10% of best bid: {}, total profit: {}",
+                        format_number(volume as f64, 0),
+                        format_isk(profit)
+                    ),
+                    None => "Volume within 10% of best bid: n/a, total profit: n/a".to_string(),
+                },
+                plain,
+            ));
+            lines.push(("Items:".to_string(), plain));
+            for item in &result.breakdown.item_expenses {
+                lines.push((
+                    format!(
+                        "  {}: {} x {} ISK = {} ISK",
+                        item_name(sdata, item.type_id),
+                        format_number(item.quantity as f64, 0),
+                        format_number(item.best_price, 2),
+                        format_number(item.total_cost, 2)
+                    ),
+                    plain,
+                ));
+            }
+        }
+        None => lines.push(("No offers were priced for this group.".to_string(), plain)),
+    }
+    lines
+}
+
+fn optional(value: Option<f64>) -> String {
+    value
+        .map(|value| format_number(value, 2))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn draw_help(frame: &mut Frame, area: Rect) {
+    let rows = [
+        ("Tab", "switch between groups, offers, and details"),
+        (
+            "Up, Down, j, k",
+            "move the selection, or scroll the details",
+        ),
+        ("PgUp, PgDn", "move a page at a time"),
+        ("l", "show or hide the full log"),
+        ("?", "show or hide this help"),
+        ("Esc", "close the log or this help"),
+        ("q, Ctrl+C", "quit, stopping the run if it is still going"),
+    ];
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(key, text)| Line::from(format!("{:<16}{}", key, text)))
+        .collect();
+    let popup = area.centered(
+        Constraint::Length(70),
+        Constraint::Length(lines.len() as u16 + 2),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Keys ")),
+        popup,
+    );
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats) {
+    let lines = vec![
+        Line::from(format!(
+            "In-flight: {} | Waiting: {} | Rate limit: {} | Errors: {}",
+            stats.in_flight,
+            stats.waiting,
+            output::rate_limit_text(stats),
+            stats.total_errors
+        )),
+        Line::from(format!(
+            "Cache: {} hits, {} misses, {} writes",
+            stats.cache_hits, stats.cache_misses, stats.cache_writes
+        )),
+        Line::from("Tab panes  Up/Down move  PgUp/PgDn page  l log  ? help  q quit").dark_gray(),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines.iter().map(|line| line.to_string()).collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_cuts_long_words() {
+        let rows = wrap("Ministry of Assessment (1000081): Turba", 20, Style::new());
+        assert_eq!(
+            texts(&rows),
+            ["Ministry of", "Assessment", "(1000081): Turba"]
+        );
+        let cut = wrap("abcdefghij", 4, Style::new());
+        assert_eq!(texts(&cut), ["abcd", "efgh", "ij"]);
+        assert_eq!(texts(&wrap("", 10, Style::new())), [""]);
+    }
+
+    #[test]
+    fn truncate_ends_a_cut_with_an_ellipsis() {
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        assert_eq!(truncate("abc", 4), "abc");
+    }
+}
