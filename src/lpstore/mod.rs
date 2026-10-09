@@ -1,7 +1,7 @@
 use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
 use crate::esi::EsiClient;
-use crate::expenses::{breakdown_from, BuyOrder, ExpenseBreakdown, ItemExpense};
+use crate::expenses::{breakdown_from, ExpenseBreakdown, ItemExpense, MarketQuote};
 use crate::tasks::run_children;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -15,6 +15,11 @@ pub struct OfferResult {
     pub reward: Option<f64>,
     pub unit_cost: Option<f64>,
     pub isk_per_lp: Option<f64>,
+    /// The lowest sell price for the reward, or `None` when nothing sells it.
+    pub best_ask: Option<f64>,
+    /// The bid/ask spread on the reward as a percentage of the best bid, or `None` when one side
+    /// of the market is missing.
+    pub spread: Option<f64>,
     pub within_10: Option<(i64, f64)>,
 }
 
@@ -82,7 +87,7 @@ enum Child {
 /// The output of a subtask of pricing one offer.
 enum Priced {
     Item(Result<ItemExpense, EsiError>),
-    Reward(Result<Vec<BuyOrder>, EsiError>),
+    Reward(Result<MarketQuote, EsiError>),
 }
 
 async fn price_offer(
@@ -113,7 +118,7 @@ async fn price_offer(
                 Child::Reward => Priced::Reward(
                     client
                         .expenses()
-                        .buy_orders(type_id, region_id, locations.as_deref())
+                        .reward_quote(type_id, region_id, locations.as_deref())
                         .await,
                 ),
             }
@@ -122,12 +127,12 @@ async fn price_offer(
     .await;
 
     let mut item_expenses = Vec::with_capacity(offer.required_items.len());
-    let mut buy_orders = None;
+    let mut quote = None;
     let mut failure = None;
     for outcome in priced {
         match outcome {
             Priced::Item(Ok(item)) => item_expenses.push(item),
-            Priced::Reward(Ok(orders)) => buy_orders = Some(orders),
+            Priced::Reward(Ok(market)) => quote = Some(market),
             Priced::Item(Err(error)) | Priced::Reward(Err(error)) => {
                 failure.get_or_insert(error);
             }
@@ -136,10 +141,11 @@ async fn price_offer(
     if let Some(error) = failure {
         return Err(OfferError { offer_id, error });
     }
-    let buy_orders = buy_orders.expect("reward lookup always produces an output");
+    let quote = quote.expect("reward lookup always produces an output");
 
     let breakdown = breakdown_from(&offer, item_expenses);
-    let reward = buy_orders
+    let reward = quote
+        .buy_orders
         .iter()
         .map(|o| o.price)
         .fold(None, |best: Option<f64>, price| {
@@ -147,11 +153,13 @@ async fn price_offer(
         });
     let unit_cost = (offer.quantity > 0).then(|| breakdown.total_isk / offer.quantity as f64);
     let isk_per_lp = redemption_isk_per_lp(reward, &offer, breakdown.total_isk);
+    let spread = spread_percent(reward, quote.best_ask);
     let within_10 = match (reward, unit_cost) {
         (Some(best), Some(unit_cost)) => {
             let threshold = best * 0.9;
             Some(
-                buy_orders
+                quote
+                    .buy_orders
                     .iter()
                     .filter(|o| o.price >= threshold)
                     .fold((0i64, 0f64), |(volume, profit), o| {
@@ -171,6 +179,8 @@ async fn price_offer(
         reward,
         unit_cost,
         isk_per_lp,
+        best_ask: quote.best_ask,
+        spread,
         within_10,
     })
 }
@@ -181,6 +191,18 @@ fn redemption_isk_per_lp(reward: Option<f64>, offer: &LoyaltyOffer, total_isk: f
     let reward = reward?;
     (offer.quantity > 0 && offer.lp_cost > 0)
         .then(|| (reward * offer.quantity as f64 - total_isk) / offer.lp_cost as f64)
+}
+
+/// The bid/ask spread on the reward as a percentage of the best bid. The best bid is the reward,
+/// the price the offer can actually sell at, so the spread says how much more the item costs to
+/// buy back: a wide one means the best bid may be a single stale order, and the ISK per LP built
+/// on it is optimistic.
+///
+/// `None` when either side of the market is missing, which includes the common case of a reward
+/// nobody sells. A negative result means the market is inverted, with the bid above the ask.
+fn spread_percent(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64> {
+    let bid = best_bid.filter(|bid| *bid > 0.0)?;
+    Some((best_ask? - bid) / bid * 100.0)
 }
 
 #[cfg(test)]
@@ -223,5 +245,28 @@ mod tests {
     fn isk_per_lp_needs_a_reward_and_lp_cost() {
         assert_eq!(redemption_isk_per_lp(None, &offer(10, 100), 0.0), None);
         assert_eq!(redemption_isk_per_lp(Some(1.0), &offer(10, 0), 0.0), None);
+    }
+
+    #[test]
+    fn spread_is_the_ask_as_a_percentage_over_the_bid() {
+        assert_eq!(spread_percent(Some(200.0), Some(250.0)), Some(25.0));
+        assert_eq!(spread_percent(Some(200.0), Some(200.0)), Some(0.0));
+    }
+
+    #[test]
+    fn spread_is_negative_when_the_market_is_inverted() {
+        assert_eq!(spread_percent(Some(200.0), Some(150.0)), Some(-25.0));
+    }
+
+    #[test]
+    fn spread_needs_both_sides_of_the_market() {
+        assert_eq!(spread_percent(Some(200.0), None), None);
+        assert_eq!(spread_percent(None, Some(250.0)), None);
+        assert_eq!(spread_percent(None, None), None);
+    }
+
+    #[test]
+    fn spread_needs_a_positive_bid() {
+        assert_eq!(spread_percent(Some(0.0), Some(250.0)), None);
     }
 }

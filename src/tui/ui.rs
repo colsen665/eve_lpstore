@@ -14,7 +14,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Block, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
 use std::collections::VecDeque;
 
@@ -27,8 +27,18 @@ const VALUE_WIDTH: usize = 26;
 const DONATION_ADDRESS: &str = "bc1qyc55ddky2ehdnty2c48nvxxugjw2xdpxk956x7";
 
 /// The offers pane is at least this many columns wide, including its borders. Narrower panes
-/// leave out the volume column.
+/// leave out the volume column. The spread column shows in both.
 const WIDE_OFFERS: u16 = 66;
+
+/// The spread is the fourth offers column, after the rank, the item, and the ISK per LP.
+const SPREAD_COLUMN: usize = 3;
+
+/// A spread up to this percentage means the market is tight enough to trust the best bid.
+const SPREAD_TIGHT: f64 = 10.0;
+
+/// A spread past this percentage means the best bid is probably a single stale order, and the
+/// ISK per LP built on it is optimistic.
+const SPREAD_WIDE: f64 = 50.0;
 
 /// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
 /// when the results are not on screen.
@@ -457,28 +467,7 @@ fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
         .enumerate()
         .map(|(rank, result)| offer_row(rank, result, sdata, wide))
         .collect();
-    let (titles, widths) = if wide {
-        (
-            vec!["#", "Item", "ISK/LP", "Vol ±10%", "Profit ±10%"],
-            vec![
-                Constraint::Length(4),
-                Constraint::Min(12),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Length(11),
-            ],
-        )
-    } else {
-        (
-            vec!["#", "Item", "ISK/LP", "Profit ±10%"],
-            vec![
-                Constraint::Length(4),
-                Constraint::Min(12),
-                Constraint::Length(12),
-                Constraint::Length(11),
-            ],
-        )
-    };
+    let (titles, widths) = offer_columns(wide);
     let header = Row::new(titles).style(Style::new().bold());
     let table = Table::new(rows, widths)
         .header(header)
@@ -489,9 +478,49 @@ fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+/// The offers table's column titles and widths. The volume column only appears when `wide`, and
+/// the spread shows in both. These have to agree in length with `offer_cells`.
+fn offer_columns(wide: bool) -> (Vec<&'static str>, Vec<Constraint>) {
+    if wide {
+        (
+            vec!["#", "Item", "ISK/LP", "Spread", "Vol ±10%", "Profit ±10%"],
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(12),
+                Constraint::Length(12),
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(11),
+            ],
+        )
+    } else {
+        (
+            vec!["#", "Item", "ISK/LP", "Spread", "Profit ±10%"],
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(12),
+                Constraint::Length(12),
+                Constraint::Length(8),
+                Constraint::Length(11),
+            ],
+        )
+    }
+}
+
 fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData, wide: bool) -> Row<'static> {
     let item = item_name(sdata, result.offer.type_id);
-    Row::new(offer_cells(rank, result, item, wide))
+    let cells = offer_cells(rank, result, item, wide)
+        .into_iter()
+        .enumerate()
+        .map(|(column, text)| {
+            if column == SPREAD_COLUMN {
+                Cell::from(text).style(spread_style(result.spread))
+            } else {
+                Cell::from(text)
+            }
+        })
+        .collect::<Vec<_>>();
+    Row::new(cells)
 }
 
 /// The cells of an offer row. The volume within 10% of the best bid is left out when `wide` is
@@ -505,12 +534,41 @@ fn offer_cells(rank: usize, result: &OfferResult, item: String, wide: bool) -> V
         Some((volume, profit)) => (format_number(volume as f64, 0), short_isk(profit)),
         None => ("n/a".to_string(), "n/a".to_string()),
     };
-    let mut cells = vec![(rank + 1).to_string(), item, isk_per_lp];
+    let mut cells = vec![
+        (rank + 1).to_string(),
+        item,
+        isk_per_lp,
+        format_spread(result.spread),
+    ];
     if wide {
         cells.push(volume);
     }
     cells.push(profit);
     cells
+}
+
+/// The spread as a percentage. An illiquid reward can spread by orders of magnitude, so anything
+/// past 999% is capped to hold the column's width.
+fn format_spread(spread: Option<f64>) -> String {
+    match spread {
+        None => "n/a".to_string(),
+        Some(value) if value > 999.0 => ">999%".to_string(),
+        Some(value) => format!("{:.2}%", value),
+    }
+}
+
+/// The colour of a spread. Green when the market is tight enough to trust the best bid, yellow as
+/// it widens, and red when the best bid is probably a single stale order. Magenta marks an
+/// inverted market. A missing side is dim rather than alarming: a reward nobody sells is not the
+/// same thing as a bad market.
+fn spread_style(spread: Option<f64>) -> Style {
+    match spread {
+        None => Style::new().dark_gray(),
+        Some(value) if value < 0.0 => Style::new().magenta(),
+        Some(value) if value <= SPREAD_TIGHT => Style::new().green(),
+        Some(value) if value <= SPREAD_WIDE => Style::new().yellow(),
+        Some(_) => Style::new().red(),
+    }
 }
 
 /// ISK in about eight characters: billions, millions, or thousands, with two decimals.
@@ -631,6 +689,14 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
                     }
                 ),
                 plain,
+            ));
+            lines.push((
+                format!(
+                    "Best ask: {} | Spread: {}",
+                    optional(result.best_ask),
+                    format_spread(result.spread)
+                ),
+                spread_style(result.spread),
             ));
             lines.push((
                 format!(
@@ -825,7 +891,7 @@ mod tests {
         assert_eq!(truncate("abc", 4), "abc");
     }
 
-    fn priced_offer(within_10: Option<(i64, f64)>) -> OfferResult {
+    fn priced_offer(spread: Option<f64>, within_10: Option<(i64, f64)>) -> OfferResult {
         OfferResult {
             offer: LoyaltyOffer {
                 offer_id: 1,
@@ -845,6 +911,9 @@ mod tests {
             reward: Some(457_900.0),
             unit_cost: Some(164_900.0),
             isk_per_lp: Some(1627.78),
+            // The ask that goes with the spread, so the fixture stays internally consistent.
+            best_ask: spread.map(|s| 457_900.0 * (1.0 + s / 100.0)),
+            spread,
             within_10,
         }
     }
@@ -860,27 +929,94 @@ mod tests {
 
     #[test]
     fn wide_offer_rows_show_the_volume_and_the_profit_within_10_percent() {
-        let result = priced_offer(Some((2_474_600, 3_980_000_000.0)));
+        let result = priced_offer(Some(12.5), Some((2_474_600, 3_980_000_000.0)));
         let cells = offer_cells(0, &result, "Sisters Combat Scanner Probe".to_string(), true);
-        assert_eq!(cells.len(), 5);
-        assert_eq!(cells[3], "2,474,600");
-        assert_eq!(cells[4], "3.98B");
+        assert_eq!(cells.len(), 6);
+        assert_eq!(cells[3], "12.50%");
+        assert_eq!(cells[4], "2,474,600");
+        assert_eq!(cells[5], "3.98B");
     }
 
     #[test]
     fn narrow_offer_rows_leave_out_the_volume() {
-        let result = priced_offer(Some((2_474_600, 3_980_000_000.0)));
+        let result = priced_offer(Some(12.5), Some((2_474_600, 3_980_000_000.0)));
         let cells = offer_cells(0, &result, "Probe".to_string(), false);
-        assert_eq!(cells.len(), 4);
-        assert_eq!(cells[3], "3.98B");
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[3], "12.50%");
+        assert_eq!(cells[4], "3.98B");
     }
 
     #[test]
     fn offers_without_a_reward_show_n_a() {
-        let result = priced_offer(None);
+        let result = priced_offer(Some(12.5), None);
+        let cells = offer_cells(0, &result, "Probe".to_string(), true);
+        assert_eq!(cells[3], "12.50%");
+        assert_eq!(cells[4], "n/a");
+        assert_eq!(cells[5], "n/a");
+    }
+
+    #[test]
+    fn the_spread_column_shows_n_a_without_an_ask() {
+        let result = priced_offer(None, Some((100, 1000.0)));
         let cells = offer_cells(0, &result, "Probe".to_string(), true);
         assert_eq!(cells[3], "n/a");
-        assert_eq!(cells[4], "n/a");
+    }
+
+    #[test]
+    fn a_huge_spread_is_capped_to_hold_the_column_width() {
+        assert_eq!(format_spread(Some(12.5)), "12.50%");
+        assert_eq!(format_spread(Some(-25.0)), "-25.00%");
+        assert_eq!(format_spread(Some(-100.0)), "-100.00%");
+        assert_eq!(format_spread(Some(999.0)), "999.00%");
+        assert_eq!(format_spread(Some(999.5)), ">999%");
+        assert_eq!(format_spread(Some(1234.5)), ">999%");
+        assert_eq!(format_spread(None), "n/a");
+    }
+
+    #[test]
+    fn the_spread_colour_follows_the_bands() {
+        assert_eq!(spread_style(Some(0.0)), Style::new().green());
+        assert_eq!(spread_style(Some(SPREAD_TIGHT)), Style::new().green());
+        assert_eq!(spread_style(Some(10.1)), Style::new().yellow());
+        assert_eq!(spread_style(Some(SPREAD_WIDE)), Style::new().yellow());
+        assert_eq!(spread_style(Some(50.1)), Style::new().red());
+        assert_eq!(spread_style(Some(-1.0)), Style::new().magenta());
+        assert_eq!(spread_style(None), Style::new().dark_gray());
+    }
+
+    #[test]
+    fn the_offer_columns_match_the_cells_in_both_layouts() {
+        // The titles, the widths, and the cells are three parallel lists, and a row that
+        // disagrees with the other two renders misaligned.
+        let result = priced_offer(Some(12.5), Some((100, 1000.0)));
+        for wide in [true, false] {
+            let (titles, widths) = offer_columns(wide);
+            let cells = offer_cells(0, &result, "Probe".to_string(), wide);
+            assert_eq!(titles.len(), cells.len(), "titles, wide {}", wide);
+            assert_eq!(widths.len(), cells.len(), "widths, wide {}", wide);
+        }
+    }
+
+    #[test]
+    fn the_narrow_offer_columns_fit_the_smallest_pane() {
+        // The offers pane gets 68% of an 80-column terminal. Its borders take two columns and the
+        // "> " highlight takes two more, which leaves the rest for the cells.
+        let (_, widths) = offer_columns(false);
+        let needed: u16 = widths
+            .iter()
+            .map(|column| match column {
+                Constraint::Length(columns) | Constraint::Min(columns) => *columns,
+                _ => 0,
+            })
+            .sum::<u16>()
+            + 4;
+        let pane = MIN_WIDTH * 68 / 100;
+        assert!(
+            needed <= pane,
+            "the narrow columns need {} of the {} available",
+            needed,
+            pane
+        );
     }
 
     fn screen_text(width: u16, height: u16) -> String {

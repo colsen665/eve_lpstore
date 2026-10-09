@@ -191,8 +191,12 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 .isk_per_lp
                 .map(|v| format_number(v, 2))
                 .unwrap_or_else(|| "n/a".to_string());
+            let spread_str = r
+                .spread
+                .map(|v| format!("{:.2}%", v))
+                .unwrap_or_else(|| "n/a".to_string());
             println!(
-                "{}. {}: LP={}, units per redemption={}, reward={}, unit cost={}, profit per unit={}, ISK/LP={}",
+                "{}. {}: LP={}, units per redemption={}, reward={}, unit cost={}, profit per unit={}, ISK/LP={}, spread={}",
                 rank + 1,
                 item_name,
                 format_number(r.offer.lp_cost as f64, 0),
@@ -200,7 +204,8 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 reward_str,
                 unit_cost_str,
                 profit_per_unit_str,
-                isk_per_lp_str
+                isk_per_lp_str,
+                spread_str
             );
             match r.within_10 {
                 Some((volume, profit)) => println!(

@@ -15,6 +15,15 @@ pub struct BuyOrder {
     pub volume_remain: i32,
 }
 
+/// Both sides of the market for a reward item in a region.
+#[derive(Debug, Clone)]
+pub struct MarketQuote {
+    /// The buy orders the reward can sell into.
+    pub buy_orders: Vec<BuyOrder>,
+    /// The lowest sell price, or `None` when nothing sells it.
+    pub best_ask: Option<f64>,
+}
+
 /// The calculated market cost of a single required item.
 #[derive(Debug, Clone)]
 pub struct ItemExpense {
@@ -54,27 +63,43 @@ pub struct ExpensesEndpoint<'a> {
 }
 
 impl<'a> ExpensesEndpoint<'a> {
-    /// Buy orders for a type in the given region.
-    pub async fn buy_orders(
+    /// Both sides of the market for a reward type in the given region.
+    ///
+    /// The buy orders are what the reward can sell into. The best ask is what buying one would
+    /// cost, and is `None` when nothing sells it. That is not an error: the offer still prices,
+    /// and only the spread is unknown.
+    pub async fn reward_quote(
         &self,
         type_id: i32,
         region_id: i32,
         locations: Option<&HashSet<i64>>,
-    ) -> Result<Vec<BuyOrder>, EsiError> {
+    ) -> Result<MarketQuote, EsiError> {
         let orders = self
             .client
             .markets()
             .orders(region_id, Some(type_id))
             .await?;
 
-        Ok(orders
+        let buy_orders = orders
             .iter()
             .filter(|o| o.is_buy_order && in_locations(locations, o.location_id))
             .map(|o| BuyOrder {
                 price: o.price,
                 volume_remain: o.volume_remain,
             })
-            .collect())
+            .collect();
+        let best_ask = orders
+            .iter()
+            .filter(|o| !o.is_buy_order && in_locations(locations, o.location_id))
+            .map(|o| o.price)
+            .fold(None, |best: Option<f64>, price| {
+                Some(best.map_or(price, |b| b.min(price)))
+            });
+
+        Ok(MarketQuote {
+            buy_orders,
+            best_ask,
+        })
     }
 
     /// The cost of one required item at the best (lowest) sell price in the region.

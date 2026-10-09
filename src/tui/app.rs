@@ -467,6 +467,8 @@ mod tests {
             reward: None,
             unit_cost: None,
             isk_per_lp: Some(isk_per_lp),
+            best_ask: None,
+            spread: None,
             within_10: None,
         }
     }
