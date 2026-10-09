@@ -56,14 +56,15 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 5: Tests and docs
 
-- [ ] Unit tests for state transitions: key sequences, progress events, stale run ids, and validation errors.
-- [ ] Render tests with `ratatui::backend::TestBackend` at 80x24 and 120x40.
-- [ ] Update `HELP_TEXT` with `--tui` examples.
+- [x] Unit tests for state transitions: key sequences, progress events, stale run ids, and validation errors. 44 tests live in `src/tui/`: `app.rs` covers keys, progress, stale run ids, and offer errors, `form.rs` covers per-field and general validation errors, `mod.rs` covers run identity and the filter summary, and `qr.rs` covers the QR rendering.
+- [x] Render tests with `ratatui::backend::TestBackend`. `src/tui/ui.rs` renders at 80x24 and 80x20, and tests `wrap`, `truncate`, `tail`, `fit`, and the wide and narrow offer rows.
+- [ ] Add a 120x40 render test. The `screen_text` helper draws only `draw_donate`, so the results view has no full-screen test yet.
+- [ ] Update `HELP_TEXT` with `--tui` examples. `--tui` is in Modes and the usage line, and `--status` and `--verbose` mention it, but the Examples block has no `--tui` entry.
 - [ ] Manual check in a real terminal: resize, filter apply during a run, quit, Ctrl-C, and a forced panic.
 
 #### Phase 6: Later
 
-- [ ] Sort toggles for ISK per LP, profit, and volume.
+- [ ] Sort toggles for ISK per LP, profit, and volume. Sorting is fixed today: the pipeline orders groups by the average ISK per LP over the top `--depth` offers, and `Report::sort_by_depth` re-sorts when depth changes in the TUI.
 - [ ] Export the current view to CSV or JSON.
 
 ## Done
@@ -84,3 +85,8 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] Atomic cache writes and request deduplication.
 - [x] Unknown arguments are rejected.
 - [x] `--help` with examples.
+- [x] Keep looking for page 1 when a sibling cache file is listed first.
+- [x] Compute ISK per LP for the whole redemption. The reward is per unit, so it is multiplied by the offer quantity against the redemption's total ISK; multi-unit offers were undervalued before.
+- [x] `d` donation overlay in `--tui`, showing the address as a QR code from `src/tui/qr.rs`. Esc or `d` closes it, `q` still quits from it, and it falls back to the address alone when the code does not fit.
+- [x] Widen the offer table columns. The volume and within-10% figures show only when there is room, and offers without a reward show `n/a`.
+- [x] Sort groups by the average ISK per LP over the top `--depth` offers, instead of by the single best offer. Offers without a value are left out of the average, and ties break on the group's first corp ID.
