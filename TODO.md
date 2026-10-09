@@ -37,8 +37,8 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] Progress view, shown until the first run finishes: gauges for fetch and pricing, plus recent log lines.
 - [x] Results layout, using the CLI's grouping:
   - [x] Groups pane on the left: each group's top ISK per LP, offer count, and corp names, best first.
-  - [x] Offers pane on the right: the selected group's top `--depth` offers, with the CLI's key columns (LP, ISK/LP, profit per unit). Reward, unit cost, units, and the within-10% figures are in the detail pane, because the table has no room for them beside the groups list.
-  - [x] Detail pane: the group's corps with their agent systems, as the CLI prints them, plus the selected offer's breakdown, within-10% volume, and profit.
+  - [x] Offers pane on the right: the selected group's top `--depth` offers. Columns are `#`, Item, ISK/LP, Spread, and Profit ±10%, with Imbal and Vol ±10% added once the pane reaches `WIDE_OFFERS` (70) columns. LP cost, reward, unit cost, units, and best ask are in the detail pane, because the table has no room for them beside the groups list.
+  - [x] Detail pane: the group's corps with their agent systems, as the CLI prints them, plus the selected offer's breakdown, the within-10% volume on both sides of the book, the spread, the imbalance, and the profit.
 - [x] Status bar: in flight, waiting, rate limit, errors, and cache hits, misses, and writes.
 - [x] Log panel (`l`): cache lines under `--verbose`, plus fetch and pricing errors.
 - [x] Keys: arrows or j/k to move, Tab to switch panes, PgUp/PgDn to scroll, `?` for help, and `q` to quit. Ctrl-C also quits. Quitting aborts the current run.
@@ -56,15 +56,15 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 5: Tests and docs
 
-- [x] Unit tests for state transitions: key sequences, progress events, stale run ids, and validation errors. 44 tests live in `src/tui/`: `app.rs` covers keys, progress, stale run ids, and offer errors, `form.rs` covers per-field and general validation errors, `mod.rs` covers run identity and the filter summary, and `qr.rs` covers the QR rendering.
+- [x] Unit tests for state transitions: key sequences, progress events, stale run ids, and validation errors. 53 tests live in `src/tui/`: `app.rs` covers keys, progress, stale run ids, and offer errors, `form.rs` covers per-field and general validation errors, `mod.rs` covers run identity and the filter summary, `qr.rs` covers the QR rendering, and `ui.rs` covers text fitting, the offer cells, the spread and imbalance formatting and colours, and the column width budget.
 - [x] Render tests with `ratatui::backend::TestBackend`. `src/tui/ui.rs` renders at 80x24 and 80x20, and tests `wrap`, `truncate`, `tail`, `fit`, and the wide and narrow offer rows.
-- [ ] Add a 120x40 render test. The `screen_text` helper draws only `draw_donate`, so the results view has no full-screen test yet.
+- [ ] Add a 120x40 render test. The `screen_text` helper draws only `draw_donate`, so the results view has no full-screen test yet. This matters more now that the offers table has seven columns in the wide layout: the width budget is checked by arithmetic in `columns_needed`, never by an actual render, and both layouts sit at three columns of slack. It needs a `StaticData` fixture, which is why it does not exist yet.
 - [ ] Update `HELP_TEXT` with `--tui` examples. `--tui` is in Modes and the usage line, and `--status` and `--verbose` mention it, but the Examples block has no `--tui` entry.
 - [ ] Manual check in a real terminal: resize, filter apply during a run, quit, Ctrl-C, and a forced panic.
 
 #### Phase 6: Later
 
-- [ ] Sort toggles for ISK per LP, profit, and volume. Sorting is fixed today: the pipeline orders groups by the average ISK per LP over the top `--depth` offers, and `Report::sort_by_depth` re-sorts when depth changes in the TUI.
+- [ ] Sort toggles for ISK per LP, profit, and volume, plus spread and imbalance now that both are on `OfferResult`. Sorting is fixed today: the pipeline orders groups by the average ISK per LP over the top `--depth` offers, and `Report::sort_by_depth` re-sorts when depth changes in the TUI.
 - [ ] Export the current view to CSV or JSON.
 
 ## Done
@@ -90,3 +90,7 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] `d` donation overlay in `--tui`, showing the address as a QR code from `src/tui/qr.rs`. Esc or `d` closes it, `q` still quits from it, and it falls back to the address alone when the code does not fit.
 - [x] Widen the offer table columns. The volume and within-10% figures show only when there is room, and offers without a reward show `n/a`.
 - [x] Sort groups by the average ISK per LP over the top `--depth` offers, instead of by the single best offer. Offers without a value are left out of the average, and ties break on the group's first corp ID.
+- [x] Remove the LP column from the Offers pane. LP cost stays in the detail pane, and the freed width made room for the spread column.
+- [x] Bid/ask spread on the reward, as a percentage of the best bid, in a coloured Offers pane column and in the CLI's `spread=`. Green up to 10%, yellow to 50%, red past that, magenta when the market is inverted, and dim when nothing sells the reward. Capped at `>999%` to hold the column width.
+- [x] Bid/ask imbalance within 10% of the touch, in a coloured wide-layout column and in the CLI's `imbalance=`. Green at +25% and above, red at -25% and below, yellow closer to even, and dim when either side is empty. `WIDE_OFFERS` rose from 66 to 70 to fit it.
+- [x] Both read the ask side of a response the reward lookup already fetched and previously discarded, so neither adds an ESI request: a full run priced 690 offers from 24,233 cache hits with no misses and no writes. Spread and imbalance come back `n/a` on exactly the same 30 offers, since the bid depth reuses the within-10% volume.
