@@ -26,6 +26,10 @@ const VALUE_WIDTH: usize = 26;
 
 const DONATION_ADDRESS: &str = "bc1qyc55ddky2ehdnty2c48nvxxugjw2xdpxk956x7";
 
+/// The offers pane is at least this many columns wide, including its borders. Narrower panes
+/// leave out the volume column.
+const WIDE_OFFERS: u16 = 66;
+
 /// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
 /// when the results are not on screen.
 pub fn draw(
@@ -441,48 +445,90 @@ fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
         frame.render_widget(Paragraph::new("").block(block), area);
         return;
     };
+    let wide = area.width >= WIDE_OFFERS;
     let rows: Vec<Row> = group
         .results
         .iter()
         .take(app.depth)
         .enumerate()
-        .map(|(rank, result)| offer_row(rank, result, sdata))
+        .map(|(rank, result)| offer_row(rank, result, sdata, wide))
         .collect();
-    let header = Row::new(["#", "Item", "LP", "ISK/LP", "Profit/unit"]).style(Style::new().bold());
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(4),
-            Constraint::Min(12),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(14),
-        ],
-    )
-    .header(header)
-    .block(block)
-    .row_highlight_style(Style::new().reversed())
-    .highlight_symbol("> ");
+    let (titles, widths) = if wide {
+        (
+            vec!["#", "Item", "LP", "ISK/LP", "Vol ±10%", "Profit ±10%"],
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(12),
+                Constraint::Length(8),
+                Constraint::Length(12),
+                Constraint::Length(10),
+                Constraint::Length(11),
+            ],
+        )
+    } else {
+        (
+            vec!["#", "Item", "LP", "ISK/LP", "Profit ±10%"],
+            vec![
+                Constraint::Length(4),
+                Constraint::Min(12),
+                Constraint::Length(8),
+                Constraint::Length(12),
+                Constraint::Length(11),
+            ],
+        )
+    };
+    let header = Row::new(titles).style(Style::new().bold());
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .row_highlight_style(Style::new().reversed())
+        .highlight_symbol("> ");
     let mut state = TableState::default().with_selected(Some(app.offer));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData) -> Row<'static> {
-    let profit = match (result.reward, result.unit_cost) {
-        (Some(reward), Some(unit_cost)) => format_number(reward - unit_cost, 2),
-        _ => "n/a".to_string(),
-    };
+fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData, wide: bool) -> Row<'static> {
+    let item = item_name(sdata, result.offer.type_id);
+    Row::new(offer_cells(rank, result, item, wide))
+}
+
+/// The cells of an offer row. The volume within 10% of the best bid is left out when `wide` is
+/// false, and the profit is the total on that volume.
+fn offer_cells(rank: usize, result: &OfferResult, item: String, wide: bool) -> Vec<String> {
     let isk_per_lp = result
         .isk_per_lp
         .map(|value| format_number(value, 2))
         .unwrap_or_else(|| "n/a".to_string());
-    Row::new(vec![
+    let (volume, profit) = match result.within_10 {
+        Some((volume, profit)) => (format_number(volume as f64, 0), short_isk(profit)),
+        None => ("n/a".to_string(), "n/a".to_string()),
+    };
+    let mut cells = vec![
         (rank + 1).to_string(),
-        item_name(sdata, result.offer.type_id),
+        item,
         format_number(result.offer.lp_cost as f64, 0),
         isk_per_lp,
-        profit,
-    ])
+    ];
+    if wide {
+        cells.push(volume);
+    }
+    cells.push(profit);
+    cells
+}
+
+/// ISK in about eight characters: billions, millions, or thousands, with two decimals.
+fn short_isk(value: f64) -> String {
+    let magnitude = value.abs();
+    let (scaled, suffix) = if magnitude >= 1e9 {
+        (value / 1e9, "B")
+    } else if magnitude >= 1e6 {
+        (value / 1e6, "M")
+    } else if magnitude >= 1e3 {
+        (value / 1e3, "K")
+    } else {
+        return format_number(value, 2);
+    };
+    format!("{:.2}{}", scaled, suffix)
 }
 
 /// Draws the details pane, wrapped to its width, and returns (rows, rows on screen).
@@ -757,6 +803,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, in_form: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eve_lpstore::ExpenseBreakdown;
+    use eve_lpstore::esi::loyalty::LoyaltyOffer;
 
     fn texts(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(|line| line.to_string()).collect()
@@ -778,6 +826,64 @@ mod tests {
     fn truncate_ends_a_cut_with_an_ellipsis() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    fn priced_offer(within_10: Option<(i64, f64)>) -> OfferResult {
+        OfferResult {
+            offer: LoyaltyOffer {
+                offer_id: 1,
+                type_id: 30486,
+                quantity: 10,
+                lp_cost: 1800,
+                isk_cost: 1_200_000.0,
+                required_items: Vec::new(),
+            },
+            breakdown: ExpenseBreakdown {
+                offer_id: 1,
+                lp_cost: 1800,
+                isk_cost: 1_200_000.0,
+                item_expenses: Vec::new(),
+                total_isk: 1_649_000.0,
+            },
+            reward: Some(457_900.0),
+            unit_cost: Some(164_900.0),
+            isk_per_lp: Some(1627.78),
+            within_10,
+        }
+    }
+
+    #[test]
+    fn short_isk_uses_one_suffix_and_two_decimals() {
+        assert_eq!(short_isk(3_980_000_000.0), "3.98B");
+        assert_eq!(short_isk(1_234_000.0), "1.23M");
+        assert_eq!(short_isk(5_000.0), "5.00K");
+        assert_eq!(short_isk(512.0), "512.00");
+        assert_eq!(short_isk(-2_500_000.0), "-2.50M");
+    }
+
+    #[test]
+    fn wide_offer_rows_show_the_volume_and_the_profit_within_10_percent() {
+        let result = priced_offer(Some((2_474_600, 3_980_000_000.0)));
+        let cells = offer_cells(0, &result, "Sisters Combat Scanner Probe".to_string(), true);
+        assert_eq!(cells.len(), 6);
+        assert_eq!(cells[4], "2,474,600");
+        assert_eq!(cells[5], "3.98B");
+    }
+
+    #[test]
+    fn narrow_offer_rows_leave_out_the_volume() {
+        let result = priced_offer(Some((2_474_600, 3_980_000_000.0)));
+        let cells = offer_cells(0, &result, "Probe".to_string(), false);
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[4], "3.98B");
+    }
+
+    #[test]
+    fn offers_without_a_reward_show_n_a() {
+        let result = priced_offer(None);
+        let cells = offer_cells(0, &result, "Probe".to_string(), true);
+        assert_eq!(cells[4], "n/a");
+        assert_eq!(cells[5], "n/a");
     }
 
     fn screen_text(width: u16, height: u16) -> String {
