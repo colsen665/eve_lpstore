@@ -1,6 +1,13 @@
 use eve_lpstore::StaticData;
+use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number};
 use eve_lpstore::report::{Event, Report, Resolved};
+
+/// The text for one event, and whether it is an error.
+pub struct Message {
+    pub text: String,
+    pub is_error: bool,
+}
 
 fn corp_label(sdata: &StaticData, corp_id: i32) -> String {
     match sdata.corporation_name(corp_id) {
@@ -29,53 +36,90 @@ pub fn print_resolution(resolved: &Resolved) {
     }
 }
 
-/// Prints one progress event as it arrives.
-pub fn print_event(event: &Event, sdata: &StaticData) {
-    match event {
-        Event::Log(message) => println!("{}", message),
-        Event::FetchStarted { corporations } => {
-            println!(
+/// The text that describes `event`, or `None` for progress updates that have no text.
+pub fn message(event: &Event, sdata: &StaticData) -> Option<Message> {
+    let (text, is_error) = match event {
+        Event::Log(line) => (line.clone(), false),
+        Event::FetchStarted { corporations } => (
+            format!(
                 "Fetching loyalty offers for {} corporations...",
                 corporations
-            )
-        }
-        Event::FetchQueued { tasks } => {
-            println!("Waiting for {} loyalty offer fetches to finish...", tasks)
-        }
+            ),
+            false,
+        ),
+        Event::FetchQueued { tasks } => (
+            format!("Waiting for {} loyalty offer fetches to finish...", tasks),
+            false,
+        ),
         Event::FetchTaskFailed { error } => {
-            eprintln!("Failed to fetch loyalty offers: {}", error)
+            (format!("Failed to fetch loyalty offers: {}", error), true)
         }
-        Event::CorpFetchFailed { corp_id, error } => eprintln!(
-            "Failed to fetch loyalty offers for corporation {}: {}",
-            corp_label(sdata, *corp_id),
-            error
+        Event::CorpFetchFailed { corp_id, error } => (
+            format!(
+                "Failed to fetch loyalty offers for corporation {}: {}",
+                corp_label(sdata, *corp_id),
+                error
+            ),
+            true,
         ),
-        Event::FetchFinished(summary) => println!(
-            "Fetched loyalty offers for {} corporations in {:.2}s, {} errors, {} cache hits, {} cache misses, {} cache writes",
-            summary.corporations,
-            summary.elapsed.as_secs_f64(),
-            summary.errors,
-            summary.cache.hits,
-            summary.cache.misses,
-            summary.cache.writes
+        Event::FetchFinished(summary) => (
+            format!(
+                "Fetched loyalty offers for {} corporations in {:.2}s, {} errors, {} cache hits, {} cache misses, {} cache writes",
+                summary.corporations,
+                summary.elapsed.as_secs_f64(),
+                summary.errors,
+                summary.cache.hits,
+                summary.cache.misses,
+                summary.cache.writes
+            ),
+            false,
         ),
-        Event::PricingStarted { groups } => println!("Pricing {} groups...", groups),
-        Event::PricingQueued { tasks } => {
-            println!("Waiting for {} groups to finish pricing...", tasks)
-        }
-        Event::GroupFailed { error } => eprintln!("Failed to price a group: {}", error),
-        Event::PricingFinished(summary) => println!(
-            "Priced {} groups in {:.2}s, {} offer errors, {} group failures, {} cache hits, {} cache misses, {} cache writes",
-            summary.groups,
-            summary.elapsed.as_secs_f64(),
-            summary.offer_errors,
-            summary.group_failures,
-            summary.cache.hits,
-            summary.cache.misses,
-            summary.cache.writes
+        Event::PricingStarted { groups } => (format!("Pricing {} groups...", groups), false),
+        Event::PricingQueued { tasks } => (
+            format!("Waiting for {} groups to finish pricing...", tasks),
+            false,
         ),
-        Event::FetchProgress { .. } | Event::PricingProgress { .. } => {}
+        Event::GroupFailed { error } => (format!("Failed to price a group: {}", error), true),
+        Event::PricingFinished(summary) => (
+            format!(
+                "Priced {} groups in {:.2}s, {} offer errors, {} group failures, {} cache hits, {} cache misses, {} cache writes",
+                summary.groups,
+                summary.elapsed.as_secs_f64(),
+                summary.offer_errors,
+                summary.group_failures,
+                summary.cache.hits,
+                summary.cache.misses,
+                summary.cache.writes
+            ),
+            false,
+        ),
+        Event::FetchProgress { .. } | Event::PricingProgress { .. } => return None,
+    };
+    Some(Message { text, is_error })
+}
+
+/// Prints one progress event as it arrives.
+pub fn print_event(event: &Event, sdata: &StaticData) {
+    let Some(line) = message(event, sdata) else {
+        return;
+    };
+    if line.is_error {
+        eprintln!("{}", line.text);
+    } else {
+        println!("{}", line.text);
     }
+}
+
+/// The client's counters on one line, shared by `--status` and the TUI footer.
+pub fn status_text(s: &ClientStats) -> String {
+    let rate_limit_str = match (s.rate_limit_remain, s.rate_limit_reset) {
+        (Some(remain), Some(reset)) => format!("{}/200 (resets in {}s)", remain, reset),
+        _ => "unknown".to_string(),
+    };
+    format!(
+        "In-flight: {} | Waiting: {} | Rate limit: {} | Total: {} | Errors: {}",
+        s.in_flight, s.waiting, rate_limit_str, s.total_requests, s.total_errors
+    )
 }
 
 /// Prints the groups with up to `depth` offers each. The best group prints last.

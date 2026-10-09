@@ -1,20 +1,15 @@
 mod output;
+mod tui;
 
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::report::{self, LpStoreOptions, OptionError};
 use eve_lpstore::{EsiClient, StaticData};
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 fn print_status(s: &ClientStats) {
     let now = chrono::Local::now().format("%H:%M:%S");
-    let rate_limit_str = match (s.rate_limit_remain, s.rate_limit_reset) {
-        (Some(remain), Some(reset)) => format!("{}/200 (resets in {}s)", remain, reset),
-        _ => "unknown".to_string(),
-    };
-    println!(
-        "[{}] In-flight: {} | Waiting: {} | Rate limit: {} | Total: {} | Errors: {}",
-        now, s.in_flight, s.waiting, rate_limit_str, s.total_requests, s.total_errors
-    );
+    println!("[{}] {}", now, output::status_text(s));
 }
 
 const HELP_TEXT: &str = "\
@@ -23,6 +18,7 @@ Usage: eve_lpstore <mode> [FILTERS] [OPTIONS]
 Modes:
   --example              Run the general ESI and static data example.
   --lpstores             Calculate expenses, profit, and ISK per LP for LP store offers and show the top 10.
+  --tui                  Show --lpstores in a full-screen view that updates while it runs. Implies --lpstores.
   --help                 Show this help and exit.
 
 Filters (apply to --lpstores):
@@ -37,13 +33,13 @@ Filters (apply to --lpstores):
 
 Options:
   --region <id|name>     Market region used for pricing, by ID or name. Defaults to The Forge (10000002).
-  --status               Print API call status every second while running.
+  --status               Print API call status every second while running. With --tui, the footer shows it instead.
   --expire               Ignore cached responses and call the API again.
   --cache-minutes <n>    Extend how long cached responses are reused, by n minutes past their Expires time. Default 0 for --example, and the number of corporations for --lpstores. Use 0 to turn it off.
   --concurrency <n>      Corporation groups priced at once with --lpstores. Default 2x the tokio worker threads.
   --max-inflight <n>     Maximum ESI requests in flight at once across all groups. Default 4.
   --depth <n>            Offers printed per corporation group with --lpstores. Default 10.
-  --verbose              Print cache hits, misses, and writes, with reasons and file names.
+  --verbose              Print cache hits, misses, and writes, with reasons and file names. With --tui, they go to the log.
   --clear-cache          Delete the cache directory before running.
 
 Examples:
@@ -84,6 +80,7 @@ async fn main() {
     const FLAGS: &[&str] = &[
         "--example",
         "--lpstores",
+        "--tui",
         "--status",
         "--expire",
         "--verbose",
@@ -118,6 +115,16 @@ async fn main() {
             std::process::exit(1);
         }
         i += 1;
+    }
+
+    let tui = args.iter().any(|a| a == "--tui");
+    if tui && args.iter().any(|a| a == "--example") {
+        eprintln!("--tui cannot be combined with --example");
+        std::process::exit(1);
+    }
+    if tui && !std::io::stdout().is_terminal() {
+        eprintln!("--tui needs an interactive terminal on stdout");
+        std::process::exit(1);
     }
 
     let value = |flag: &str| -> Option<String> {
@@ -168,8 +175,8 @@ async fn main() {
             eprintln!("Example failed: {}", e);
             std::process::exit(1);
         }
-    } else if args.iter().any(|a| a == "--lpstores") {
-        run_lpstores(status, options, clear_cache).await;
+    } else if tui || args.iter().any(|a| a == "--lpstores") {
+        run_lpstores(status, options, clear_cache, tui).await;
     } else {
         if let Err(errors) = options.parse() {
             exit_with_errors(errors);
@@ -178,7 +185,7 @@ async fn main() {
             clear_cache_dir();
         } else {
             println!(
-                "Usage: {} [--example|--lpstores] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <op><level>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
+                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <op><level>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
                 args[0]
             );
         }
@@ -215,7 +222,10 @@ async fn run_example(
     // Load static data (only downloads if cache is missing or forced)
     let sdata = match StaticData::load(false).await {
         Ok(data) => {
-            println!("Static data loaded: {} regions", data.region_names().count());
+            println!(
+                "Static data loaded: {} regions",
+                data.region_names().count()
+            );
             data
         }
         Err(e) => {
@@ -313,7 +323,7 @@ async fn run_example(
     Ok(())
 }
 
-async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool) {
+async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool, tui: bool) {
     let sdata = match StaticData::load(false).await {
         Ok(data) => data,
         Err(e) => {
@@ -327,6 +337,13 @@ async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool) 
     };
     if clear_cache {
         clear_cache_dir();
+    }
+    if tui {
+        if let Err(e) = tui::run(Arc::new(sdata), options, resolved).await {
+            eprintln!("TUI failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
     }
     output::print_resolution(&resolved);
 

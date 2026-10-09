@@ -25,11 +25,11 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 2: Dependencies, `--tui`, and terminal setup
 
-- [ ] Add `ratatui = "0.30"` and `crossterm = "0.29"`. ratatui 0.30 needs Rust 1.86 or newer. Pin crossterm to 0.29 so only one copy is built. Cargo needs network access to fetch them.
-- [ ] Add `--tui` to `FLAGS`, `HELP_TEXT`, and the usage line. It implies `--lpstores` and is rejected with `--example`. It exits with an error if stdout is not a terminal. Inside the TUI, the status bar replaces `--status`, and `--verbose` output goes to the log panel.
-- [ ] Put the TUI in `src/tui/`, declared from `main.rs`. Start it after static data loads and the arguments validate, so existing errors still print to a normal terminal. The CLI filter flags pre-fill the filter form.
-- [ ] Run the UI on a blocking thread with `spawn_blocking` around `ratatui::run`. It polls keys with `crossterm::event::poll`, drains progress with `try_recv`, and redraws every 250 ms. The pipeline stays on the async runtime. This fits `ratatui::run`, which takes a sync closure, and it avoids `EventStream` and `futures`.
-- [ ] Restore the terminal on quit, on Ctrl-C (raw mode delivers it as a key event), and on panic. Check whether ratatui's init installs a panic hook. If not, add one.
+- [x] Add `ratatui = "0.30"` and `crossterm = "0.29"`. ratatui 0.30 needs Rust 1.86 or newer. Pin crossterm to 0.29 so only one copy is built. Cargo needs network access to fetch them.
+- [x] Add `--tui` to `FLAGS`, `HELP_TEXT`, and the usage line. It implies `--lpstores` and is rejected with `--example`. It exits with an error if stdout is not a terminal. Inside the TUI, the footer shows the status instead of `--status`, and `--verbose` output goes to the log panel.
+- [x] Put the TUI in `src/tui/`, declared from `main.rs`. Start it after static data loads and the arguments validate, so existing errors still print to a normal terminal. The header shows the CLI filter flags. Pre-filling the filter form from them waits for Phase 4.
+- [x] Run the UI on a blocking thread with `spawn_blocking` around `ratatui::run`. It polls keys with `crossterm::event::poll`, drains progress with `try_recv`, and redraws every 250 ms. The pipeline stays on the async runtime. This fits `ratatui::run`, which takes a sync closure, and it avoids `EventStream` and `futures`.
+- [x] Restore the terminal on quit, on Ctrl-C (raw mode delivers it as a key event), and on panic. ratatui's `init` already installs a panic hook that restores the terminal before the panic message prints, so no hook was added.
 
 #### Phase 3: Results view
 
