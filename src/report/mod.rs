@@ -17,6 +17,19 @@ pub struct Report {
     pub groups: Vec<Group>,
 }
 
+impl Report {
+    /// Orders the groups by the average ISK per LP over the top `depth` offers, best first,
+    /// with ties broken by the lower first corporation ID.
+    pub fn sort_by_depth(&mut self, depth: usize) {
+        let key = |group: &Group| group.average_isk_per_lp(depth).unwrap_or(f64::NEG_INFINITY);
+        self.groups.sort_by(|a, b| {
+            key(b)
+                .total_cmp(&key(a))
+                .then_with(|| a.corp_ids[0].cmp(&b.corp_ids[0]))
+        });
+    }
+}
+
 /// Corporations whose loyalty offers are identical, with those offers priced.
 #[derive(Debug)]
 pub struct Group {
@@ -24,6 +37,21 @@ pub struct Group {
     pub offer_count: usize,
     pub results: Vec<OfferResult>,
     pub errors: Vec<OfferError>,
+}
+
+impl Group {
+    /// The average ISK per LP over the top `depth` priced offers, or `None` when none of them
+    /// have a value. Offers without one are left out of the average.
+    pub fn average_isk_per_lp(&self, depth: usize) -> Option<f64> {
+        let top = self.results.get(..depth.min(self.results.len()))?;
+        let (sum, count) = top
+            .iter()
+            .filter_map(|result| result.isk_per_lp)
+            .fold((0.0, 0usize), |(sum, count), value| {
+                (sum + value, count + 1)
+            });
+        (count > 0).then(|| sum / count as f64)
+    }
 }
 
 /// A progress event, tagged with the run it belongs to.
@@ -99,4 +127,58 @@ pub struct PricingSummary {
     pub offer_errors: usize,
     pub group_failures: usize,
     pub cache: CacheCounts,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::esi::loyalty::LoyaltyOffer;
+    use crate::expenses::ExpenseBreakdown;
+
+    fn group(isk_per_lp: &[Option<f64>]) -> Group {
+        let results: Vec<OfferResult> = isk_per_lp
+            .iter()
+            .map(|&isk_per_lp| OfferResult {
+                offer: LoyaltyOffer {
+                    offer_id: 1,
+                    type_id: 1,
+                    quantity: 1,
+                    lp_cost: 1,
+                    isk_cost: 0.0,
+                    required_items: Vec::new(),
+                },
+                breakdown: ExpenseBreakdown {
+                    offer_id: 1,
+                    lp_cost: 1,
+                    isk_cost: 0.0,
+                    item_expenses: Vec::new(),
+                    total_isk: 0.0,
+                },
+                reward: None,
+                unit_cost: None,
+                isk_per_lp,
+                within_10: None,
+            })
+            .collect();
+        Group {
+            corp_ids: vec![1],
+            offer_count: results.len(),
+            results,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_average_covers_only_the_top_depth_offers_that_have_a_value() {
+        let group = group(&[Some(10.0), Some(2.0), None, Some(2.0)]);
+        assert_eq!(group.average_isk_per_lp(10), Some(14.0 / 3.0));
+        assert_eq!(group.average_isk_per_lp(3), Some(6.0));
+        assert_eq!(group.average_isk_per_lp(1), Some(10.0));
+    }
+
+    #[test]
+    fn the_average_is_none_without_a_valued_offer() {
+        assert_eq!(group(&[None, None]).average_isk_per_lp(10), None);
+        assert_eq!(group(&[]).average_isk_per_lp(10), None);
+    }
 }

@@ -374,7 +374,7 @@ fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
     let names_width = usize::from(area.width.saturating_sub(4));
     let items: Vec<ListItem> = groups
         .iter()
-        .map(|group| group_item(group, sdata, names_width))
+        .map(|group| group_item(group, app.depth, sdata, names_width))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -384,12 +384,16 @@ fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A group takes two lines: its ISK per LP and offer count, then its corporations.
-fn group_item(group: &Group, sdata: &StaticData, names_width: usize) -> ListItem<'static> {
+/// A group takes two lines: its average ISK per LP over the offers it lists, its offer count,
+/// then its corporations.
+fn group_item(
+    group: &Group,
+    depth: usize,
+    sdata: &StaticData,
+    names_width: usize,
+) -> ListItem<'static> {
     let isk = group
-        .results
-        .first()
-        .and_then(|result| result.isk_per_lp)
+        .average_isk_per_lp(depth)
         .map(|value| format_number(value, 2))
         .unwrap_or_else(|| "n/a".to_string());
     let names: Vec<String> = group
@@ -398,7 +402,7 @@ fn group_item(group: &Group, sdata: &StaticData, names_width: usize) -> ListItem
         .map(|&id| corp_name(sdata, id))
         .collect();
     ListItem::new(vec![
-        Line::from(format!("{} ISK/LP | {} offers", isk, group.offer_count)),
+        Line::from(format!("{} avg ISK/LP | {} offers", isk, group.offer_count)),
         Line::from(Span::styled(
             truncate(&names.join(", "), names_width),
             Style::new().dark_gray(),

@@ -197,9 +197,22 @@ impl App {
         });
     }
 
-    /// Changes how many offers each group lists. The run itself is unchanged.
+    /// Changes how many offers each group lists. The run itself is unchanged, so the group
+    /// order is re-sorted for the new depth and the selected group stays selected.
     pub fn apply_depth(&mut self, depth: usize) {
+        let selected = self.selected_group().map(|group| group.corp_ids.clone());
         self.depth = depth;
+        if let Some(report) = &mut self.report {
+            report.sort_by_depth(depth);
+            if let Some(selected) = selected
+                && let Some(index) = report
+                    .groups
+                    .iter()
+                    .position(|g| g.corp_ids == selected)
+            {
+                self.group = index;
+            }
+        }
         let max = self.offer_count().saturating_sub(1);
         self.offer = self.offer.min(max);
     }
@@ -727,5 +740,23 @@ mod tests {
         app.apply_depth(2);
         assert_eq!(app.offer, 1);
         assert_eq!(app.offer_count(), 2);
+    }
+
+    #[test]
+    fn a_depth_change_reorders_and_keeps_the_group_selected() {
+        // Depth 1 averages 10 for corp 1 and 6 for corp 2, so corp 1 sorts first. Depth 2
+        // averages 5 for corp 1 and 6 for corp 2, so the order flips.
+        let mut app = app_with(vec![group(1, &[10.0, 0.0]), group(2, &[6.0, 6.0])], 1);
+        app.apply_depth(1);
+        assert_eq!(app.groups()[0].corp_ids, vec![1]);
+        assert_eq!(app.group, 0);
+
+        app.apply_depth(2);
+        assert_eq!(app.groups()[0].corp_ids, vec![2]);
+        assert_eq!(app.groups()[1].corp_ids, vec![1]);
+        assert_eq!(
+            app.group, 1,
+            "the same group stays selected after the reorder"
+        );
     }
 }
