@@ -5,6 +5,7 @@
 use super::form::FilterForm;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eve_lpstore::OfferResult;
+use eve_lpstore::export::ExportRequest;
 use eve_lpstore::report::{Event, Group, LpStoreOptions, Report};
 use eve_lpstore::static_data::AgentFilter;
 use std::collections::VecDeque;
@@ -51,6 +52,7 @@ pub enum Overlay {
     Help,
     Filters,
     Donate,
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +60,8 @@ pub enum Action {
     Continue,
     Quit,
     Apply,
+    /// Write the report on screen to the file the export prompt names.
+    Export,
 }
 
 /// What a run was started with, as the header and the detail pane show it.
@@ -92,6 +96,10 @@ pub struct App {
     pub detail_visible: usize,
     pub log_scroll: usize,
     pub overlay: Overlay,
+    /// The file name typed into the export prompt.
+    pub export_path: String,
+    /// Why the last export attempt was refused, shown beside the prompt.
+    pub export_error: Option<String>,
 }
 
 impl App {
@@ -117,6 +125,8 @@ impl App {
             detail_visible: 0,
             log_scroll: 0,
             overlay: Overlay::None,
+            export_path: String::new(),
+            export_error: None,
         }
     }
 
@@ -190,6 +200,7 @@ impl App {
         self.stale = self.report.is_some();
         self.stage = Stage::Starting;
         self.close_form();
+        self.close_export();
         let text = format!("Started a run with {}", self.filters);
         self.push_log(LogLine {
             text,
@@ -230,6 +241,56 @@ impl App {
         if self.overlay == Overlay::Filters {
             self.overlay = Overlay::None;
         }
+    }
+
+    /// Opens the export prompt with a name built from the region, so Enter on its own writes
+    /// somewhere sensible. Only reachable once there are results to write.
+    pub fn open_export(&mut self) {
+        self.export_path = self.suggested_path();
+        self.export_error = None;
+        self.overlay = Overlay::Export;
+    }
+
+    pub fn close_export(&mut self) {
+        if self.overlay == Overlay::Export {
+            self.overlay = Overlay::None;
+        }
+    }
+
+    /// Keeps a refusal beside the prompt, so the name stays editable.
+    pub fn refuse_export(&mut self, reason: impl Into<String>) {
+        self.export_error = Some(reason.into());
+    }
+
+    /// Where the report on screen would be written, as the prompt names it. `None` when the name
+    /// has no known extension, which is the same rule the exporter applies.
+    pub fn export_request(&self) -> Option<ExportRequest> {
+        ExportRequest::parse(&self.export_path)
+    }
+
+    /// A file name for this run: the mode, the region, and the filters, in lower case with
+    /// anything that is not a letter or a digit turned into a dash. The filter part is short,
+    /// because a name that long stops being readable, and it is only a starting point the user
+    /// edits before pressing Enter.
+    fn suggested_path(&self) -> String {
+        fn slug(text: &str, limit: usize) -> String {
+            text.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .take(limit)
+                .collect()
+        }
+        let mut name = format!("lpstores-{}", slug(&self.region, 64));
+        if self.filters != "none" {
+            name.push_str(&format!("-{}", slug(&self.filters, 32)));
+        }
+        name.push_str(".csv");
+        name
     }
 
     pub fn push_log(&mut self, line: LogLine) {
@@ -304,6 +365,9 @@ impl App {
         if self.overlay == Overlay::Filters {
             return self.on_form_key(key);
         }
+        if self.overlay == Overlay::Export {
+            return self.on_export_key(key);
+        }
         if is_quit(&key) {
             return Action::Quit;
         }
@@ -318,6 +382,7 @@ impl App {
             KeyCode::Char('?') => self.toggle(Overlay::Help),
             KeyCode::Char('l') => self.toggle(Overlay::Log),
             KeyCode::Char('f') => self.open_form(),
+            KeyCode::Char('e') if self.report.is_some() => self.open_export(),
             KeyCode::Char('d') => self.toggle(Overlay::Donate),
             _ if self.overlay == Overlay::Help => {}
             KeyCode::Tab => {
@@ -351,6 +416,45 @@ impl App {
             KeyCode::Backspace => self.form.backspace(),
             KeyCode::Char('u') if ctrl => self.form.clear_focused(),
             KeyCode::Char(c) if plain => self.form.type_char(c),
+            _ => {}
+        }
+        Action::Continue
+    }
+
+    /// While the export prompt is open, keys go to it, so `q` types a letter. Only Ctrl+C quits.
+    fn on_export_key(&mut self, key: KeyEvent) -> Action {
+        if is_ctrl_c(&key) {
+            return Action::Quit;
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.close_export(),
+            KeyCode::Enter => {
+                return match self.export_request() {
+                    Some(_) => {
+                        self.export_error = None;
+                        Action::Export
+                    }
+                    None => {
+                        self.refuse_export("Use a file name ending in .csv or .json");
+                        Action::Continue
+                    }
+                };
+            }
+            KeyCode::Backspace => {
+                self.export_path.pop();
+                self.export_error = None;
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.export_path.clear();
+                self.export_error = None;
+            }
+            KeyCode::Char(c) if plain => {
+                self.export_path.push(c);
+                self.export_error = None;
+            }
             _ => {}
         }
         Action::Continue
@@ -693,6 +797,127 @@ mod tests {
         app.on_key(press(KeyCode::Char('f')));
         app.on_key(press(KeyCode::Char('d')));
         assert_eq!(app.form.corporations, "d");
+    }
+
+    #[test]
+    fn e_opens_the_export_prompt_with_a_name_from_the_region() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        assert_eq!(app.on_key(press(KeyCode::Char('e'))), Action::Continue);
+        assert_eq!(app.overlay, Overlay::Export);
+        assert_eq!(app.export_path, "lpstores-the-forge.csv");
+        assert_eq!(
+            app.export_request().map(|request| request.format),
+            Some(eve_lpstore::export::ExportFormat::Csv)
+        );
+    }
+
+    #[test]
+    fn e_does_nothing_until_there_are_results() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('e')));
+        assert_eq!(app.overlay, Overlay::None, "there is nothing to write yet");
+    }
+
+    #[test]
+    fn the_suggested_name_carries_the_filters() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.filters = "faction Caldari".to_string();
+        app.open_export();
+        assert_eq!(app.export_path, "lpstores-the-forge-faction-caldari.csv");
+        app.filters = "a".repeat(80);
+        app.open_export();
+        assert!(
+            app.export_path.len() < 80,
+            "the filter part is cut short: {}",
+            app.export_path
+        );
+    }
+
+    #[test]
+    fn enter_in_the_export_prompt_asks_for_the_write() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        app.export_path = "out/offers.json".to_string();
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Export);
+        assert_eq!(
+            app.overlay,
+            Overlay::Export,
+            "the prompt stays open until it is written"
+        );
+    }
+
+    #[test]
+    fn enter_refuses_an_unknown_extension() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        app.export_path = "offers.txt".to_string();
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Continue);
+        assert!(app.export_error.unwrap().contains(".csv or .json"));
+        assert_eq!(app.overlay, Overlay::Export, "the name stays editable");
+    }
+
+    #[test]
+    fn editing_the_export_name_clears_the_refusal() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        app.export_path = "offers".to_string();
+        app.on_key(press(KeyCode::Enter));
+        assert!(app.export_error.is_some());
+        app.on_key(press(KeyCode::Char('.')));
+        assert_eq!(app.export_error, None, "the refusal is about the old name");
+        app.on_key(press(KeyCode::Char('c')));
+        app.on_key(press(KeyCode::Char('s')));
+        app.on_key(press(KeyCode::Char('v')));
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Export);
+    }
+
+    #[test]
+    fn q_is_a_letter_in_the_export_prompt() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        app.export_path.clear();
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Continue);
+        assert_eq!(app.export_path, "q");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_export_prompt() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        assert_eq!(app.on_key(ctrl('c')), Action::Quit);
+    }
+
+    #[test]
+    fn backspace_and_ctrl_u_edit_the_export_name() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Backspace));
+        }
+        assert_eq!(app.export_path, "lpstores-the-forge");
+        app.on_key(press(KeyCode::Char('u')));
+        assert_eq!(
+            app.export_path, "lpstores-the-forgeu",
+            "plain u types a letter"
+        );
+        app.on_key(ctrl('u'));
+        assert_eq!(app.export_path, "", "Ctrl+U clears the whole name");
+    }
+
+    #[test]
+    fn escape_closes_the_export_prompt() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn starting_a_run_closes_the_export_prompt() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.open_export();
+        app.start_run(info(10));
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     #[test]

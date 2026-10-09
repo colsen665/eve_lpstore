@@ -11,6 +11,7 @@ use app::{Action, App, LogLine, RunInfo};
 use crossterm::event::{self, Event as TermEvent};
 use eve_lpstore::StaticData;
 use eve_lpstore::esi::EsiClient;
+use eve_lpstore::export;
 use eve_lpstore::report::{self, LpStoreOptions, Report, Resolved, RunEvent};
 use ratatui::DefaultTerminal;
 use std::io;
@@ -140,6 +141,7 @@ fn ui_loop(
                 Action::Continue => {}
                 Action::Quit => return Ok(()),
                 Action::Apply => apply(app, session),
+                Action::Export => write_export(app, &session.sdata),
             }
         }
     }
@@ -170,6 +172,38 @@ fn apply(app: &mut App, session: &mut Session) {
     }
     app.set_applied(options);
     app.close_form();
+}
+
+/// Writes the report on screen to the file the prompt names. Success closes the prompt and says so
+/// in the log; a failure leaves the prompt open with the reason beside the name, so it can be
+/// corrected and tried again. Split from the loop so the write can be tested without a terminal.
+fn write_export(app: &mut App, sdata: &StaticData) {
+    let Some(request) = app.export_request() else {
+        return;
+    };
+    let Some(report) = app.report.as_ref() else {
+        return;
+    };
+    let context = export::ExportContext {
+        region: &app.region,
+        filters: &app.filters,
+        depth: app.depth,
+    };
+    let offers = export::offer_count(report, app.depth);
+    let text = match request.format {
+        export::ExportFormat::Csv => export::csv(report, &context, sdata),
+        export::ExportFormat::Json => export::json(report, &context, sdata),
+    };
+    match std::fs::write(&request.path, text) {
+        Ok(()) => {
+            app.push_log(LogLine {
+                text: format!("Wrote {} offers to {}", offers, request.path),
+                is_error: false,
+            });
+            app.close_export();
+        }
+        Err(error) => app.refuse_export(format!("Could not write {}: {}", request.path, error)),
+    }
 }
 
 fn run_info(resolved: &Resolved, filters: String) -> RunInfo {
@@ -216,6 +250,112 @@ fn filter_summary(options: &LpStoreOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eve_lpstore::esi::loyalty::LoyaltyOffer;
+    use eve_lpstore::report::Group;
+    use eve_lpstore::static_data::AgentFilter;
+    use eve_lpstore::{ExpenseBreakdown, OfferResult};
+
+    use crate::tui::app::Overlay;
+
+    /// An app on the results view with the export prompt open and `path` typed into it.
+    fn prompt(path: &str) -> App {
+        let info = RunInfo {
+            region: "The Forge".to_string(),
+            corporations: 1,
+            filters: "none".to_string(),
+            depth: 10,
+            agent_filter: AgentFilter::default(),
+        };
+        let mut app = App::new(info, LpStoreOptions::default());
+        app.finish(Report {
+            groups: vec![Group {
+                corp_ids: vec![1000002],
+                offer_count: 1,
+                results: vec![OfferResult {
+                    offer: LoyaltyOffer {
+                        offer_id: 1,
+                        type_id: 30486,
+                        quantity: 10,
+                        lp_cost: 1800,
+                        isk_cost: 1_200_000.0,
+                        required_items: Vec::new(),
+                    },
+                    breakdown: ExpenseBreakdown {
+                        offer_id: 1,
+                        lp_cost: 1800,
+                        isk_cost: 1_200_000.0,
+                        item_expenses: Vec::new(),
+                        total_isk: 1_649_000.0,
+                    },
+                    reward: Some(457_900.0),
+                    unit_cost: Some(164_900.0),
+                    isk_per_lp: Some(1627.78),
+                    best_ask: Some(515_000.0),
+                    spread: Some(12.5),
+                    book_depth: Some((2_474_600, 800_000)),
+                    imbalance: Some(51.2),
+                    within_10: Some((2_474_600, 3_980_000_000.0)),
+                }],
+                errors: Vec::new(),
+            }],
+        });
+        app.open_export();
+        app.export_path = path.to_string();
+        app
+    }
+
+    /// A file base name in the system temp directory, distinct per test so they cannot collide.
+    /// The caller adds the extension.
+    fn temp_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("eve_lpstore_{}_{}", std::process::id(), name))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn an_export_writes_the_view_and_reports_it_in_the_log() {
+        let path = format!("{}.csv", temp_path("csv"));
+        let mut app = prompt(&path);
+        write_export(&mut app, &StaticData::default());
+        let written = std::fs::read_to_string(&app.export_path).unwrap();
+        assert!(written.starts_with("group,average_isk_per_lp,"));
+        assert!(written.contains("30486"), "the offer row is there");
+        assert!(written.contains("1627.78"));
+        assert_eq!(app.overlay, Overlay::None, "success closes the prompt");
+        let line = app.log.back().expect("the write is reported");
+        assert!(!line.is_error);
+        assert!(line.text.contains("Wrote 1 offers"), "{}", line.text);
+        std::fs::remove_file(&app.export_path).unwrap();
+    }
+
+    #[test]
+    fn a_json_name_writes_json() {
+        let path = format!("{}.json", temp_path("json"));
+        let mut app = prompt(&path);
+        write_export(&mut app, &StaticData::default());
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(parsed["region"], "The Forge");
+        assert_eq!(parsed["groups"][0]["offers"][0]["spread_percent"], 12.5);
+        assert_eq!(app.overlay, Overlay::None);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_fails_keeps_the_prompt_open_with_the_reason() {
+        // A directory that does not exist, so the write cannot succeed.
+        let mut app = prompt("/no/such/directory/eve_lpstore_out.csv");
+        write_export(&mut app, &StaticData::default());
+        assert_eq!(
+            app.overlay,
+            Overlay::Export,
+            "the name stays editable so it can be retried"
+        );
+        let error = app.export_error.expect("the reason shows beside the name");
+        assert!(error.contains("Could not write"), "{}", error);
+        assert!(error.contains("no/such/directory"), "{}", error);
+    }
 
     #[test]
     fn filter_summary_lists_only_the_filters_that_are_set() {

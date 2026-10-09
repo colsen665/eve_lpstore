@@ -114,8 +114,42 @@ pub fn draw(
     if app.overlay == Overlay::Donate {
         draw_donate(frame, area);
     }
-    draw_footer(frame, footer, stats, app.overlay == Overlay::Filters);
+    if app.overlay == Overlay::Export {
+        draw_export(frame, area, app);
+    }
+    draw_footer(frame, footer, stats, app.overlay);
     layout
+}
+
+/// The export prompt: where the view on screen would be written, and why the last attempt was
+/// refused. The results stay behind it, so the name can be read against what is showing. A name
+/// too long for the popup shows its end, which is where the letters being typed are.
+fn draw_export(frame: &mut Frame, area: Rect, app: &App) {
+    let width = 64usize;
+    let inner = width - 2;
+    let mut lines = vec![
+        Line::from("Write the current view to".dark_gray()),
+        Line::from(tail(&app.export_path, inner)).bold(),
+    ];
+    if let Some(error) = &app.export_error {
+        lines.push(Line::from(truncate(error, inner)).red());
+    }
+    lines.push(Line::from(
+        truncate(
+            "Enter writes it  Esc cancels  Ctrl+U clears the name",
+            inner,
+        )
+        .dark_gray(),
+    ));
+    let popup = area.centered(
+        Constraint::Length(width as u16),
+        Constraint::Length(lines.len() as u16 + 2),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Export ")),
+        popup,
+    );
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, app: &App) {
@@ -812,6 +846,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         ("PgUp, PgDn", "move a page at a time"),
         ("f", "edit the filters; Enter runs them, Esc cancels"),
+        ("e", "write the view to a .csv or .json file"),
         ("d", "show the donation address as a QR code"),
         ("l", "show or hide the full log"),
         ("?", "show or hide this help"),
@@ -900,11 +935,13 @@ fn qr_lines(grid: &[Vec<bool>]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, in_form: bool) {
-    let keys = if in_form {
-        "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
-    } else {
-        "Tab panes  Up/Down move  f filters  d donate  l log  ? help  q quit"
+fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, overlay: Overlay) {
+    let keys = match overlay {
+        Overlay::Filters => {
+            "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
+        }
+        Overlay::Export => "Enter write  Esc cancel  Ctrl+U clear  Ctrl+C quit",
+        _ => "Tab panes  Up/Down move  f filters  e export  d donate  l log  ? help  q quit",
     };
     let lines = vec![
         Line::from(format!(
@@ -1234,6 +1271,40 @@ mod tests {
                 width
             );
         }
+    }
+
+    #[test]
+    fn the_export_prompt_shows_the_name_and_the_footer_hints_for_it() {
+        let mut app = results_app(one_priced_offer(), 10);
+        app.open_export();
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("Export"), "the popup is titled");
+        assert!(
+            text.contains("lpstores-the-forge.csv"),
+            "the suggested name shows: {}",
+            text
+        );
+        assert!(
+            text.contains("Enter write"),
+            "the footer switches to the prompt's keys"
+        );
+        assert!(
+            !text.contains("f filters"),
+            "the view keys are hidden while the prompt owns the keyboard"
+        );
+    }
+
+    #[test]
+    fn a_refused_export_shows_why_beside_the_name() {
+        let mut app = results_app(one_priced_offer(), 10);
+        app.open_export();
+        app.refuse_export("Use a file name ending in .csv or .json");
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("Use a file name ending in .csv or .json"));
+        assert!(
+            text.contains("lpstores-the-forge.csv"),
+            "the name is still there to correct"
+        );
     }
 
     fn screen_text(width: u16, height: u16) -> String {

@@ -63,7 +63,15 @@ CLI output stays the same, except that it prints every filter error, and lists c
 
 #### Phase 6: Later
 
-- [ ] Export the current view to CSV or JSON.
+- [x] Export the current view to CSV or JSON. `e` in the results view opens a prompt pre-filled from
+  the region and filters; Enter writes the file, Esc cancels, and the extension chooses the shape, so
+  an unknown one is refused beside the name rather than guessed. `src/export/mod.rs` renders both
+  shapes from one tree, so a renamed field cannot end up in only one of them. It follows the view:
+  groups best first, only the top `depth` offers each, no new ESI request. Numbers are plain rather
+  than comma-grouped, missing figures are empty in CSV and `null` in JSON, ISK and percentages are
+  rounded to two decimals, and there is no timestamp, so the same report always writes the same
+  bytes. The required items and the offers that failed to price are JSON only, since a flat row has
+  nowhere for them.
 
 ## Done
 
