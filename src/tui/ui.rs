@@ -3,13 +3,14 @@
 
 use super::app::{App, Focus, LogLine, Overlay, Stage};
 use super::form::FormField;
+use super::qr;
 use crate::output;
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number};
 use eve_lpstore::report::Group;
 use eve_lpstore::{OfferResult, StaticData};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -22,6 +23,8 @@ pub const MIN_HEIGHT: u16 = 20;
 
 const LABEL_WIDTH: usize = 14;
 const VALUE_WIDTH: usize = 26;
+
+const DONATION_ADDRESS: &str = "bc1qyc55ddky2ehdnty2c48nvxxugjw2xdpxk956x7";
 
 /// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
 /// when the results are not on screen.
@@ -83,6 +86,9 @@ pub fn draw(
     };
     if app.overlay == Overlay::Help {
         draw_help(frame, area);
+    }
+    if app.overlay == Overlay::Donate {
+        draw_donate(frame, area);
     }
     draw_footer(frame, footer, stats, app.overlay == Overlay::Filters);
     layout
@@ -637,6 +643,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         ("PgUp, PgDn", "move a page at a time"),
         ("f", "edit the filters; Enter runs them, Esc cancels"),
+        ("d", "show the donation address as a QR code"),
         ("l", "show or hide the full log"),
         ("?", "show or hide this help"),
         ("Esc", "close the log or this help"),
@@ -657,11 +664,78 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// The donation popup: the address as a QR code, with the address as text under it. When the
+/// terminal is too small for the code, the popup shows only the address and a note.
+fn draw_donate(frame: &mut Frame, area: Rect) {
+    let grid = qr::modules(DONATION_ADDRESS);
+    let code_rows = grid.len() / 2;
+    let width = grid[0].len().max(DONATION_ADDRESS.len()) + 2;
+    let height = code_rows + 4;
+    let (popup, lines) = if usize::from(area.width) >= width && usize::from(area.height) >= height {
+        let popup = area.centered(
+            Constraint::Length(width as u16),
+            Constraint::Length(height as u16),
+        );
+        let mut lines = qr_lines(&grid);
+        lines.push(Line::from(DONATION_ADDRESS));
+        lines.push(Line::from("Esc or d closes this").dark_gray());
+        (popup, lines)
+    } else {
+        let popup = area.centered(
+            Constraint::Length(width.min(usize::from(area.width)) as u16),
+            Constraint::Length(4),
+        );
+        let inner = usize::from(popup.width.saturating_sub(2));
+        let note = format!(
+            "Enlarge the terminal to {}x{} for the QR code",
+            width, height
+        );
+        let lines = vec![
+            Line::from(truncate(DONATION_ADDRESS, inner)),
+            Line::from(truncate(&note, inner)).dark_gray(),
+        ];
+        (popup, lines)
+    };
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .block(Block::bordered().title(" Donate ")),
+        popup,
+    );
+}
+
+/// The code as rows of half-block characters. Each character shows two module rows: the top
+/// module is its foreground and the bottom module its background. Dark modules are black and
+/// light modules white, so the code scans whatever colors the terminal uses.
+fn qr_lines(grid: &[Vec<bool>]) -> Vec<Line<'static>> {
+    let color = |dark: bool| {
+        if dark {
+            Color::Rgb(0, 0, 0)
+        } else {
+            Color::Rgb(255, 255, 255)
+        }
+    };
+    grid.chunks(2)
+        .map(|pair| {
+            let spans: Vec<Span<'static>> = (0..pair[0].len())
+                .map(|x| {
+                    Span::styled(
+                        "▀",
+                        Style::new().fg(color(pair[0][x])).bg(color(pair[1][x])),
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, in_form: bool) {
     let keys = if in_form {
         "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
     } else {
-        "Tab panes  Up/Down move  PgUp/PgDn page  f filters  l log  ? help  q quit"
+        "Tab panes  Up/Down move  f filters  d donate  l log  ? help  q quit"
     };
     let lines = vec![
         Line::from(format!(
@@ -704,6 +778,36 @@ mod tests {
     fn truncate_ends_a_cut_with_an_ellipsis() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
+    }
+
+    fn screen_text(width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_donate(frame, frame.area()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_donation_popup_shows_the_code_and_the_address_when_it_fits() {
+        let text = screen_text(80, 24);
+        assert!(text.contains(DONATION_ADDRESS));
+        assert!(text.contains('▀'));
+        assert!(!text.contains("Enlarge"));
+    }
+
+    #[test]
+    fn the_donation_popup_falls_back_to_the_address_when_the_code_does_not_fit() {
+        let text = screen_text(80, 20);
+        assert!(text.contains(DONATION_ADDRESS));
+        assert!(text.contains("Enlarge the terminal"));
     }
 
     #[test]

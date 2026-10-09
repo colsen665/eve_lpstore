@@ -3,6 +3,7 @@
 
 mod app;
 mod form;
+mod qr;
 mod ui;
 
 use crate::output;

@@ -50,6 +50,7 @@ pub enum Overlay {
     Log,
     Help,
     Filters,
+    Donate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,11 +294,18 @@ impl App {
         if is_quit(&key) {
             return Action::Quit;
         }
+        if self.overlay == Overlay::Donate {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('d')) {
+                self.overlay = Overlay::None;
+            }
+            return Action::Continue;
+        }
         match key.code {
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Char('?') => self.toggle(Overlay::Help),
             KeyCode::Char('l') => self.toggle(Overlay::Log),
             KeyCode::Char('f') => self.open_form(),
+            KeyCode::Char('d') => self.toggle(Overlay::Donate),
             _ if self.overlay == Overlay::Help => {}
             KeyCode::Tab => {
                 if self.overlay == Overlay::None && self.report.is_some() {
@@ -634,6 +642,40 @@ mod tests {
         assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Continue);
         assert_eq!(app.form.corporations, "q");
         assert_eq!(app.on_key(ctrl('c')), Action::Quit);
+    }
+
+    #[test]
+    fn d_opens_the_donation_overlay_until_esc_or_d_closes_it() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.on_key(press(KeyCode::Char('d')));
+        assert_eq!(app.overlay, Overlay::Donate);
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Char('?')));
+        assert_eq!(
+            app.overlay,
+            Overlay::Donate,
+            "other keys wait until it closes"
+        );
+        app.on_key(press(KeyCode::Esc));
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key(press(KeyCode::Char('d')));
+        app.on_key(press(KeyCode::Char('d')));
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn q_still_quits_from_the_donation_overlay() {
+        let mut app = app_with(Vec::new(), 10);
+        app.on_key(press(KeyCode::Char('d')));
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    #[test]
+    fn d_is_a_letter_in_the_form() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('f')));
+        app.on_key(press(KeyCode::Char('d')));
+        assert_eq!(app.form.corporations, "d");
     }
 
     #[test]
