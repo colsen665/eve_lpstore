@@ -216,16 +216,27 @@ fn percent(part: f64) -> String {
 
 /// The destination table as plain text, one line per system and per destination. Split out from the
 /// drawing so the wording is testable without a frame.
-fn destination_rows(app: &App, sdata: &StaticData) -> Vec<String> {
+fn destination_rows(app: &App, sdata: &StaticData, width: usize) -> Vec<String> {
     let Some(group) = app.selected_group() else {
         return vec!["No group selected.".to_string()];
     };
     let mut rows = Vec::new();
+    match destination_scope(sdata.security_division_id(), app.agent_filter.division_id) {
+        Scope::Unknown => return vec!["the static data names no Security division".to_string()],
+        Scope::Excluded(division) => {
+            let name = sdata
+                .division_name(division)
+                .cloned()
+                .unwrap_or_else(|| format!("Division {division}"));
+            return vec![excluded_row(&name, width)];
+        }
+        Scope::Included => {}
+    }
     for corp_id in &group.corp_ids {
         rows.push(output::corporation_label(sdata, *corp_id));
-        let systems = sdata.agent_systems(*corp_id, &app.agent_filter);
+        let systems = sdata.security_agent_systems(*corp_id, &app.agent_filter);
         if systems.is_empty() {
-            rows.push("  no agent systems match the filters".to_string());
+            rows.push("  no security agents match the filters".to_string());
             continue;
         }
         for (system_id, name, _) in systems {
@@ -294,20 +305,57 @@ fn band_tenths(tenths: i32) -> String {
 /// systems in the agent system's constellation, which is an assumption this tool makes rather than a
 /// measurement of how missions are routed, and the band a destination lands in is the lowest
 /// security on the safest way to reach it, which is why it can sit below the destination's own.
-/// The pane's two standing lines, kept above the scrolling body so the disclaimer cannot be
-/// scrolled out of sight. Both are 74 characters or fewer, which is inside the 78 columns left by a
-/// border at the minimum supported width, so neither wraps and neither eats a row of the body.
+/// The pane's standing lines, kept above the scrolling body so the disclaimer cannot be scrolled
+/// out of sight. Both are 74 characters or fewer, which is inside the 78 columns a border leaves at
+/// the minimum supported width, so neither wraps and neither eats a row of the body.
 const DESTINATION_NOTES: [&str; 2] = [
-    "model, not measurement: level 1 stays in the agent's own constellation",
+    "model, not measurement: security missions stay in the constellation",
     "bands are the lowest security on the safest gate route, not a system's own",
 ];
+
+/// The agent systems the pane describes, and why any of them might be absent. The model covers
+/// Security division agents only, so a run filtered to courier or mining agents has nothing to show
+/// and says so instead of listing agents it was not asked to model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// The static data names no Security division, so nothing can be put in scope.
+    Unknown,
+    /// The run asked for a different division, carrying its id.
+    Excluded(i32),
+    /// Security agents are in scope for this run.
+    Included,
+}
+
+/// Which divisions the pane may describe, from the id the static data calls Security and the id the
+/// run filtered on. Kept apart from the data so the decision is testable on its own: a run that
+/// asked for courier agents has nothing in scope, and a run that named no division has everything
+/// in scope that its other filters allow.
+fn destination_scope(security: Option<i32>, asked: Option<i32>) -> Scope {
+    let Some(security) = security else {
+        return Scope::Unknown;
+    };
+    match asked {
+        Some(division) if division != security => Scope::Excluded(division),
+        _ => Scope::Included,
+    }
+}
+
+/// The tail of the line shown when the run's division filter excludes the missions this model
+/// describes. The longest division name in the archive is 28 characters, which with a fixed sentence
+/// would overrun the pane at the minimum width, so the name is cut to whatever room is left.
+const EXCLUDED_TAIL: &str = " agents are outside this model: security missions only";
+
+fn excluded_row(division: &str, width: usize) -> String {
+    let budget = width.saturating_sub(EXCLUDED_TAIL.chars().count());
+    format!("{}{EXCLUDED_TAIL}", truncate(division, budget))
+}
 
 fn draw_destinations(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> PaneLayout {
     let block = pane_block("Mission destinations", false, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let rows = destination_rows(app, sdata);
-    // The notes take the first two lines, so the scrollable body starts below them.
+    let rows = destination_rows(app, sdata, usize::from(inner.width));
+    // The notes take the first lines, so the scrollable body starts below them.
     let height = usize::from(inner.height).saturating_sub(DESTINATION_NOTES.len());
     let end = rows.len().saturating_sub(app.destinations_scroll);
     let start = end.saturating_sub(height);
@@ -1822,6 +1870,10 @@ mod tests {
             "the pane says the numbers are a model: {text}"
         );
         assert!(
+            text.contains("security missions stay in the constellation"),
+            "and names the scope it assumes: {text}"
+        );
+        assert!(
             text.contains("safest gate route"),
             "and says what a band means"
         );
@@ -1856,15 +1908,68 @@ mod tests {
 
     #[test]
     fn the_missions_pane_reports_what_it_cannot_show() {
-        // An empty static data has no agent systems and no constellation, which is the state before
-        // the data has been fetched, and the pane must say so rather than print nothing.
+        // An empty static data names no divisions at all, which is the state before the data has
+        // been fetched, and the pane must say that rather than print nothing or guess an id.
         let mut app = results_app(one_priced_offer(), 10);
         app.overlay = Overlay::Destinations;
         let text = view_text(&app, 120, 40);
         assert!(text.contains("Mission destinations"), "the pane is titled");
         assert!(
-            text.contains("no agent systems match the filters"),
-            "it says why a line is empty: {text}"
+            text.contains("the static data names no Security division"),
+            "it says why there is nothing to list: {text}"
+        );
+    }
+
+    #[test]
+    fn the_scope_follows_the_division_the_run_asked_for() {
+        assert_eq!(destination_scope(None, None), Scope::Unknown, "no data");
+        assert_eq!(
+            destination_scope(None, Some(22)),
+            Scope::Unknown,
+            "a division filter cannot conjure a division table"
+        );
+        assert_eq!(destination_scope(Some(24), None), Scope::Included);
+        assert_eq!(destination_scope(Some(24), Some(24)), Scope::Included);
+        assert_eq!(
+            destination_scope(Some(24), Some(22)),
+            Scope::Excluded(22),
+            "Distribution is courier work, outside the model"
+        );
+    }
+
+    #[test]
+    fn an_excluded_run_is_told_which_division_it_asked_for() {
+        assert_eq!(
+            excluded_row("Distribution", 78),
+            "Distribution agents are outside this model: security missions only"
+        );
+    }
+
+    #[test]
+    fn the_longest_division_name_still_fits_the_pane() {
+        // "Industrialist - Entrepreneur" is 28 characters, and with a fixed sentence it would have overrun
+        // the 78 columns a border leaves at the minimum width, where the line is cut without an
+        // ellipsis because the pane does not wrap. The name gives way instead of the message.
+        let width = usize::from(MIN_WIDTH) - 2;
+        for division in [
+            "Security",
+            "Industrialist - Entrepreneur",
+            "Soldier of Fortune",
+            "a name far longer than any division in the archive at all",
+        ] {
+            let row = excluded_row(division, width);
+            assert!(
+                row.chars().count() <= width,
+                "{row} overruns {width} columns"
+            );
+            assert!(
+                row.ends_with("security missions only"),
+                "the reason is never the part that gets cut: {row}"
+            );
+        }
+        assert_eq!(
+            excluded_row("Industrialist - Entrepreneur", width),
+            "Industrialist - Entrepr… agents are outside this model: security missions only"
         );
     }
 

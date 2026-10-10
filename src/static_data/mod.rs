@@ -759,6 +759,39 @@ impl StaticData {
     /// security alone cannot be looked up in the constellation or gate maps. Deduplicated by name,
     /// as `corporation_systems` is, so a corporation with several agents in one system lists it
     /// once.
+    /// The id of the agent division whose missions this project models, named by its internal name
+    /// rather than a number: the archive calls it `Security` and numbers it 24 today, but the id is
+    /// an SDE row and the name is what the filter form already shows the user.
+    pub fn security_division_id(&self) -> Option<i32> {
+        self.division_id("Security")
+    }
+
+    /// The agent systems whose missions the destination model describes: the Security division only,
+    /// since courier and mining missions are outside it. The rest of `filter` still applies, and a
+    /// filter that names some other division answers empty rather than quietly widening the scope to
+    /// match what it lists.
+    ///
+    /// Note what this cannot do: burner and anomic missions come from the same level 4 Security
+    /// agents as regular ones, so narrowing by division does not exclude them.
+    pub fn security_agent_systems(
+        &self,
+        corporation_id: i32,
+        filter: &AgentFilter,
+    ) -> Vec<(i32, String, f64)> {
+        let Some(security) = self.security_division_id() else {
+            return Vec::new();
+        };
+        if filter
+            .division_id
+            .is_some_and(|division| division != security)
+        {
+            return Vec::new();
+        }
+        let mut scoped = *filter;
+        scoped.division_id = Some(security);
+        self.agent_systems(corporation_id, &scoped)
+    }
+
     pub fn agent_systems(
         &self,
         corporation_id: i32,
@@ -838,6 +871,14 @@ impl StaticData {
             .iter()
             .find(|(_, internal)| internal.eq_ignore_ascii_case(name))
             .map(|(id, _)| *id)
+    }
+
+    /// The internal name of a division, or `None` when the id is unknown.
+    pub fn division_name(&self, division_id: i32) -> Option<&String> {
+        self.divisions
+            .iter()
+            .find(|(id, _)| *id == division_id)
+            .map(|(_, name)| name)
     }
 
     /// Division names accepted by `division_id`.
@@ -1519,6 +1560,115 @@ mod tests {
                 .sum::<i32>(),
             4 * 5 + 5,
             "own bands are in tenths: five at 0.4 and Moh at 0.5"
+        );
+    }
+
+    /// A `StaticData` with agent rows, for the listing questions the destination pane asks. Each
+    /// agent is (corporation, system, level, division), and the division ids are the archive's.
+    fn fixture_with_agents(rows: &[FixtureRow], agents: &[(i32, i32, i32, i32)]) -> StaticData {
+        let mut data = fixture(rows, &[]);
+        let mut by_corporation: HashMap<i32, Vec<AgentRow>> = HashMap::new();
+        for (corporation, system, level, division) in agents {
+            let true_sec = data
+                .systems
+                .get(system)
+                .map(|(_, sec, _, _)| *sec)
+                .unwrap_or(0.4);
+            by_corporation
+                .entry(*corporation)
+                .or_default()
+                .push(AgentRow {
+                    level: *level,
+                    tenths: displayed_security(true_sec),
+                    division_id: *division,
+                    agent_type_id: 2,
+                    system_id: *system,
+                });
+        }
+        data.corporation_agents = by_corporation;
+        data.divisions = vec![
+            (22, "Distribution".to_string()),
+            (23, "Mining".to_string()),
+            (24, "Security".to_string()),
+        ];
+        data
+    }
+
+    /// The four fixture systems with one Security agent in each at level 1 to 4.
+    fn one_agent_per_system() -> StaticData {
+        fixture_with_agents(
+            &FOUR_SYSTEMS,
+            &[
+                (7, 1, 1, 24),
+                (7, 2, 2, 24),
+                (7, 3, 3, 24),
+                (7, 4, 4, 24),
+                (7, 2, 2, 22),
+                (7, 3, 1, 23),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_security_division_is_found_by_its_name() {
+        let data = one_agent_per_system();
+        assert_eq!(data.security_division_id(), Some(24));
+        assert_eq!(
+            data.division_name(22).map(String::as_str),
+            Some("Distribution")
+        );
+        assert_eq!(data.division_name(99), None);
+    }
+
+    #[test]
+    fn only_security_agents_are_listed_for_the_model() {
+        let data = one_agent_per_system();
+        let listed = data.security_agent_systems(7, &AgentFilter::default());
+        let ids: Vec<i32> = listed.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "the Distribution and Mining rows are left out"
+        );
+        // The same listing without the scope keeps them, which is what the pane used to show.
+        let all = data.agent_systems(7, &AgentFilter::default());
+        assert!(all.len() >= listed.len(), "the scope can only narrow");
+    }
+
+    #[test]
+    fn a_filter_for_another_division_leaves_nothing_to_model() {
+        let data = one_agent_per_system();
+        let courier = AgentFilter {
+            division_id: Some(22),
+            ..Default::default()
+        };
+        assert!(
+            data.security_agent_systems(7, &courier).is_empty(),
+            "courier agents are outside the model, not folded into it"
+        );
+        // Other conditions still apply inside the scope.
+        let level_4 = AgentFilter {
+            level: Some(4),
+            ..Default::default()
+        };
+        let listed = data.security_agent_systems(7, &level_4);
+        assert_eq!(
+            listed.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            vec![4],
+            "level 4 narrows the security rows only"
+        );
+    }
+
+    #[test]
+    fn an_unknown_division_table_lists_nothing_rather_than_everything() {
+        // A cache without the division names cannot say which agents are in scope, and guessing by
+        // id would show missions the model does not describe.
+        let mut data = one_agent_per_system();
+        data.divisions = Vec::new();
+        assert_eq!(data.security_division_id(), None);
+        assert!(
+            data.security_agent_systems(7, &AgentFilter::default())
+                .is_empty()
         );
     }
 
