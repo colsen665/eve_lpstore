@@ -7,8 +7,7 @@ silently or writing around it in the summary. If several are open, ask them toge
 
 When asked to implement something, ask the questions first, then carry the implementation through to
 the end. Once the questions are answered, continue and do not stop to ask again. If an answer turns
-out not to apply, or a fresh obstacle appears, note it in the report of the finished work rather
-than pausing to ask, unless the obstacle genuinely prevents the work.
+out not to apply, or a fresh obstacle appears, ask for the desired action in a dialog with suggestions.
 
 When work is pending and nothing is unresolved, offer it as a dialog rather than starting it or
 waiting to be told. State the scope options concretely, such as one phase, one item within a phase,
