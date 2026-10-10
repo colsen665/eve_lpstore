@@ -19,6 +19,12 @@ Keep the writing objective and verifiable.
 - Give a recommendation as a recommendation, with the reason, rather than asserting a verdict.
 - Report a claim that turned out to be wrong as a correction, plainly and early.
 
+## Commands
+
+Never run `sudo`, or any other route to root privileges. Installing or configuring system packages
+is a human action. When a tool needed for a task is missing, report what is missing and what it
+would be used for, and stop there.
+
 ## Completion cue
 
 When work ships something — a commit, or a verified implementation — play the Terminator 2 theme,
@@ -30,8 +36,7 @@ mpv --no-video https://www.youtube.com/watch?v=pVZ2NShfCE8
 
 - Run it in the background rather than blocking on playback.
 - If `mpv` is not installed, print the link instead of playing it, and say that it was not played.
-  Do not install anything to satisfy this; `mpv` needs `yt-dlp` alongside it, and both need a
-  password for `sudo`, which is a human action.
+  Do not install anything to satisfy this, per the rule under Commands.
 - Do not fire for replies that only answer a question, explain a state, audit something, or open a
   dialog. Playing after every response makes it noise rather than a cue.
 
