@@ -269,20 +269,42 @@ What the data supports, after one assumed gap closed and one question opened:
       sources agree no such system exists: the cached `mapSolarSystems` rows, and ESI's
       `POST /universe/ids`, which resolves the name only as a character. The claim that the data
       "excludes space systems" stays withdrawn, since 14 of the 15 probed names may not be real.
-- [ ] **The bound to one constellation is documented for level 1 only, and only for courier
-      missions.** Same EVE Info page, courier section: "Level 1 missions will keep you within the
-      agent's constellation, level 2 and level 3 will possibly send you to a neighboring constellation,
-      and level 4 courier missions will always send you to a neighboring constellation." EVE-Survival's
-      courier reference gives one-way jump ranges that agree: 0 to 5 for levels 1 and 2, 0 to 12 for
-      level 3, and 1 to 12 for level 4 couriers. So the model as built is defensible at level 1 and
-      understates reach above it, and neither source says what bounds an **Encounter** mission at levels
-      2 to 4, which is the case this tool's users most care about. Decided separately, below.
-- [ ] Level 5 carries a constraint the uniform model cannot express: the E-Uni mission page says level 5
-      missions "are exclusively located in Low Security space", so in a constellation that mixes bands a
-      0.5 system is not a possible destination for a level 5 agent at all. An archived forum thread
-      agrees from the other direction, reporting that level 5 sites in a constellation with mostly
-      highsec systems concentrate in the few lowsec ones. Both are documentation and anecdote, not
-      measurement.
+- [x] **Scope is security missions, which excludes courier and mining agents.** Stated as a correction
+      while this work was in progress: the constellation bound quoted below comes from EVE Info's
+      *courier* section, and courier work is a different agent division, so it was never evidence about
+      the missions this tool models. The pane now lists Security division agents only, and the line it
+      claimed about levels 2 and up was removed together with that evidence.
+- [ ] What bounds a security (Encounter) mission's destination above level 1 is **undocumented by
+      anything found so far.** The sentences that do exist — level 1 "will keep you within the agent's
+      constellation", levels 2 and 3 "will possibly send you to a neighboring constellation", level 4
+      couriers "always" — belong to Distribution division agents and are recorded here only to explain
+      why they were set aside, as are EVE-Survival's jump ranges (0 to 5 for levels 1 and 2, 0 to 12 at
+      level 3, 1 to 12 for level 4 couriers), which are courier figures too. Nothing located states the
+      reach of an Encounter mission at any level, so the constellation bound is this project's own
+      assumption at every level, and the pane's first line says it is a model.
+- [ ] Level 5 carries a constraint the uniform model cannot express, and which reading applies is not
+      settled. The E-Uni mission page says level 5 missions "are exclusively located in Low Security
+      space", and an archived forum thread agrees from the other direction, reporting level 5 sites in a
+      mostly-highsec constellation concentrating in its few lowsec systems. Read as a claim about the
+      *agent*, it contradicts the cached archive: of its 84 level 5 Security agents, 66 sit in systems
+      whose true security is below 0.5 and 18 at 0.5 or above (by displayed band, 65 and 19). Read as a
+      claim about the *site*, it is unchecked by this tool, since sites are in no public data. Either
+      way the uniform model does not capture it, because it lets a mixed constellation's 0.5 systems be
+      destinations at every level.
+- [x] The scope is applied where the data allows it: `StaticData::security_agent_systems` keeps the
+      corporation's agents in the archive's `Security` division, looked up by internal name rather than
+      a hard-coded id (24 today), and a filter naming another division answers empty instead of quietly
+      widening what is modelled. On the real archive this narrows listings — X-Sense from 27 agent
+      systems to 12, Ammatar Consulate from 10 to 8, Guristas from 8 to 7 — and of the 178 corporations
+      cached, 20 have no Security agent at all, which reads as "no security agents match the filters".
+      A run filtered to Distribution gets "Distribution agents are outside this model: security
+      missions only", with the name cut to fit the pane because the longest division name in the
+      archive is 28 characters.
+- [ ] What should the pane say for an agent system in a gateless pocket, where the gate-only model
+      counts one system out of a constellation of several? The options are to name the unreachable
+      members on the row, to leave such systems out of the pane altogether, or to widen the graph to
+      the archive's wormhole links, which is the only reading that makes the numbers true but rests on
+      connections that change outside downtime. Asked, not decided.
 - [ ] There is no public way to measure any of this. Probed on 2026-10-10:
       `GET /characters/{id}/missions/` and `GET /characters/{id}/missionlog/` both return 404, while
       `GET /characters/{id}/assets/` returns 401 for the same unauthenticated request. The 401 is the
@@ -322,7 +344,10 @@ assumption about the game, not a measurement, so the view should present it as t
       agent system with its band groups and hop groups, then one line per destination. Probabilities
       are whole percents, since the counts are single digits and a decimal would suggest a precision
       the model does not have. Up and Down scroll it in the details-pane direction, not the log's
-      inverted one, and `Esc` closes while `q` still quits.
+      inverted one, and `Esc` closes while `q` still quits. Two italic lines sit above the body so the
+      disclaimer cannot be scrolled away: that these are a model in which security missions stay in the
+      constellation, and that a band is the lowest security on the safest route rather than the system's
+      own.
 - [x] Grouping uses the same rounding the security filter already applies, so a band on screen is a
       band a user can type: `security_band` returns tenths through `displayed_security` rather than
       rounding a second time, and the negative and zero cases the filter accepts are reachable here
@@ -397,7 +422,24 @@ Deferred to a later phase:
       pane's text is pinned by assertions on the exact rendered lines, including the collapsed
       Sazdih case, a destination whose id is unknown and the notes at the narrowest supported width,
       and the whole pane has been printed from a TestBackend at 80 columns, but nobody has opened it
-      with `m` in a real terminal and it has never been drawn from a version 3 cache.
+      with `m` in a real terminal.
+- [x] The pane's *numbers* are now checked against the version 3 data on disk, through a temporary test
+      that read the real cache and printed the rows — no download was needed, the archive was already
+      fetched. Bayuka's spread from the live map is `bands [(4, 1.0)]`, `own_bands [(4, 5/6), (5, 1/6)]`
+      and `hops [(0, 1/6), (1, 3/6), (2, 2/6)]`, exactly the fixture, with `Moh (2, 4, 5)` the one
+      destination whose own band differs from its route band. The test was deleted afterwards and the
+      numbers recorded here instead.
+- [ ] **Real data exposed a shape the fixtures never had, and it is a live problem.** 9-ERCP, a nullsec
+      Security agent system, printed `route -0.1/100%  0J/100%`, which reads as "every mission lands in
+      your own system". It is not a one-system constellation: 9-ERCP belongs to 20000218, which has 7
+      members, none of them reachable by stargate — a wormhole pocket, whose systems are joined by
+      connections the model deliberately ignores. The spread drops members unreachable inside the
+      constellation, so the denominator fell from 7 to 1 and the row shows a certainty about a
+      constellation it only counted one system of. Measured on the archive: 1,184 constellations split
+      766 all-gated and 418 all-gate-less with none mixing the two, which confirms the earlier claim
+      that no gated constellation contains a gateless member, and 52 of the 1,239 distinct Security
+      agent systems (4.2%) sit in those gateless pockets, where every row the pane prints is like this
+      one. Open question below: what such a row should say.
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
