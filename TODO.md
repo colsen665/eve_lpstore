@@ -155,6 +155,20 @@ Store the ESI response cache, the static data, and the remembered filters in the
 - [x] A `filters.json` left in the working directory by a Phase 7.1 build was orphaned when the file moved to `~/.config/eve_lpstore/filters.json`. One existed in this checkout, written 2026-10-10 11:11 with `lpstore: The Scope` and the pre-filled region and depth. It was deleted rather than moved or migrated, so those remembered filters are gone and the next session starts from the command line and the defaults. Nothing reads or writes the top-level path, which is why `.gitignore` no longer lists it.
 - [x] The seven files in `data/` that nothing read are covered by the download path writing only four. `load_from_disk` reads four files and only those four have filename constants. This checkout's `data/` was created by a run and holds only the four, so there was nothing to remove here; the seven existed only in the predecessor checkout, which this code never wrote them into either.
 
+#### Phase 9: The TUI as the default mode
+
+A bare `eve_lpstore` prints the usage line. It should open the view instead, with `--tui` kept as an
+accepted flag that says what now happens anyway.
+
+- [ ] A bare invocation starts the TUI, and `--tui` stays accepted and behaves identically, so existing muscle memory and scripts that pass it are unaffected. `--help`, `--example`, and `--lpstores` all keep selecting themselves rather than the default.
+- [ ] Decide the mode before the paths and the filters are needed, in one place. The current shape is a boolean read at `src/main.rs:143`, a terminal test at `:149`, a branch at `:223`, and an `else` at `:229` that either clears the cache or prints the usage line from `:232`. Replacing that spread with one function returning a mode, given the arguments and whether stdout is a terminal, is what makes the rest testable.
+- [ ] No mode and no terminal on stdout prints the usage line, as it does today, so a pipe and a CI job see help rather than a failure. Passing `--tui` explicitly with no terminal keeps the current error at `:149`, because there the user asked for something that cannot happen.
+- [ ] `--clear-cache` with no mode clears the files and exits, as it does now. It does not start the view afterwards: maintenance should not drop the user into an interactive session, and a cold cache makes the first run slow enough to look like a hang.
+- [ ] `--tui --example` stays an error. Both name a mode, and `--example` being one that the default does not override means the combination is a contradiction rather than a redundancy.
+- [ ] `HELP_TEXT` says the default. The `--tui` entry at `:22` currently reads as an addition to make; it becomes the thing that happens on its own, with `--example` and `--lpstores` at `:20-21` the ways to ask for something else. The usage line printed at `:232` brackets the mode list, `[--example|--lpstores|--tui]`, which should read as optional and defaulted rather than as one of three required choices. Add an example for the bare run, and keep the `--clear-cache --help` example honest, since `--help` is still checked before anything else.
+- [ ] Tests. `src/main.rs` has three, all for `--clear-cache`, and none for argument handling, which is why the mode decision wants extracting before it changes. Cover bare with a terminal, bare without one, `--tui` with and without one, `--lpstores`, `--example`, both modes refused together, and `--clear-cache` alone.
+- [ ] Check the `--status` and `--verbose` entries, which both mention `--tui` as a qualifier of what they do. Once `--tui` is the default, "With --tui, the footer shows it instead" needs to describe the default case rather than an opt-in. The two path lines printed under `--verbose` at `:195-199` also reach stdout before the mode is chosen at `:200`, so with the TUI as the default that text is written just before the terminal is taken over.
+
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
