@@ -295,7 +295,7 @@ fn ui_loop(
         let mut layout = ui::PaneLayout::default();
         terminal.draw(|frame| layout = ui::draw(frame, app, &session.sdata, &stats))?;
         app.set_detail_layout(layout.detail_rows, layout.detail_visible);
-        app.set_destinations_rows(layout.destinations_rows);
+        app.set_destinations_layout(layout.destinations_rows, layout.destinations_visible);
 
         if event::poll(TICK)? {
             let action = match event::read()? {

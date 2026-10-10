@@ -117,8 +117,10 @@ pub struct App {
     pub detail_rows: usize,
     pub detail_visible: usize,
     pub log_scroll: usize,
-    /// Scrolling within the mission destinations pane.
+    /// Scrolling within the mission destinations pane: how many rows it produced and how many fit on
+    /// screen, so the keys bound the scroll the same way the details pane does.
     pub destinations_rows: usize,
+    pub destinations_visible: usize,
     pub destinations_scroll: usize,
     pub overlay: Overlay,
     /// The file name typed into the export prompt.
@@ -162,6 +164,7 @@ impl App {
             detail_visible: 0,
             log_scroll: 0,
             destinations_rows: 0,
+            destinations_visible: 0,
             destinations_scroll: 0,
             overlay: Overlay::None,
             export_path: String::new(),
@@ -394,11 +397,12 @@ impl App {
 
     /// Records how the details pane was drawn: its total rows, and how many fit on screen.
     /// Scrolling uses these, so the last row can always be reached.
-    /// Records how tall the destinations pane was last frame, which bounds its scrolling. The pane
-    /// is only measured while it is open, so a closed pane keeps the last count rather than
-    /// resetting it; the scroll is clamped against it either way.
-    pub fn set_destinations_rows(&mut self, rows: usize) {
+    /// Records how tall the destinations pane was last frame, which bounds its scrolling. The pane is
+    /// only measured while it is open, so a closed pane keeps the last count rather than resetting it;
+    /// the scroll is clamped against it either way.
+    pub fn set_destinations_layout(&mut self, rows: usize, visible: usize) {
         self.destinations_rows = rows;
+        self.destinations_visible = visible;
     }
 
     pub fn set_detail_layout(&mut self, rows: usize, visible: usize) {
@@ -603,9 +607,12 @@ impl App {
             return;
         }
         if self.overlay == Overlay::Destinations {
-            // The details-pane direction, not the log's: this table reads top to bottom, so Down
-            // moves to later rows. The log is inverted because its newest line is at the bottom.
-            let max = self.destinations_rows.saturating_sub(1);
+            // The details-pane direction and the details-pane bound: this table reads top to bottom,
+            // so Down moves to later rows and the last row stays on screen. The log is inverted
+            // because its newest line is at the bottom.
+            let max = self
+                .destinations_rows
+                .saturating_sub(self.destinations_visible);
             self.destinations_scroll = shift(self.destinations_scroll, delta, max);
             return;
         }
@@ -974,7 +981,7 @@ mod tests {
     fn the_missions_pane_scrolls_without_moving_the_selection() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.on_key(press(KeyCode::Char('m')));
-        app.set_destinations_rows(30);
+        app.set_destinations_layout(30, 10);
         let group_before = app.group;
         app.on_key(press(KeyCode::Down));
         assert_eq!(app.destinations_scroll, 1, "down shows lower rows");
@@ -986,8 +993,9 @@ mod tests {
         for _ in 0..40 {
             app.on_key(press(KeyCode::Down));
         }
+        // 30 rows with 10 on screen: the last window shows rows 20 to 29.
         assert_eq!(
-            app.destinations_scroll, 29,
+            app.destinations_scroll, 20,
             "stops with the last row on screen"
         );
     }

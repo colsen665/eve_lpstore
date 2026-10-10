@@ -59,6 +59,7 @@ pub struct PaneLayout {
     pub detail_rows: usize,
     pub detail_visible: usize,
     pub destinations_rows: usize,
+    pub destinations_visible: usize,
 }
 
 /// Draws the whole view. Reports what each scrollable pane needs to know about itself.
@@ -221,16 +222,9 @@ fn destination_rows(app: &App, sdata: &StaticData, width: usize) -> Vec<String> 
         return vec!["No group selected.".to_string()];
     };
     let mut rows = Vec::new();
-    match destination_scope(sdata.security_division_id(), app.agent_filter.division_id) {
-        Scope::Unknown => return vec!["the static data names no Security division".to_string()],
-        Scope::Excluded(division) => {
-            let name = sdata
-                .division_name(division)
-                .cloned()
-                .unwrap_or_else(|| format!("Division {division}"));
-            return vec![excluded_row(&name, width)];
-        }
-        Scope::Included => {}
+    let scope = destination_scope(sdata.security_division_id(), app.agent_filter.division_id);
+    if scope != Scope::Included {
+        return vec![scope_note(sdata, scope, width)];
     }
     for corp_id in &group.corp_ids {
         rows.push(output::corporation_label(sdata, *corp_id));
@@ -296,6 +290,103 @@ fn system_lines(
     rows
 }
 
+/// The colour of a security band in the destination views: the asked-for purple at 0.0 and below,
+/// red through lowsec, yellow at 0.5, green across the highsec middle and cyan at the top.
+///
+/// Ratatui's palette is ANSI and has no `Purple`, only `Magenta` and `LightMagenta`. `LightMagenta`
+/// is what reads as purple on the usual terminal themes, and it is chosen over `Magenta` because the
+/// offers table already spends `Magenta` on an inverted spread: two meanings in one colour two panes
+/// apart is worse than two close shades with distinct meanings.
+fn band_colour(tenths: i32) -> Color {
+    match tenths {
+        t if t <= 0 => Color::LightMagenta,
+        t if t <= 4 => Color::Red,
+        5 => Color::Yellow,
+        t if t <= 8 => Color::Green,
+        _ => Color::Cyan,
+    }
+}
+
+/// The line broken into spans with its security bands coloured. Band labels are already written in
+/// tenths by the formatters, so this reads the printed digits rather than converting a security
+/// again, which is what keeps `(0.18)` — a system's true security, two decimals — plain while
+/// `0.4/83%`, `route 0.4` and `own 0.5` are coloured.
+fn coloured(text: &str, base: Style) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let Some((tenths, next)) = read_band(&chars, at) else {
+            plain.push(chars[at]);
+            at += 1;
+            continue;
+        };
+        if !plain.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut plain), base));
+        }
+        let words: String = chars[at..next].iter().collect();
+        spans.push(Span::styled(
+            words,
+            base.patch(Style::new().fg(band_colour(tenths))),
+        ));
+        at = next;
+    }
+    if !plain.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(plain, base));
+    }
+    spans
+}
+
+/// A band label starting at `at`: an optional sign, one digit, a dot and one digit, with nothing
+/// after it that would make the number longer. Returns its value in tenths and where it ends.
+fn read_band(chars: &[char], at: usize) -> Option<(i32, usize)> {
+    let mut i = at;
+    let negative = chars.get(i) == Some(&'-');
+    if negative {
+        i += 1;
+    }
+    let ones = chars.get(i).and_then(|c| c.to_digit(10))?;
+    i += 1;
+    if chars.get(i) != Some(&'.') {
+        return None;
+    }
+    i += 1;
+    let tenths = chars.get(i).and_then(|c| c.to_digit(10))?;
+    i += 1;
+    if chars
+        .get(i)
+        .is_some_and(|c| c.is_ascii_digit() || *c == '.')
+    {
+        return None;
+    }
+    let value = ones as i32 * 10 + tenths as i32;
+    Some((if negative { -value } else { value }, i))
+}
+
+/// The details-pane line for one agent system: its name and true security, then the band groups and
+/// the hop groups. The destinations pane spells the same numbers with the system id and the word
+/// `route`; here the row sits under its corporation, so the security stands in for the id.
+fn summary_text(
+    name: &str,
+    true_sec: f64,
+    spread: &eve_lpstore::static_data::DestinationSpread,
+) -> String {
+    let bands = spread
+        .bands
+        .iter()
+        .map(|(band, part)| format!("{}/{}", band_tenths(*band), percent(*part)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hops = spread
+        .hops
+        .iter()
+        .map(|(distance, part)| format!("{distance}J/{}", percent(*part)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("  {name} ({true_sec:.2}) {bands}  {hops}")
+}
+
 /// Tenths to the one-decimal label the panes and `--security` both use.
 fn band_tenths(tenths: i32) -> String {
     format!("{:.1}", tenths as f64 / 10.0)
@@ -312,6 +403,21 @@ const DESTINATION_NOTES: [&str; 2] = [
     "model, not measurement: security missions stay in the constellation",
     "bands are the lowest security on the safest gate route, not a system's own",
 ];
+
+/// The one-line reason the systems are missing, for whichever view asks.
+fn scope_note(sdata: &StaticData, scope: Scope, width: usize) -> String {
+    match scope {
+        Scope::Unknown => "the static data names no Security division".to_string(),
+        Scope::Excluded(division) => {
+            let name = sdata
+                .division_name(division)
+                .cloned()
+                .unwrap_or_else(|| format!("Division {division}"));
+            excluded_row(&name, width)
+        }
+        Scope::Included => String::new(),
+    }
+}
 
 /// The agent systems the pane describes, and why any of them might be absent. The model covers
 /// Security division agents only, so a run filtered to courier or mining agents has nothing to show
@@ -350,36 +456,69 @@ fn excluded_row(division: &str, width: usize) -> String {
     format!("{}{EXCLUDED_TAIL}", truncate(division, budget))
 }
 
+/// Which of the pane's rows are on screen. The window starts at the top of the table, so a pane that
+/// opens with nothing scrolled shows the first corporation and its systems rather than the tail of
+/// the list, and a scroll past the end is pulled back until the last row is on screen.
+fn pane_window(rows: usize, scroll: usize, height: usize) -> (usize, usize) {
+    if height == 0 {
+        return (0, 0);
+    }
+    let start = scroll.min(rows.saturating_sub(height));
+    (start, (start + height).min(rows))
+}
+
+/// The pane's rows, each given the style its indent asks for and cut to the pane's width. A
+/// corporation names itself at column 0, a system indents two, a destination four, and the
+/// indentation survives the cut so a wrapped row cannot be mistaken for the start of a new entry.
+fn pane_body(rows: &[String], width: usize) -> Vec<(String, Style)> {
+    rows.iter()
+        .flat_map(|row| {
+            let style = if row.starts_with("    ") {
+                Style::new().dark_gray()
+            } else if row.starts_with("  ") {
+                Style::new()
+            } else {
+                Style::new().bold()
+            };
+            wrap_text(row, width)
+                .into_iter()
+                .map(move |part| (part, style))
+        })
+        .collect()
+}
+
 fn draw_destinations(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> PaneLayout {
     let block = pane_block("Mission destinations", false, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let rows = destination_rows(app, sdata, usize::from(inner.width));
-    // The notes take the first lines, so the scrollable body starts below them.
+    let width = usize::from(inner.width).max(1);
+    let rows = destination_rows(app, sdata, width);
+    // Measured on the real archive a summary line runs to a median of 65 characters and a maximum of
+    // 126, so at the 78 columns a border leaves at the minimum width some of them have to wrap. They
+    // wrap here rather than being clipped, with the indent kept on every row, because a cut-off
+    // percentage is worse than a second row.
+    let body = pane_body(&rows, width);
+    // The notes take the first lines, so the scrollable body starts below them, and the window opens
+    // at the top of the table: the first rows are the corporation names and their systems.
     let height = usize::from(inner.height).saturating_sub(DESTINATION_NOTES.len());
-    let end = rows.len().saturating_sub(app.destinations_scroll);
-    let start = end.saturating_sub(height);
+    let (start, end) = pane_window(body.len(), app.destinations_scroll, height);
     let mut lines: Vec<Line<'static>> = DESTINATION_NOTES
         .iter()
         .map(|note| Line::from(Span::styled(*note, Style::new().italic().dark_gray())))
         .collect();
-    lines.extend(rows[start..end].iter().map(|row| {
-        // System lines are indented two, destinations four; anything less is a corporation name.
-        let style = if row.starts_with("    ") {
-            Style::new().dark_gray()
-        } else if row.starts_with("  ") {
-            Style::new()
-        } else {
-            Style::new().bold()
-        };
-        Line::from(Span::styled(row.clone(), style))
-    }));
+    lines.extend(
+        body[start..end]
+            .iter()
+            .map(|(row, style)| Line::from(coloured(row, *style))),
+    );
     // Sliced to the visible window already, so no `.scroll()` offset on top of that.
     frame.render_widget(Paragraph::new(lines), inner);
     PaneLayout {
         detail_rows: 0,
         detail_visible: 0,
-        destinations_rows: rows.len(),
+        // The count the keys scroll against is the wrapped rows, not the logical lines.
+        destinations_rows: body.len(),
+        destinations_visible: height,
     }
 }
 
@@ -659,6 +798,7 @@ fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) ->
         detail_rows,
         detail_visible,
         destinations_rows: 0,
+        destinations_visible: 0,
     }
 }
 
@@ -941,7 +1081,11 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) ->
     let visible = usize::from(area.height.saturating_sub(2));
     let lines: Vec<Line<'static>> = detail_entries(app, sdata)
         .iter()
-        .flat_map(|(text, style)| wrap(text, width, *style))
+        .flat_map(|(text, style)| {
+            wrap_text(text, width)
+                .into_iter()
+                .map(move |row| Line::from(coloured(&row, *style)))
+        })
         .collect();
     let rows = lines.len();
     let scroll = app.detail_scroll.min(rows.saturating_sub(visible));
@@ -959,6 +1103,24 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         let mut rows = wrap_text(first, width);
         rows.extend(wrap_text(rest, width));
         return rows;
+    }
+    // Leading spaces are indentation, not a word, and splitting on spaces would drop them: a
+    // wrapped destination line would then start its second row at column 0 and read like a new
+    // system rather than the continuation of one. The indent is taken off, the rest wrapped into
+    // what is left of the width, and the indent put back on every row.
+    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
+    if !indent.is_empty() {
+        if width <= indent.chars().count() {
+            // Nothing is left to wrap into. Hand back the line and let the pane clip it, which is
+            // what it did before, rather than cutting one character per row. The view's own
+            // minimum width makes this unreachable; the guard is so it stays that way.
+            return vec![text.to_string()];
+        }
+        let room = width - indent.chars().count();
+        return wrap_text(&text[indent.len()..], room)
+            .into_iter()
+            .map(|row| format!("{indent}{row}"))
+            .collect();
     }
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
@@ -997,14 +1159,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-/// The rows of `wrap_text`, each styled.
-fn wrap(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
-    wrap_text(text, width)
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, style)))
-        .collect()
-}
-
 /// The text of the details pane, one entry per logical line. `wrap` turns each entry into one
 /// or more screen rows.
 fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
@@ -1014,8 +1168,32 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
         return Vec::new();
     };
     let mut lines = vec![("Corporations".to_string(), bold)];
+    let scope = destination_scope(sdata.security_division_id(), app.agent_filter.division_id);
+    if scope != Scope::Included {
+        // The systems below are the ones the model describes, so an excluded run says why there are
+        // none rather than leaving the corporation names standing alone. The `m` pane gives the same
+        // reason at more length.
+        lines.push((scope_note(sdata, scope, usize::from(MIN_WIDTH) - 2), plain));
+        for &id in &group.corp_ids {
+            lines.push((output::corporation_label(sdata, id), plain));
+        }
+        lines.push((String::new(), plain));
+        return lines;
+    }
     for &id in &group.corp_ids {
-        lines.push((output::corp_line(sdata, id, &app.agent_filter), plain));
+        lines.push((output::corporation_label(sdata, id), plain));
+        let systems = sdata.security_agent_systems(id, &app.agent_filter);
+        if systems.is_empty() {
+            lines.push(("  no security agents match the filters".to_string(), plain));
+            continue;
+        }
+        for (system_id, name, true_sec) in systems {
+            let text = match sdata.mission_spread(system_id) {
+                Some(spread) => summary_text(&name, true_sec, &spread),
+                None => format!("  {name} ({true_sec:.2})  no constellation data"),
+            };
+            lines.push((text, plain));
+        }
     }
     lines.push((String::new(), plain));
 
@@ -1257,20 +1435,32 @@ mod tests {
     use eve_lpstore::report::{LpStoreOptions, Report};
     use eve_lpstore::static_data::AgentFilter;
 
-    fn texts(lines: &[Line<'_>]) -> Vec<String> {
-        lines.iter().map(|line| line.to_string()).collect()
+    #[test]
+    fn wrapping_keeps_the_indent_on_every_row() {
+        // Destination lines are indented under their corporation. Without this the continuation row
+        // sat at column 0, which is where a new system would start.
+        assert_eq!(
+            wrap_text("  Bereye 0.5/12% 0.6/38%", 12),
+            ["  Bereye", "  0.5/12%", "  0.6/38%"]
+        );
+        // A line with no indent is wrapped exactly as before.
+        assert_eq!(wrap_text("one two three", 7), ["one two", "three"]);
+        // An indent wider than the row still keeps its text rather than vanishing.
+        assert_eq!(
+            wrap_text("    deep", 3),
+            ["    deep"],
+            "clipped, not shredded"
+        );
     }
 
     #[test]
     fn wrap_breaks_at_spaces_and_cuts_long_words() {
-        let rows = wrap("Ministry of Assessment (1000081): Turba", 20, Style::new());
         assert_eq!(
-            texts(&rows),
+            wrap_text("Ministry of Assessment (1000081): Turba", 20),
             ["Ministry of", "Assessment", "(1000081): Turba"]
         );
-        let cut = wrap("abcdefghij", 4, Style::new());
-        assert_eq!(texts(&cut), ["abcd", "efgh", "ij"]);
-        assert_eq!(texts(&wrap("", 10, Style::new())), [""]);
+        assert_eq!(wrap_text("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_text("", 10), [""]);
     }
 
     #[test]
@@ -1479,7 +1669,7 @@ mod tests {
         app
     }
 
-    /// The whole `--tui` view rendered at `width` x `height`, as one string.
+    /// The whole `--tui` view rendered at `width` x `height`, as one string, on empty static data.
     fn view_text(app: &App, width: u16, height: u16) -> String {
         let sdata = StaticData::default();
         let stats = ClientStats::default();
@@ -1847,6 +2037,169 @@ mod tests {
         };
         let rows = system_lines(9, "Here", &spread, &|_| None);
         assert_eq!(rows[1], "    system 99 1J route 0.4");
+    }
+
+    /// A spread with the numbers of the asked-for example, so the wording is pinned against it.
+    fn two_band_spread() -> eve_lpstore::static_data::DestinationSpread {
+        eve_lpstore::static_data::DestinationSpread {
+            constellation_id: 20000300,
+            systems: 2,
+            bands: vec![(1, 0.5), (2, 0.5)],
+            own_bands: vec![(1, 0.5), (2, 0.5)],
+            hops: vec![(0, 0.5), (1, 0.5)],
+            destinations: vec![(30003601, 0, 1, 1), (30003602, 1, 2, 2)],
+        }
+    }
+
+    #[test]
+    fn the_pane_opens_at_the_top_of_the_table() {
+        // The bug this pins: the pane inherited the log's bottom-first window, so it opened showing
+        // the tail of the list and Down moved it up. A corporation table reads top to bottom.
+        assert_eq!(pane_window(60, 0, 10), (0, 10), "nothing scrolled");
+        assert_eq!(pane_window(60, 5, 10), (5, 15), "scrolled down");
+        assert_eq!(
+            pane_window(60, 999, 10),
+            (50, 60),
+            "clamped to the last row"
+        );
+        assert_eq!(pane_window(4, 0, 10), (0, 4), "shorter than the pane");
+        assert_eq!(
+            pane_window(4, 2, 0),
+            (0, 0),
+            "a pane with no room shows nothing"
+        );
+    }
+
+    #[test]
+    fn a_long_summary_wraps_in_the_pane_instead_of_being_cut() {
+        // The longest real summary measured 126 characters against the 78 columns a border leaves at
+        // the minimum width, so this is the case the pane cannot show in one row.
+        let long = format!(
+            "  {}",
+            [
+                "Evenlongname (0.12)",
+                "0.1/12%, 0.2/12%, 0.3/12%, 0.4/12%, 0.5/12%",
+                "0J/12%, 1J/12%, 2J/12%, 3J/12%, 4J/12%, 5J/12%, 6J/12%, 7J/12%",
+            ]
+            .join("  ")
+        );
+        assert!(long.chars().count() > 100, "fixture is long enough");
+        let dest = "    Deep 3J route 0.4";
+        let body = pane_body(&[long.clone(), dest.to_string()], 78);
+        assert!(
+            body.len() >= 3,
+            "the summary took more than one row: {body:?}"
+        );
+        for (part, _) in &body {
+            assert!(part.chars().count() <= 78, "{part:?} overran the pane");
+        }
+        // Wrapping must lose no word and reorder none.
+        let wrapped: Vec<&str> = body
+            .iter()
+            .flat_map(|(part, _)| part.split_whitespace())
+            .collect();
+        let wanted: Vec<&str> = long
+            .split_whitespace()
+            .chain(dest.split_whitespace())
+            .collect();
+        assert_eq!(wrapped, wanted, "wrapping lost or moved a word");
+        assert!(
+            body[0].0.starts_with("  Evenlongname"),
+            "the first row keeps the indent"
+        );
+        assert!(
+            body.iter().skip(1).all(|(part, _)| part.starts_with("  ")),
+            "continuation rows are indented too: {body:?}"
+        );
+        assert_eq!(
+            body.last().unwrap().0,
+            dest,
+            "the destination row is intact"
+        );
+        assert_eq!(body.last().unwrap().1, Style::new().dark_gray());
+    }
+
+    #[test]
+    fn the_details_summary_is_one_indented_line_per_system() {
+        assert_eq!(
+            summary_text("Babirmoult", 0.1788, &two_band_spread()),
+            "  Babirmoult (0.18) 0.1/50%, 0.2/50%  0J/50%, 1J/50%"
+        );
+        assert_eq!(
+            summary_text("Annancale", 0.0941, &two_band_spread()),
+            "  Annancale (0.09) 0.1/50%, 0.2/50%  0J/50%, 1J/50%"
+        );
+    }
+
+    #[test]
+    fn bands_are_coloured_at_the_asked_boundaries() {
+        assert_eq!(band_colour(0), Color::LightMagenta);
+        assert_eq!(band_colour(-1), Color::LightMagenta, "nullsec and below");
+        assert_eq!(band_colour(1), Color::Red);
+        assert_eq!(band_colour(4), Color::Red, "lowsec ends at 0.4");
+        assert_eq!(band_colour(5), Color::Yellow);
+        assert_eq!(band_colour(6), Color::Green);
+        assert_eq!(band_colour(8), Color::Green);
+        assert_eq!(band_colour(9), Color::Cyan);
+        assert_eq!(band_colour(10), Color::Cyan, "1.0 is the top of the scale");
+    }
+
+    #[test]
+    fn a_band_is_coloured_and_a_true_security_is_not() {
+        // The system's own security is printed to two decimals and belongs to the agent, not to a
+        // band, so it stays in the line's style while the band groups beside it are coloured.
+        let spans = coloured("  Babirmoult (0.18) 0.1/50%, 0.2/50%", Style::new());
+        let texts: Vec<String> = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(
+            texts,
+            ["  Babirmoult (0.18) ", "0.1", "/50%, ", "0.2", "/50%"]
+        );
+        assert_eq!(spans[1].style.fg, Some(Color::Red));
+        assert_eq!(spans[3].style.fg, Some(Color::Red));
+        assert_eq!(
+            spans[0].style.fg, None,
+            "the uncoloured run keeps the line style"
+        );
+
+        let route = coloured("    Moh 2J route 0.4  own 0.5", Style::new().dark_gray());
+        let values: Vec<Option<Color>> = route.iter().map(|s| s.style.fg).collect();
+        assert_eq!(
+            values,
+            vec![
+                Some(Color::DarkGray),
+                Some(Color::Red),
+                Some(Color::DarkGray),
+                Some(Color::Yellow),
+            ]
+        );
+        assert_eq!(
+            route.iter().map(|s| s.content.as_ref()).collect::<String>(),
+            "    Moh 2J route 0.4  own 0.5",
+            "colouring must not lose a character"
+        );
+    }
+
+    #[test]
+    fn a_negative_band_is_read_as_a_band() {
+        let spans = coloured("  9-ERCP (30001484)  route -0.1/100%", Style::new());
+        assert_eq!(spans[1].content, "-0.1");
+        assert_eq!(spans[1].style.fg, Some(Color::LightMagenta));
+        // Hops and percents are not bands, and neither is a whole number written without a decimal.
+        let plain = coloured("  0J/100% 1J/50% x 10 stations", Style::new());
+        assert_eq!(plain.len(), 1, "nothing in {plain:?} should split");
+    }
+
+    #[test]
+    fn the_details_pane_says_why_no_systems_are_listed() {
+        // Empty static data has no division table, so nothing can be put in scope; the pane states
+        // that rather than printing corporation names with nothing under them.
+        let app = results_app(one_priced_offer(), 10);
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("Corporations"), "the section is there");
+        assert!(
+            text.contains("the static data names no Security division"),
+            "and says why it is empty: {text}"
+        );
     }
 
     #[test]

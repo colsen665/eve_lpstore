@@ -300,17 +300,17 @@ What the data supports, after one assumed gap closed and one question opened:
       A run filtered to Distribution gets "Distribution agents are outside this model: security
       missions only", with the name cut to fit the pane because the longest division name in the
       archive is 28 characters.
-- [ ] Colour the security bands in the mission destination views. As asked: `..0.0` purple,
-      `0.1..0.4` red, `0.5` yellow, `0.6..0.8` green, `0.9..1.0` cyan. Where it applies, in order: the
-      band tokens on a system's summary line in the `m` pane, and the same tokens in the details-pane
-      lines below. Open details to settle with the change: whether the hop tokens (`0J/50%`) stay
-      uncoloured, since the request names bands only; and whether purple for nullsec collides with the
-      offers table, which already uses magenta for an inverted spread — ratatui has both, so keeping
-      them distinct is possible but should be a decision rather than an accident. The rule covers the
-      negative bands the `--security` syntax already accepts, and measured rows that need it today:
-      Annancale at true security 0.0941 is band 0.1 and so red, 9-ERCP at `-0.1/100%` is purple.
-- [ ] Show each agent system's destination summary in the details pane, under its corporation, in the
-      indented form asked for:
+- [x] The bands are coloured. Ratatui's palette is ANSI and has **no `Purple`**, only `Magenta` and
+      `LightMagenta`, so the asked-for purple is `LightMagenta` — the shade that reads as purple on the
+      usual terminal themes — and not `Magenta`, which the offers table already spends on an inverted
+      spread. The buckets are as given: 0 and below `LightMagenta`, 1 to 4 `Red`, 5 `Yellow`, 6 to 8
+      `Green`, 9 and 10 `Cyan`, tested at every boundary including `-1` and `10`.
+- [x] Colouring reads the printed band label rather than converting a security again, which is what
+      keeps a system's own true security plain while the groups beside it are coloured: `(0.18)` is two
+      decimals and stays in the line's style, `0.4/83%`, `route 0.4` and `own 0.5` are coloured, and
+      `0J/50%` is not a band so it is left alone — the request named bands only, so the hop tokens are
+      uncoloured by that reading rather than by oversight. A test asserts colouring loses no character.
+The requested shape, kept as the spec the tests are written against:
 
       ```
       Corporations:
@@ -321,24 +321,34 @@ What the data supports, after one assumed gap closed and one question opened:
         Annancale (0.09) 0.1/50%, 0.2/50%  0J/50%, 1J/50%
       ```
 
-      The corporation keeps its own line, then one line per agent system: name, its true security to
-      two decimals, the band groups, then the hop groups. Measured against the cache: all three system
-      names and both corporation ids are real, and the securities in the example match the archive to
-      the printed two decimals (Babirmoult 0.1788, Annancale 0.0941), so only the probabilities are
-      invented. Two things this shape implies and are not yet decided: the corp line today prints its
-      systems inline (`Name (id): Turba (0.40), Jitura (0.31)`), so this replaces that list rather than
-      adding to it, which also changes what `corp_line` means for the CLI report that shares it; and a
-      corporation can hold many security systems — measured 1 to 53 distinct Security agent systems per
-      corporation over the 158 corporations that have any, so the longest case is 53 indented lines
-      before wrapping, at a pane that shares its column with the offer breakdown and scrolls. Cap,
-      scroll or print them all is an open question.
-- [ ] This request extends where the destinations appear. The decision recorded above was "a pane of
-      its own, opened by `m`", and the file nowhere weighed the details pane and rejected it, so this
-      is an addition to that decision rather than a reversal of it. What remains to decide is whether
-      the `m` pane survives once the details pane carries the same summary strings: the pane holds the
-      per-destination lines and the two model notes, and the summary form drops all of that, so the two
-      views would say different things about the same systems. The notes in particular are the only
-      place the model labels itself, and the details-pane form as written has no room for them.
+      Measured against the cache before building it: all three system names and both corporation ids
+      are real, and the securities match the archive to the printed two decimals (Babirmoult 0.1788,
+      Annancale 0.0941), so only the probabilities were invented. Both corporations have Security
+      agents, so the scope applied today keeps them in: 29 agents in 16 systems and 26 in 14. Across
+      the 158 corporations with any Security agent the systems per corporation run 1 to 53, median 11,
+      and 81 of them have more than the 10 that `corp_line` used to cut at — which is why the pane
+      lists them without a cap and scrolls instead, the decision the cap question below replaces.
+      A summary line measured 65 characters at the median and 126 at the longest, against the 78
+      columns a border leaves at the minimum width, so both panes wrap rather than clip; the indent is
+      kept on every wrapped row, because a continuation at column 0 reads as a new system.
+
+- [x] Both views stay. The decision recorded above was "a pane of its own, opened by `m`", and this
+      request adds the details pane beside it rather than reversing that decision. Chosen with the cost
+      named: the same numbers now appear in two places, and the two say different things — the `m` pane
+      carries the per-destination lines and the two model notes, the details pane carries neither. So
+      the details summary is unlabelled, and the only place the tool states that this is a model is
+      behind `m`. Worth revisiting if a user ever reads the details lines as measured fact.
+- [x] Two bugs the real render caught, neither visible from the tests that existed. The destinations
+      pane had inherited the log's bottom-first window while being given the details pane's key
+      directions, so it **opened showing the tail of the list and Up moved down the table**; the window
+      is now `pane_window`, which starts at the top and is bounded by the rows on screen, tested at
+      scroll 0, past the end, and with a list shorter than the pane. And wrapping dropped the leading
+      indent, so a summary's second row began at column 0 — exactly where a new system starts.
+      `wrap_text` now takes the indent off, wraps into what is left of the width, and puts it back on
+      every row. Observed on the rendered summary rows, which sat flush left at column 0 before the
+      fix. The offer breakdown's item lines go through the same helper and so had the same defect —
+      inference from the shared function, not something rendered and seen. A clipped-but-aligned line was the alternative, and the pane's own
+      minimum width makes the degenerate case unreachable, guarded so it stays that way.
 - [ ] What should the pane say for an agent system in a gateless pocket, where the gate-only model
       counts one system out of a constellation of several? The options are to name the unreachable
       members on the row, to leave such systems out of the pane altogether, or to widen the graph to
@@ -464,7 +474,10 @@ Deferred to a later phase:
       with `m` in a real terminal.
 - [x] The pane's *numbers* are now checked against the version 3 data on disk, through a temporary test
       that read the real cache and printed the rows — no download was needed, the archive was already
-      fetched. Bayuka's spread from the live map is `bands [(4, 1.0)]`, `own_bands [(4, 5/6), (5, 1/6)]`
+      fetched. That harness later rendered **both** panes as grids at 80x24 and 120x40 from the real
+      cache, which is how the two bugs below were found; it was deleted afterwards, so the numbers and
+      the shapes they produced are recorded here instead of in a test that cannot run on another
+      machine. Still nobody has opened `m` in a real terminal. Bayuka's spread from the live map is `bands [(4, 1.0)]`, `own_bands [(4, 5/6), (5, 1/6)]`
       and `hops [(0, 1/6), (1, 3/6), (2, 2/6)]`, exactly the fixture, with `Moh (2, 4, 5)` the one
       destination whose own band differs from its route band. The test was deleted afterwards and the
       numbers recorded here instead.
