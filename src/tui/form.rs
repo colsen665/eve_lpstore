@@ -19,14 +19,17 @@ pub enum FormField {
 }
 
 impl FormField {
+    /// The fields in the order the dialog shows them and Tab moves through them. Grouped: which
+    /// corporations and agents, then where the prices are read from, then how the results are
+    /// shown. `Expire` stays last so the space toggle is always the final stop.
     pub const ALL: [FormField; 10] = [
         FormField::Corporations,
-        FormField::Region,
         FormField::Security,
         FormField::AgentLevel,
         FormField::Division,
         FormField::Type,
         FormField::Faction,
+        FormField::Region,
         FormField::System,
         FormField::Depth,
         FormField::Expire,
@@ -35,13 +38,16 @@ impl FormField {
     pub fn label(self) -> &'static str {
         match self {
             FormField::Corporations => "Corporations",
-            FormField::Region => "Region",
             FormField::Security => "Security",
             FormField::AgentLevel => "Agent level",
             FormField::Division => "Division",
             FormField::Type => "Agent type",
             FormField::Faction => "Faction",
-            FormField::System => "System",
+            // Named for what they filter, since a bare "Region" next to agent filters reads like
+            // another corporation attribute. Only the first word is capitalised, as in "Agent level"
+            // and "Expire cache". The command line keeps --region and --system.
+            FormField::Region => "Market region",
+            FormField::System => "Market system",
             FormField::Depth => "Depth",
             FormField::Expire => "Expire cache",
         }
@@ -311,7 +317,8 @@ mod tests {
     #[test]
     fn typing_and_backspace_edit_the_focused_field() {
         let mut form = form();
-        form.next_field();
+        // Focused by name rather than by stepping, so this does not move when the fields are regrouped.
+        form.focus = FormField::Region;
         form.type_char('T');
         form.type_char('h');
         form.backspace();
@@ -462,10 +469,40 @@ mod tests {
         assert_eq!(form.name_query(), Some("Am"));
         form.corporations = "Caldari Navy,".to_string();
         assert_eq!(form.name_query(), None);
-        form.next_field();
+        form.focus = FormField::Region;
         form.region = "The Fo".to_string();
         assert_eq!(form.name_query(), Some("The Fo"));
-        form.next_field();
+        form.focus = FormField::System;
+        form.system = "Jita".to_string();
+        assert_eq!(form.name_query(), Some("Jita"));
+        form.focus = FormField::Security;
         assert_eq!(form.name_query(), None);
+    }
+
+    #[test]
+    fn the_market_fields_are_labelled_and_grouped_together() {
+        assert_eq!(FormField::Region.label(), "Market region");
+        assert_eq!(FormField::System.label(), "Market system");
+        // Both names fit the dialog's label column, so grouping costs no layout change.
+        let column = crate::tui::ui::LABEL_WIDTH;
+        for field in FormField::ALL {
+            assert!(
+                field.label().chars().count() <= column,
+                "{:?} does not fit {} columns",
+                field,
+                column
+            );
+        }
+        let position = |wanted| {
+            FormField::ALL
+                .iter()
+                .position(|field| *field == wanted)
+                .unwrap()
+        };
+        // The two that choose where prices come from sit side by side, after the corporation and
+        // agent filters and before how the results are shown.
+        assert_eq!(position(FormField::Region) + 1, position(FormField::System));
+        assert!(position(FormField::Faction) < position(FormField::Region));
+        assert!(position(FormField::Region) < position(FormField::Depth));
     }
 }

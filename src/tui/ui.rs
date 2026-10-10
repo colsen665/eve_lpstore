@@ -21,7 +21,9 @@ use std::collections::VecDeque;
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 20;
 
-const LABEL_WIDTH: usize = 14;
+/// The width of the form's label column. `pub(crate)` so a test can check that a field's name fits
+/// it, which is what lets the market fields be grouped without a layout change.
+pub(crate) const LABEL_WIDTH: usize = 14;
 const VALUE_WIDTH: usize = 26;
 
 const DONATION_ADDRESS: &str = "bc1qyc55ddky2ehdnty2c48nvxxugjw2xdpxk956x7";
@@ -377,7 +379,9 @@ fn form_row(app: &App, field: FormField, sdata: &StaticData, width: usize) -> Li
     let detail_width = width.saturating_sub(LABEL_WIDTH + VALUE_WIDTH + 2);
     let (detail, style) = match app.form.error_for(field) {
         Some(error) => (error, Style::new().red()),
-        None => (hint(field, sdata), Style::new().dark_gray()),
+        // Only the first line belongs in the row, which is one line tall. The rest is shown under
+        // the focused field, where there is room for it.
+        None => (hint_line(field, sdata), Style::new().dark_gray()),
     };
     Line::from(vec![
         Span::styled(
@@ -391,10 +395,23 @@ fn form_row(app: &App, field: FormField, sdata: &StaticData, width: usize) -> Li
 }
 
 /// The valid values of a field, shown beside it when it has no error.
+/// The first line of [`hint`], for the row's detail column, which is one line tall.
+fn hint_line(field: FormField, sdata: &StaticData) -> String {
+    hint(field, sdata)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn hint(field: FormField, sdata: &StaticData) -> String {
     match field {
         FormField::Corporations => "IDs or names, comma-separated. Blank for all.".to_string(),
-        FormField::Region => "ID or name. Blank for The Forge.".to_string(),
+        // Two lines: what the field picks, then how to write it. Kept to what fits the hint column at
+        // the minimum terminal width, so the second line is not wrapped away.
+        FormField::Region => {
+            "Prices come from its market orders.\nID or name. Blank for The Forge.".to_string()
+        }
         FormField::Security => {
             "+0.5 at least, -0.5 at most, =0.5 exactly. Blank for any.".to_string()
         }
@@ -411,7 +428,9 @@ fn hint(field: FormField, sdata: &StaticData) -> String {
             "One of: {}. Blank for any.",
             sdata.faction_names().join(", ")
         ),
-        FormField::System => "Name or ID. Blank for all systems.".to_string(),
+        FormField::System => {
+            "Prices use its NPC stations.\nName or ID. Blank for all systems.".to_string()
+        }
         FormField::Depth => "Offers per group, 1 or more. Blank for 10.".to_string(),
         FormField::Expire => {
             "Space toggles. Ignore cached responses and call the API again.".to_string()
@@ -752,6 +771,13 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) ->
 /// Splits `text` into rows of at most `width` characters, breaking at spaces where it can. A
 /// word longer than a row is cut into pieces.
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    // A break in the source text starts a row of its own, so a hint can ask for two lines instead
+    // of leaving that to the width. Each of those lines then wraps as usual.
+    if let Some((first, rest)) = text.split_once('\n') {
+        let mut rows = wrap_text(first, width);
+        rows.extend(wrap_text(rest, width));
+        return rows;
+    }
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -1056,6 +1082,16 @@ mod tests {
         let cut = wrap("abcdefghij", 4, Style::new());
         assert_eq!(texts(&cut), ["abcd", "efgh", "ij"]);
         assert_eq!(texts(&wrap("", 10, Style::new())), [""]);
+    }
+
+    #[test]
+    fn a_line_break_in_the_source_starts_its_own_row() {
+        // The market fields ask for two lines instead of leaving the split to the width.
+        assert_eq!(wrap_text("one\ntwo", 20), ["one", "two"]);
+        assert_eq!(wrap_text("one\ntwo", 3), ["one", "two"]);
+        assert_eq!(wrap_text("a b\nc d", 3), ["a b", "c d"]);
+        // A blank line stays a row of its own rather than vanishing.
+        assert_eq!(wrap_text("a\n\nb", 10), ["a", "", "b"]);
     }
 
     #[test]
@@ -1491,6 +1527,103 @@ mod tests {
         assert!(
             text.contains("The Forge"),
             "the form still shows what it fell back to"
+        );
+    }
+
+    #[test]
+    fn the_market_hints_split_between_the_row_and_the_note_below() {
+        // The row's detail column is one line tall, so an inline hint must show only its purpose.
+        // Before this split the two lines collided into one mangled row reading
+        // "Prices use its NPC stations.Name or ID…".
+        for (focus, purpose) in [
+            (FormField::Region, "Prices come from its market orders."),
+            (FormField::System, "Prices use its NPC stations."),
+        ] {
+            let mut app = App::new(LpStoreOptions::default());
+            let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+            form.focus = focus;
+            app.show_filters(form);
+            let text = view_text(&app, 120, 40);
+            assert!(text.contains(purpose), "the row shows its purpose");
+            assert!(
+                !text.contains(&format!("{purpose}Name")),
+                "the row glued two lines together: {focus:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_focused_market_field_shows_both_hint_lines_when_there_is_room() {
+        let mut app = App::new(LpStoreOptions::default());
+        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        form.focus = FormField::System;
+        app.show_filters(form);
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("Name or ID. Blank for all systems."),
+            "the syntax line shows under the focused field"
+        );
+    }
+
+    #[test]
+    fn the_inline_hint_is_one_line_even_when_the_note_is_two() {
+        assert_eq!(
+            hint_line(FormField::Region, &StaticData::default()),
+            "Prices come from its market orders."
+        );
+        assert_eq!(
+            hint_line(FormField::System, &StaticData::default()),
+            "Prices use its NPC stations."
+        );
+        // The market fields are the ones this change worded, and both fit the detail column at the
+        // minimum terminal width so their purpose is never cut. Other hints are longer and already
+        // truncate there, which is existing behaviour this test does not cover.
+        let detail = usize::from(MIN_WIDTH - 2) - (LABEL_WIDTH + VALUE_WIDTH + 2);
+        for field in [FormField::Region, FormField::System] {
+            let line = hint_line(field, &StaticData::default());
+            assert!(
+                line.chars().count() <= detail,
+                "{field:?} needs {} of {} columns: {:?}",
+                line.chars().count(),
+                detail,
+                line
+            );
+        }
+        // No inline hint may carry a break, whatever its length.
+        for field in FormField::ALL {
+            assert!(
+                !hint_line(field, &StaticData::default()).contains('\n'),
+                "{field:?} kept the break in the row"
+            );
+        }
+    }
+
+    #[test]
+    fn the_grouped_dialog_renders_at_the_minimum_terminal_size() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.show_filters(FilterForm::from_options_with_defaults(
+            &app.applied,
+            "The Forge",
+            10,
+        ));
+        let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+        for label in [
+            "Corporations",
+            "Security",
+            "Agent level",
+            "Division",
+            "Agent type",
+            "Faction",
+            "Market region",
+            "Market system",
+            "Depth",
+            "Expire cache",
+        ] {
+            assert!(text.contains(label), "{label:?} did not render");
+        }
+        assert!(
+            !text.contains("stations.Name"),
+            "a two-line hint was glued into one row"
         );
     }
 

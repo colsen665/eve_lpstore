@@ -107,6 +107,29 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] Tests: 25 added, covering the round trip, a missing file, five kinds of damaged file, the fields that are never written, per-field precedence, the command-line-only settings surviving a merge, blank handling on both sides, the reset by clearing, a file with a missing field and one with an extra field, `set_note` and its replacement by a validation failure, the note rendering on the startup form, and a remembered run being written and read back.
 - [x] One behaviour that is not a bug: a file containing `[]` loads as every field absent rather than being rejected, because serde's derived deserializer accepts the sequence form. That is the same run the file being absent would give, so there is nothing to report.
 
+#### Phase 7.2: Name the market fields for what they filter
+
+The two fields that choose where prices come from were called `Region` and `System`, sitting apart
+from each other and reading like more corporation attributes. This is the dialog only: `--region`
+and `--system` keep their names, `filters.json` keeps its keys, and the export keeps its columns.
+
+- [x] Labels are `Market region` and `Market system`, first word capitalised only, matching `Agent level`, `Agent type`, and `Expire cache`. Both are 13 characters, inside the 14-column label width, so grouping cost no layout change.
+- [x] The form is ordered in three groups: which corporations and agents, then the two market fields side by side, then how results are shown. `Expire` stays last so the space toggle is always the final stop, and Tab follows the same order because it walks `ALL`.
+- [x] Each hint is split between the row and the note under it. A row is one line tall, so `hint_line` shows just the purpose there; the focused field's note below carries purpose then syntax, which is what the two spare rows at 80x20 are for. `wrap_text` now honours a line break in the source, so a hint can ask for two lines instead of leaving the split to the width.
+- [x] The purpose wording is the point of the change, and a mismatch is worth preventing: `station_ids_in_system` returns the stations of whatever system was typed, `in_locations` then filters the priced region's orders against them, and a system from another region leaves every lookup failing with 404 `no sell orders found … in region`.
+- [x] Two tests that walked to a field by `next_field` now name it through `focus` instead, so they do not move when the fields are regrouped. The two that still step, `space_toggles_the_expire_option` and `focus_wraps_around_the_fields`, assert on `Expire` and `Corporations`, which stay last and first, so they are unaffected.
+- [x] Tests: 6 added. The labels and their width, adjacency and group order, wrapping on a source break, the inline hint being one line and inside the detail column, all ten labels rendering at the minimum terminal size, and both hint lines showing under a focused market field at 120x40.
+- [ ] Check the focus-dependent note in a real terminal. The first attempt proved nothing: the keys did not move focus, so what looked like the syntax line was the always-visible inline hint of some other row. The `TestBackend` tests set `focus` directly and pass, so the behaviour is covered; only the live check is outstanding.
+
+##### Remembering and validating the pair
+
+- [ ] On apply, clear `Market system` when `Market region` changed. Compare resolved region ids rather than typed text, so `Domain` and `10000043` are the same region. Clearing has to happen before `resolve`, or the run keeps using the old system's stations, and the log has to say the field was cleared rather than dropping what the user typed in silence.
+- [ ] Leave `Market system` alone when the region did not change.
+- [ ] Add the system to region mapping to the static data. `AgentCache.systems` is `(id, name, security)` and `stations` is `(station, system)`, so nothing today reaches a region. Confirm the SDE file name and the field inside it first: extraction matches names loosely, `contains("region")` and `contains("corporation")`, so a fifth file needs a check that it picked up the right one.
+- [ ] Count the new file in `is_cached`, so an existing install reads as uncached and the Phase 7 dialog asks before re-downloading instead of failing on a mapping that is not there.
+- [ ] Validate a typed `Market system` against the resolved `Market region`, and report a mismatch through `set_errors` on that field, which shows it inline and stops the run.
+- [ ] Keep the rule to the dialog. `--region` and `--system` together on the command line behave as they do today, mismatch included.
+
 #### Phase 8: Cache and data in platform directories
 
 Store the ESI response cache and the static data in the platform's standard locations instead of `cache/` and `data/` in the working directory. Both are relative today, so running the binary from anywhere else silently re-downloads the static data and re-fetches every ESI response.
