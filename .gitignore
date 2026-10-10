@@ -1,4 +1,6 @@
 /target
+# Leftovers from the working-directory layout. Nothing writes these any more, since the cache and
+# the static data moved to the platform directories, but an old checkout may still hold them and
+# they should never be committed.
 /data
 /cache
-/filters.json

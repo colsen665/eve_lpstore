@@ -132,14 +132,9 @@ pub fn draw(
     layout
 }
 
-/// Where the static data files live, taken from one of them rather than written out again, so this
-/// keeps saying the right thing when their location changes.
-fn static_data_dir() -> String {
-    StaticData::regions_cache_path()
-        .parent()
-        .map(|dir| dir.display().to_string())
-        .unwrap_or_else(|| "the data directory".to_string())
-}
+/// Where the static data files live, for the dialog's text. A placeholder until the view is given
+/// the real root, so the string is never empty and never wrong about a directory it has not seen.
+pub(crate) const UNKNOWN_DATA_DIR: &str = "the data directory";
 
 /// The static data dialog, shown when the files are not on disk, or are and cannot be read.
 /// Downloading fetches the whole EVE Online archive, so the view asks before spending the time on
@@ -159,7 +154,7 @@ fn draw_static_data(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(truncate(reason, inner)).red());
     }
     lines.push(Line::from(
-        truncate(&format!("It is stored in {}.", static_data_dir()), inner).dark_gray(),
+        truncate(&format!("It is stored in {}.", app.data_dir), inner).dark_gray(),
     ));
     let keys = if app.downloading {
         "Ctrl+C quits"
@@ -1432,8 +1427,8 @@ mod tests {
             text
         );
         assert!(
-            text.contains("stored in data"),
-            "it says where the files would go"
+            text.contains("It is stored in the data directory."),
+            "it names a place even before the real root is known"
         );
         assert!(
             text.contains("Enter or d download"),
@@ -1442,6 +1437,20 @@ mod tests {
         assert!(
             !text.contains("f filters"),
             "the view keys are hidden while it is open"
+        );
+    }
+
+    #[test]
+    fn the_static_data_dialog_names_the_root_the_view_was_given() {
+        // The whole point of the platform roots is that they are not `data/` any more, so the
+        // dialog has to repeat what it was told rather than a guessed relative name.
+        let mut app = App::new(LpStoreOptions::default());
+        app.set_data_dir("/home/user/.local/share/eve_lpstore");
+        app.open_static_data(None);
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("It is stored in /home/user/.local/share/eve_lpstore."),
+            "the given root is not shown"
         );
     }
 

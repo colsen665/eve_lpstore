@@ -3,7 +3,8 @@
 //! The view starts from what the command line asked for and the defaults behind it. That is the
 //! right answer for a script and the wrong one for an interactive session, where the same handful
 //! of corporations or the same region is usually wanted again. So a successful apply in the view
-//! writes the filters it used to `filters.json`, and the next session reads them back before it
+//! writes the filters it used to a file in the platform config directory, and the next session
+//! reads them back before it
 //! shows the filters dialog.
 //!
 //! Only the nine fields the form carries are kept. `--expire` is a one-shot cache bypass, and
@@ -17,10 +18,9 @@ use std::path::{Path, PathBuf};
 
 const FILE_NAME: &str = "filters.json";
 
-/// Where the remembered filters are kept. Relative to the working directory, which Phase 8 replaces
-/// with the platform's config location.
-pub fn path() -> PathBuf {
-    PathBuf::from(FILE_NAME)
+/// Where the remembered filters live, inside the platform config directory.
+pub fn path(config: &Path) -> PathBuf {
+    config.join(FILE_NAME)
 }
 
 /// The filters a run was applied with, as they are written to disk.
@@ -123,9 +123,9 @@ impl Loaded {
     }
 }
 
-/// Read the remembered filters from [`path`](path).
-pub fn load() -> Loaded {
-    load_from(&path())
+/// Read the remembered filters from [`path`](path) inside `config`.
+pub fn load(config: &Path) -> Loaded {
+    load_from(&path(config))
 }
 
 /// Read the remembered filters from `file`. Never fails: a missing file is [`Loaded::Absent`], and
@@ -144,9 +144,9 @@ pub fn load_from(file: &Path) -> Loaded {
     }
 }
 
-/// Write the nine persisted fields of `options` to [`path`](path).
-pub fn save(options: &LpStoreOptions) -> io::Result<()> {
-    save_to(&path(), options)
+/// Write the remembered filters of `options` to [`path`](path) inside `config`.
+pub fn save(options: &LpStoreOptions, config: &Path) -> io::Result<()> {
+    save_to(&path(config), options)
 }
 
 /// Write the nine persisted fields of `options` to `file`, as JSON that is readable and editable by
@@ -154,6 +154,11 @@ pub fn save(options: &LpStoreOptions) -> io::Result<()> {
 pub fn save_to(file: &Path, options: &LpStoreOptions) -> io::Result<()> {
     let text = serde_json::to_string_pretty(&SavedFilters::from(options))
         .expect("the saved filters always serialize");
+    // The config directory is not created by anything else, and the first apply happens before
+    // any other file has been written there.
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(file, text)
 }
 
@@ -371,7 +376,12 @@ mod tests {
     }
 
     #[test]
-    fn the_path_is_the_top_level_file_phase_8_relocates() {
-        assert_eq!(path(), PathBuf::from("filters.json"));
+    fn the_file_sits_in_the_directory_it_is_given() {
+        // It used to be top-level `filters.json`, which a future move of the roots would strand.
+        let config = Path::new("/home/user/.config/eve_lpstore");
+        assert_eq!(
+            path(config),
+            PathBuf::from("/home/user/.config/eve_lpstore/filters.json")
+        );
     }
 }

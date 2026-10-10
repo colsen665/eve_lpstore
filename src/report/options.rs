@@ -63,7 +63,7 @@ pub struct LpStoreOptions {
     pub lpstore: Option<String>,
     /// Market region as an ID or name. Defaults to The Forge.
     pub region: Option<String>,
-    /// Security filter such as `+0.5`.
+    /// Security range such as `0.5..0.7`. See `SecurityFilter::parse`.
     pub security: Option<String>,
     /// Agent level from 1 to 5.
     pub agent_level: Option<String>,
@@ -76,6 +76,9 @@ pub struct LpStoreOptions {
     pub concurrency: Option<String>,
     pub max_inflight: Option<String>,
     pub depth: Option<String>,
+    /// Where to keep ESI responses instead of the platform cache directory. The static data does
+    /// not move with it: this names a cache.
+    pub cache_dir: Option<String>,
     /// Ignore cached responses and call ESI again.
     pub expire: bool,
     pub verbose: bool,
@@ -346,9 +349,14 @@ impl LpStoreOptions {
 impl Resolved {
     /// Builds the ESI client for this run. Verbose log lines go to `events` as
     /// `Event::Log`, tagged with `run_id`.
-    pub fn client(&self, run_id: u64, events: UnboundedSender<RunEvent>) -> EsiClient {
+    pub fn client(
+        &self,
+        cache_dir: &std::path::Path,
+        run_id: u64,
+        events: UnboundedSender<RunEvent>,
+    ) -> EsiClient {
         EsiClient::builder()
-            .cache_dir("cache")
+            .cache_dir(cache_dir.to_path_buf())
             .expire(self.expire)
             .verbose(self.verbose)
             .cache_expiry_offset(self.cache_offset)

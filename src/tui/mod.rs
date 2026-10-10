@@ -12,6 +12,7 @@ use crossterm::event::{self, Event as TermEvent};
 use eve_lpstore::StaticData;
 use eve_lpstore::esi::EsiClient;
 use eve_lpstore::export;
+use eve_lpstore::paths::Paths;
 use eve_lpstore::report::{self, LpStoreOptions, Report, Resolved, RunEvent};
 use eve_lpstore::saved_filters;
 use ratatui::DefaultTerminal;
@@ -46,6 +47,7 @@ struct Download {
 struct Session {
     handle: Handle,
     sdata: Arc<StaticData>,
+    paths: Paths,
     events: UnboundedSender<RunEvent>,
     next_id: u64,
     current: Option<Run>,
@@ -68,10 +70,11 @@ impl Session {
 fn spawn_run(
     handle: &Handle,
     events: &UnboundedSender<RunEvent>,
+    cache: &Path,
     resolved: Resolved,
     id: u64,
 ) -> Run {
-    let client = Arc::new(resolved.client(id, events.clone()));
+    let client = Arc::new(resolved.client(cache, id, events.clone()));
     let (done_tx, done_rx) = oneshot::channel();
     let task_client = client.clone();
     let task_events = events.clone();
@@ -92,8 +95,9 @@ fn spawn_run(
 /// `spawn_blocking`.
 fn spawn_download(session: &mut Session) {
     let (done_tx, done_rx) = oneshot::channel();
+    let data = session.paths.data.clone();
     let task = session.handle.spawn(async move {
-        let result = StaticData::load(true)
+        let result = StaticData::load(true, &data)
             .await
             .map_err(|error| error.to_string());
         let _ = done_tx.send(result);
@@ -150,13 +154,13 @@ fn opening(cached: bool, loaded: Option<Result<StaticData, String>>) -> Opening 
 
 /// Runs the view until the user quits. Static data is loaded here when it is on disk, and asked
 /// for in the view when it is not, so a first run does not silently fetch the whole archive.
-pub async fn run(cli: LpStoreOptions) -> io::Result<()> {
+pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
     let handle = Handle::current();
     // The filters the last applied run used fill in whatever the command line left alone, so the
     // dialog opens on something the user recognises instead of on the defaults every time. A field
     // the command line did set keeps its own value, which is what makes the flags still work.
-    let remembered = saved_filters::load();
+    let remembered = saved_filters::load(&paths.config);
     // One message, shown on the form and kept in the log, that names the consequence as well as the
     // cause: the saved filters were not used.
     let ignored = remembered
@@ -171,10 +175,15 @@ pub async fn run(cli: LpStoreOptions) -> io::Result<()> {
         });
     }
 
+    // The roots are absolute now and shared between runs, so the view says where it writes. The log
+    // is the only place a TUI user can read this, since stdout becomes the screen.
+    app.set_data_dir(paths.data.display().to_string());
+    log_roots(&mut app, &paths);
+
     // Loading is only attempted when the files are there, so the question comes before the wait.
-    let cached = StaticData::is_cached();
+    let cached = StaticData::is_cached(&paths.data);
     let loaded = if cached {
-        let data = StaticData::load(false)
+        let data = StaticData::load(false, &paths.data)
             .await
             .map_err(|error| error.to_string());
         Some(data)
@@ -204,6 +213,7 @@ pub async fn run(cli: LpStoreOptions) -> io::Result<()> {
         next_id: 0,
         current: None,
         download: None,
+        paths,
     };
     let ui = tokio::task::spawn_blocking(move || {
         let result =
@@ -305,6 +315,18 @@ fn ui_loop(
     }
 }
 
+/// Says where the two roots are, as the first log lines of the session. The view cannot print these
+/// to stdout, because that becomes the screen, and the log panel cannot be opened over the startup
+/// dialog, so they are the first thing readable once a run is applied.
+fn log_roots(app: &mut App, paths: &Paths) {
+    for (label, root) in [("Cache", &paths.cache), ("Static data", &paths.data)] {
+        app.push_log(LogLine {
+            text: format!("{label}: {}", root.display()),
+            is_error: false,
+        });
+    }
+}
+
 /// Checks every field of the form. If they are all valid, a change to the depth only
 /// re-renders, and any other change replaces the current run with one using the new filters.
 /// Otherwise the errors are shown beside their fields and nothing runs.
@@ -323,7 +345,13 @@ fn apply(app: &mut App, session: &mut Session) {
         let info = run_info(&resolved, filter_summary(&options));
         let id = session.next_id;
         session.next_id += 1;
-        let next = spawn_run(&session.handle, &session.events, resolved, id);
+        let next = spawn_run(
+            &session.handle,
+            &session.events,
+            &session.paths.cache,
+            resolved,
+            id,
+        );
         if let Some(previous) = session.current.replace(next) {
             previous.pipeline.abort();
         }
@@ -331,7 +359,7 @@ fn apply(app: &mut App, session: &mut Session) {
     }
     app.set_applied(options);
     app.close_form();
-    remember(app, &saved_filters::path());
+    remember(app, &saved_filters::path(&session.paths.config));
 }
 
 /// Keeps the filters this run was applied with, so the next session's dialog starts from them. Both
@@ -554,6 +582,31 @@ mod tests {
             filter_summary(&options),
             "--security 0.5..0.7 --faction caldari"
         );
+    }
+
+    #[test]
+    fn the_session_opens_by_saying_where_its_files_live() {
+        let mut app = App::new(LpStoreOptions::default());
+        let paths = Paths {
+            cache: PathBuf::from("/home/user/.cache/eve_lpstore"),
+            data: PathBuf::from("/home/user/.local/share/eve_lpstore"),
+            config: PathBuf::from("/home/user/.config/eve_lpstore"),
+        };
+        log_roots(&mut app, &paths);
+        app.set_data_dir(paths.data.display().to_string());
+        let lines: Vec<&str> = app.log.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "Cache: /home/user/.cache/eve_lpstore",
+                "Static data: /home/user/.local/share/eve_lpstore",
+            ]
+        );
+        assert!(
+            app.log.iter().all(|line| !line.is_error),
+            "neither root line is an error"
+        );
+        assert_eq!(app.data_dir, "/home/user/.local/share/eve_lpstore");
     }
 
     #[test]

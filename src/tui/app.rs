@@ -119,6 +119,9 @@ pub struct App {
     pub downloading: bool,
     /// Why the last static data download failed, shown in its dialog.
     pub download_error: Option<String>,
+    /// Where the static data files live, for the dialog's text. The view is given this after the
+    /// platform roots are found; until then it says only that there is a data directory.
+    pub data_dir: String,
 }
 
 impl App {
@@ -152,7 +155,13 @@ impl App {
             export_error: None,
             downloading: false,
             download_error: None,
+            data_dir: super::ui::UNKNOWN_DATA_DIR.to_string(),
         }
+    }
+
+    /// Tells the view where its files live, once the platform roots have been found.
+    pub fn set_data_dir(&mut self, data_dir: impl Into<String>) {
+        self.data_dir = data_dir.into();
     }
 
     /// Moves the stage forward for `event`, and keeps its line in the log if it has one.

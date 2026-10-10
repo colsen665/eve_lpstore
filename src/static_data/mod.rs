@@ -2,12 +2,16 @@ use crate::esi::error::EsiError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::Path;
 
 const SDE_ZIP_URL: &str =
     "https://developers.eveonline.com/static-data/eve-online-static-data-latest-jsonl.zip";
 
-const CACHE_DIR: &str = "data";
+/// Name of the archive the four files below are extracted from. Nothing writes it to disk today,
+/// since `download_and_cache` unzips it in memory, but `--clear-cache` looks for it in case that
+/// changes.
+pub const SDE_ARCHIVE_NAME: &str = "static-data.zip";
+
 const REGIONS_CACHE_FILE: &str = "regions.json";
 const CORPORATIONS_CACHE_FILE: &str = "corporations.json";
 const TYPES_CACHE_FILE: &str = "types.json";
@@ -345,30 +349,21 @@ impl StaticData {
     /// `load` downloads on its own when this is `false`, which is a several hundred megabyte fetch
     /// of the whole static data archive. Callers that want to ask before spending that, rather than
     /// finding out silently, check this first.
-    pub fn is_cached() -> bool {
-        Self::regions_cache_path().exists()
-            && Self::corporations_cache_path().exists()
-            && Self::types_cache_path().exists()
-            && Self::security_cache_path().exists()
+    pub fn is_cached(data: &Path) -> bool {
+        Self::files(data).iter().all(|path| path.exists())
     }
 
-    /// Load static data from local cache.
+    /// Load static data from the local cache under `data`.
     ///
-    /// If `force_download` is `true`, the cache is re-downloaded from the SDE
-    /// even if a local copy exists. If `false`, the local cache is used when
-    /// present; otherwise a download is triggered.
-    pub async fn load(force_download: bool) -> Result<Self, EsiError> {
-        let regions_path = Self::regions_cache_path();
-        let corporations_path = Self::corporations_cache_path();
-        let types_path = Self::types_cache_path();
-        let security_path = Self::security_cache_path();
-
-        if force_download || !Self::is_cached() {
-            Self::download_and_cache(&regions_path, &corporations_path, &types_path, &security_path)
-                .await?;
+    /// If `force_download` is `true`, the cache is re-downloaded from the SDE even if a local copy
+    /// exists. If `false`, the local cache is used when present; otherwise a download is
+    /// triggered.
+    pub async fn load(force_download: bool, data: &Path) -> Result<Self, EsiError> {
+        if force_download || !Self::is_cached(data) {
+            Self::download_and_cache(data).await?;
         }
-
-        Self::load_from_disk(&regions_path, &corporations_path, &types_path, &security_path)
+        let [regions, corporations, types, security] = Self::files(data);
+        Self::load_from_disk(&regions, &corporations, &types, &security)
     }
 
     /// Look up a region ID by name (case-insensitive).
@@ -415,24 +410,34 @@ impl StaticData {
         self.types.get(&type_id)
     }
 
-    /// Returns the path to the local regions cache file.
-    pub fn regions_cache_path() -> PathBuf {
-        PathBuf::from(CACHE_DIR).join(REGIONS_CACHE_FILE)
+    /// The file holding the region names, which is also how the data root is named in a message.
+    pub fn regions_path(data: &Path) -> std::path::PathBuf {
+        data.join(REGIONS_CACHE_FILE)
     }
 
-    /// Returns the path to the local corporations cache file.
-    pub fn corporations_cache_path() -> PathBuf {
-        PathBuf::from(CACHE_DIR).join(CORPORATIONS_CACHE_FILE)
+    /// The file holding the corporation names.
+    pub fn corporations_path(data: &Path) -> std::path::PathBuf {
+        data.join(CORPORATIONS_CACHE_FILE)
     }
 
-    /// Returns the path to the local types cache file.
-    pub fn types_cache_path() -> PathBuf {
-        PathBuf::from(CACHE_DIR).join(TYPES_CACHE_FILE)
+    /// The file holding the type names.
+    pub fn types_path(data: &Path) -> std::path::PathBuf {
+        data.join(TYPES_CACHE_FILE)
     }
 
-    /// Returns the path to the local hi-sec corporations cache file.
-    pub fn security_cache_path() -> PathBuf {
-        PathBuf::from(CACHE_DIR).join(SECURITY_CACHE_FILE)
+    /// The file holding the agent, faction, system, and station data.
+    pub fn security_path(data: &Path) -> std::path::PathBuf {
+        data.join(SECURITY_CACHE_FILE)
+    }
+
+    /// The four files [`load`](Self::load) reads, in the order it reads them.
+    pub fn files(data: &Path) -> [std::path::PathBuf; 4] {
+        [
+            Self::regions_path(data),
+            Self::corporations_path(data),
+            Self::types_path(data),
+            Self::security_path(data),
+        ]
     }
 
     /// Whether one agent of the corporation satisfies every condition in the filter.
@@ -541,15 +546,9 @@ impl StaticData {
     }
 
     /// Download the SDE ZIP, extract regions, corporations, and types, and write to cache files.
-    async fn download_and_cache(
-        regions_path: &std::path::Path,
-        corporations_path: &std::path::Path,
-        types_path: &std::path::Path,
-        security_path: &std::path::Path,
-    ) -> Result<(), EsiError> {
-        if let Some(parent) = regions_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(EsiError::Io)?;
-        }
+    async fn download_and_cache(data: &Path) -> Result<(), EsiError> {
+        let [regions_path, corporations_path, types_path, security_path] = Self::files(data);
+        tokio::fs::create_dir_all(data).await.map_err(EsiError::Io)?;
 
         let response = reqwest::get(SDE_ZIP_URL)
             .await

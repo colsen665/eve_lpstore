@@ -9,6 +9,7 @@ use error::{EsiError, SharedError};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OnceCell, Semaphore};
@@ -90,7 +91,7 @@ pub struct EsiConfig {
     pub token: Option<String>,
     pub user_agent: String,
     pub timeout: Duration,
-    pub cache_dir: Option<String>,
+    pub cache_dir: Option<PathBuf>,
     pub expire: bool,
     pub verbose: bool,
     pub cache_expiry_offset: Duration,
@@ -159,7 +160,9 @@ impl EsiClientBuilder {
         self
     }
 
-    pub fn cache_dir(mut self, dir: impl Into<String>) -> Self {
+    /// Where to write cached responses. A path rather than a string, because the platform locations
+    /// carry spaces and backslashes on Windows.
+    pub fn cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.cache_dir = Some(dir.into());
         self
     }
@@ -774,9 +777,7 @@ mod tests {
             std::fs::write(dir.join(name), format!("[{}]", page)).unwrap();
         }
 
-        let client = EsiClient::builder()
-            .cache_dir(dir.to_string_lossy().to_string())
-            .build();
+        let client = EsiClient::builder().cache_dir(dir.to_path_buf()).build();
         let url = url::Url::parse(
             "https://esi.evetech.net/markets/10000002/orders/?datasource=tranquility&language=en",
         )

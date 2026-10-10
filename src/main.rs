@@ -3,8 +3,9 @@ mod tui;
 
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::report::{self, LpStoreOptions, OptionError};
-use eve_lpstore::{EsiClient, StaticData};
+use eve_lpstore::{EsiClient, Paths, StaticData};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Arc;
 
 fn print_status(s: &ClientStats) {
@@ -38,11 +39,12 @@ Options:
   --status               Print API call status every second while running. With --tui, the footer shows it instead.
   --expire               Ignore cached responses and call the API again.
   --cache-minutes <n>    Extend how long cached responses are reused, by n minutes past their Expires time. Default 0 for --example, and the number of corporations for --lpstores. Use 0 to turn it off.
+  --cache-dir <path>     Where to keep ESI responses, instead of the platform cache directory. The static data does not move with it.
   --concurrency <n>      Corporation groups priced at once with --lpstores. Default 2x the tokio worker threads.
   --max-inflight <n>     Maximum ESI requests in flight at once across all groups. Default 4.
   --depth <n>            Offers printed per corporation group with --lpstores. Default 10.
   --verbose              Print cache hits, misses, and writes, with reasons and file names. With --tui, they go to the log.
-  --clear-cache          Delete the cache directory before running.
+  --clear-cache          Delete the cached ESI responses, and the static data archive if one is on disk. The four extracted static data files stay.
 
 Examples:
   eve_lpstore --example
@@ -120,6 +122,7 @@ async fn main() {
         "--faction",
         "--depth",
         "--system",
+        "--cache-dir",
     ];
 
     let mut i = 1;
@@ -170,16 +173,37 @@ async fn main() {
         concurrency: value("--concurrency"),
         max_inflight: value("--max-inflight"),
         depth: value("--depth"),
+        cache_dir: value("--cache-dir"),
         expire,
         verbose,
     };
+    // Every mode that runs needs both roots, including a bare --clear-cache, so the home directory
+    // is settled before any of them. Refusing here rather than falling back to the working
+    // directory keeps the relative-path behaviour this replaces from creeping back in.
+    let paths = match Paths::discover()
+        .map(|found| found.with_cache_override(options.cache_dir.as_deref()))
+    {
+        Some(paths) => paths,
+        None => {
+            eprintln!(
+                "No home directory is known to this system, so there is nowhere to keep the ESI \
+                 cache or the static data. Set HOME, or USERPROFILE on Windows, and run again."
+            );
+            std::process::exit(1);
+        }
+    };
+    if verbose {
+        println!("Cache: {}", paths.cache.display());
+        println!("Static data: {}", paths.data.display());
+        warn_ignored_local_dirs();
+    }
     if args.iter().any(|a| a == "--example") {
         let parsed = match options.parse() {
             Ok(parsed) => parsed,
             Err(errors) => exit_with_errors(errors),
         };
         if clear_cache {
-            clear_cache_dir();
+            clear_cached_files(&paths.cache, &paths.data);
         }
         let cache_offset = std::time::Duration::from_secs(parsed.cache_minutes.unwrap_or(0) * 60);
         if let Err(e) = run_example(
@@ -189,6 +213,7 @@ async fn main() {
             options.region.as_deref(),
             cache_offset,
             parsed.max_inflight,
+            &paths,
         )
         .await
         {
@@ -196,16 +221,16 @@ async fn main() {
             std::process::exit(1);
         }
     } else if tui || args.iter().any(|a| a == "--lpstores") {
-        run_lpstores(status, options, clear_cache, tui).await;
+        run_lpstores(status, options, clear_cache, tui, paths).await;
     } else {
         if let Err(errors) = options.parse() {
             exit_with_errors(errors);
         }
         if clear_cache {
-            clear_cache_dir();
+            clear_cached_files(&paths.cache, &paths.data);
         } else {
             println!(
-                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <level|range>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
+                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--cache-dir <path>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <level|range>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
                 args[0]
             );
         }
@@ -219,29 +244,87 @@ fn exit_with_errors(errors: Vec<OptionError>) -> ! {
     std::process::exit(1);
 }
 
-fn clear_cache_dir() {
-    let cache_dir = "cache";
-    if std::path::Path::new(cache_dir).exists() {
-        match std::fs::remove_dir_all(cache_dir) {
-            Ok(_) => println!("Cache directory '{}' cleared", cache_dir),
-            Err(e) => eprintln!("Failed to clear cache: {}", e),
+/// Deletes the cached responses and the archive, leaving the directories and the extracted static
+/// data in place.
+///
+/// `--clear-cache` used to be `remove_dir_all("cache")`. With the roots now absolute and shared,
+/// wiping a whole directory is a heavier thing to do by accident, and the static data root costs
+/// an archive download to refill, so this removes files it recognises instead: the JSON responses
+/// and the orphaned temporary files of the cache root, and the SDE archive in the data root if one
+/// is ever there.
+fn clear_cached_files(cache: &Path, data: &Path) {
+    let mut removed = 0;
+    let mut failures = 0;
+    match std::fs::read_dir(cache) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let cached = name.ends_with(".json");
+                // The atomic write names its temporary file `.{name}.json.{pid}.tmp`, so a
+                // json-only rule would leave a crash's leftovers behind for good.
+                let orphan = name.starts_with('.') && name.ends_with(".tmp");
+                if !cached && !orphan {
+                    continue;
+                }
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => removed += 1,
+                    Err(error) => {
+                        failures += 1;
+                        eprintln!("Failed to remove {}: {}", entry.path().display(), error);
+                    }
+                }
+            }
         }
-    } else {
-        println!("Cache directory '{}' does not exist", cache_dir);
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("No cache to clear in {}", cache.display());
+        }
+        Err(error) => eprintln!("Failed to read {}: {}", cache.display(), error),
+    }
+    if removed > 0 || failures == 0 {
+        println!(
+            "Cleared {removed} cached responses from {}",
+            cache.display()
+        );
+    }
+
+    // Nothing writes this today, since the archive is unzipped in memory, so the check is here in
+    // case that changes rather than because it matches anything now.
+    let archive = data.join(eve_lpstore::static_data::SDE_ARCHIVE_NAME);
+    match std::fs::remove_file(&archive) {
+        Ok(()) => println!("Removed the static data archive {}", archive.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("Failed to remove {}: {}", archive.display(), error),
+    }
+}
+
+/// Notes the two directories this used to write in the working directory. They are not read any
+/// more, so their contents are dead weight until someone deletes them.
+fn warn_ignored_local_dirs() {
+    let mut left = Vec::new();
+    for name in ["cache", "data"] {
+        if Path::new(name).is_dir() {
+            left.push(name);
+        }
+    }
+    if !left.is_empty() {
+        println!(
+            "Note: {} in the working directory is no longer used; the files there can be deleted.",
+            left.join(" and ")
+        );
     }
 }
 
 /// Says what is about to happen before the static data archive is fetched. Loading it pulls the
 /// whole SDE download, which takes long enough that a silent terminal looks hung.
-fn announce_static_data_download() {
-    if StaticData::is_cached() {
+fn announce_static_data_download(data: &Path) {
+    if StaticData::is_cached(data) {
         return;
     }
-    let where_ = StaticData::regions_cache_path()
-        .parent()
-        .map(|dir| dir.display().to_string())
-        .unwrap_or_else(|| "the data directory".to_string());
-    println!("Static data not found, downloading it to {}...", where_);
+    println!(
+        "Static data not found, downloading it to {}...",
+        data.display()
+    );
 }
 
 async fn run_example(
@@ -251,10 +334,11 @@ async fn run_example(
     region: Option<&str>,
     cache_offset: std::time::Duration,
     max_inflight: usize,
+    paths: &Paths,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Load static data (only downloads if cache is missing or forced)
-    announce_static_data_download();
-    let sdata = match StaticData::load(false).await {
+    announce_static_data_download(&paths.data);
+    let sdata = match StaticData::load(false, &paths.data).await {
         Ok(data) => {
             println!(
                 "Static data loaded: {} regions",
@@ -310,7 +394,7 @@ async fn run_example(
     println!("Region: {}", region_label);
 
     let esi = EsiClient::builder()
-        .cache_dir("cache")
+        .cache_dir(paths.cache.clone())
         .expire(expire)
         .verbose(verbose)
         .cache_expiry_offset(cache_offset)
@@ -357,21 +441,27 @@ async fn run_example(
     Ok(())
 }
 
-async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool, tui: bool) {
+async fn run_lpstores(
+    status: bool,
+    options: LpStoreOptions,
+    clear_cache: bool,
+    tui: bool,
+    paths: Paths,
+) {
     if tui {
         if clear_cache {
-            clear_cache_dir();
+            clear_cached_files(&paths.cache, &paths.data);
         }
         // The view asks about the static data itself, and resolves the filters when they are
         // applied, so nothing is loaded or fetched before it can say so on screen.
-        if let Err(e) = tui::run(options).await {
+        if let Err(e) = tui::run(options, paths).await {
             eprintln!("TUI failed: {}", e);
             std::process::exit(1);
         }
         return;
     }
-    announce_static_data_download();
-    let sdata = match StaticData::load(false).await {
+    announce_static_data_download(&paths.data);
+    let sdata = match StaticData::load(false, &paths.data).await {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Failed to load static data: {}", e);
@@ -383,12 +473,12 @@ async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool, 
         Err(errors) => exit_with_errors(errors),
     };
     if clear_cache {
-        clear_cache_dir();
+        clear_cached_files(&paths.cache, &paths.data);
     }
     output::print_resolution(&resolved);
 
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
-    let client = Arc::new(resolved.client(0, events.clone()));
+    let client = Arc::new(resolved.client(&paths.cache, 0, events.clone()));
     let status_task = status.then(|| client.spawn_status_monitor(print_status));
     let printing = async {
         while let Some(run_event) = received.recv().await {
@@ -400,5 +490,113 @@ async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool, 
 
     if let Some(task) = status_task {
         task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A fresh directory under the system temp directory, removed when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "eve_lpstore_clear_{}_{}_{}",
+                std::process::id(),
+                name,
+                uuid_like()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn write(&self, dir: &Path, name: &str) {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        fn names(&self, dir: &Path) -> Vec<String> {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => entries
+                    .flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn uuid_like() -> u32 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::time::Instant::now().hash(&mut hasher);
+        (hasher.finish() % 100_000) as u32
+    }
+
+    #[test]
+    fn clearing_removes_responses_and_temp_orphans_but_not_the_directory() {
+        let temp = TempDir::new("files");
+        let cache = temp.0.join("cache");
+        for name in [
+            "loyalty_stores_1000002_offers.json",
+            "markets_10000002_orders.json",
+            ".markets_10000002_orders.json.4242.tmp",
+        ] {
+            temp.write(&cache, name);
+        }
+        // Something the program did not put there is left alone.
+        temp.write(&cache, "notes.txt");
+        let data = temp.0.join("data");
+        for name in ["regions.json", "corporations.json", "types.json"] {
+            temp.write(&data, name);
+        }
+
+        clear_cached_files(&cache, &data);
+
+        assert!(cache.is_dir(), "the directory itself survives");
+        assert_eq!(temp.names(&cache), ["notes.txt"]);
+        assert!(data.is_dir(), "the static data root survives");
+        for name in ["regions.json", "corporations.json", "types.json"] {
+            assert!(data.join(name).exists(), "{name} was deleted");
+        }
+    }
+
+    #[test]
+    fn clearing_removes_a_stored_archive_but_keeps_the_extracted_files() {
+        // Nothing writes the archive today, since it is unzipped in memory, so this is the case
+        // where it does.
+        let temp = TempDir::new("archive");
+        let cache = temp.0.join("cache");
+        let data = temp.0.join("data");
+        temp.write(&cache, "a.json");
+        temp.write(&data, eve_lpstore::static_data::SDE_ARCHIVE_NAME);
+        temp.write(&data, "regions.json");
+
+        clear_cached_files(&cache, &data);
+
+        assert!(
+            !data
+                .join(eve_lpstore::static_data::SDE_ARCHIVE_NAME)
+                .exists()
+        );
+        assert!(data.join("regions.json").exists());
+        assert!(!cache.join("a.json").exists());
+    }
+
+    #[test]
+    fn clearing_missing_directories_is_not_an_error() {
+        let temp = TempDir::new("absent");
+        let cache = temp.0.join("no-cache");
+        let data = temp.0.join("no-data");
+        clear_cached_files(&cache, &data);
+        assert!(!cache.exists());
+        assert!(!data.exists());
     }
 }
