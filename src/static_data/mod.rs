@@ -1,8 +1,9 @@
 use crate::esi::error::EsiError;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::Path;
+use std::sync::Mutex;
 
 const SDE_ZIP_URL: &str =
     "https://developers.eveonline.com/static-data/eve-online-static-data-latest-jsonl.zip";
@@ -16,6 +17,16 @@ const REGIONS_CACHE_FILE: &str = "regions.json";
 const CORPORATIONS_CACHE_FILE: &str = "corporations.json";
 const TYPES_CACHE_FILE: &str = "types.json";
 const SECURITY_CACHE_FILE: &str = "corporation_agent_stations.json";
+
+/// Standard NPC trade hubs excluded from burner destination candidates and route transit, as
+/// specified for the burner model.
+pub const BURNER_BLACKLIST: [i32; 5] = [
+    30000142, // Jita
+    30002187, // Amarr
+    30002659, // Dodixie
+    30002510, // Rens
+    30002053, // Hek
+];
 
 /// Displayed security is rounded as described at https://wiki.eveuniversity.org/System_security
 ///
@@ -346,6 +357,43 @@ fn better_route(candidate: &Route, current: &Route) -> bool {
     cp < bp
 }
 
+/// The two destination marginals over a uniformly weighted system set. Both regular and burner
+/// distributions use the same route-band, own-band and hop summaries; only their candidate pools
+/// and route graphs differ.
+fn destination_spread(
+    constellation_id: i32,
+    mut destinations: Vec<(i32, usize, i32, i32)>,
+) -> DestinationSpread {
+    destinations.sort_unstable_by_key(|(system, _, _, _)| *system);
+    let systems = destinations.len();
+    let mut bands: std::collections::BTreeMap<i32, usize> = Default::default();
+    let mut own_bands: std::collections::BTreeMap<i32, usize> = Default::default();
+    let mut hop_counts: std::collections::BTreeMap<usize, usize> = Default::default();
+    for (_, hops, route_band, own_band) in &destinations {
+        *bands.entry(*route_band).or_default() += 1;
+        *own_bands.entry(*own_band).or_default() += 1;
+        *hop_counts.entry(*hops).or_default() += 1;
+    }
+    let tally = |counts: std::collections::BTreeMap<i32, usize>| {
+        counts
+            .into_iter()
+            .map(|(band, count)| (band, DestinationSpread::share(count, systems)))
+            .collect::<Vec<_>>()
+    };
+
+    DestinationSpread {
+        constellation_id,
+        systems,
+        bands: tally(bands),
+        own_bands: tally(own_bands),
+        hops: hop_counts
+            .into_iter()
+            .map(|(distance, count)| (distance, DestinationSpread::share(count, systems)))
+            .collect(),
+        destinations,
+    }
+}
+
 /// The agent data cached from the SDE.
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentCache {
@@ -449,6 +497,9 @@ pub struct StaticData {
     /// Solar systems reachable through one stargate, keyed by the system you start in. Built once
     /// at load so a hop count is a map lookup rather than a scan of the gate list.
     neighbours: HashMap<i32, Vec<i32>>,
+    /// Burner route spreads are computed on the full gate graph, which has thousands of systems.
+    /// Cache by agent origin so redraws of the Details pane do not repeat that graph search.
+    burner_spreads: Mutex<HashMap<i32, Option<DestinationSpread>>>,
     corporation_factions: HashMap<i32, i32>,
     factions: Vec<(i32, String)>,
     stations: Vec<(i64, i32)>,
@@ -624,44 +675,9 @@ impl StaticData {
             return None;
         }
         let inside: std::collections::HashSet<i32> = members.iter().copied().collect();
-        let start = self.mission_security(agent_system)?;
+        self.mission_security(agent_system)?;
 
-        // Widest-path relaxation on the security floor, which is monotone along a path, so the
-        // loop settles in at most one pass per improvement. Constellations are single-digit
-        // systems, so the rescan costs nothing.
-        let mut score: std::collections::HashMap<i32, Route> =
-            std::collections::HashMap::from([(agent_system, (start, 0, vec![agent_system]))]);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let settled: Vec<(i32, Route)> = score
-                .iter()
-                .map(|(system, best)| (*system, best.clone()))
-                .collect();
-            for (system, (floor, hops, path)) in settled {
-                for next in self.gate_neighbours(system) {
-                    if !inside.contains(next) {
-                        continue;
-                    }
-                    let Some(seat) = self.mission_security(*next) else {
-                        continue;
-                    };
-                    let candidate = (floor.min(seat), hops + 1, {
-                        let mut extended = path.clone();
-                        extended.push(*next);
-                        extended
-                    });
-                    let improve = match score.get(next) {
-                        None => true,
-                        Some(current) => better_route(&candidate, current),
-                    };
-                    if improve {
-                        score.insert(*next, candidate);
-                        changed = true;
-                    }
-                }
-            }
-        }
+        let score = self.best_routes(agent_system, Some(&inside), &HashSet::new())?;
 
         let mut destinations = Vec::new();
         for system in &members {
@@ -672,35 +688,146 @@ impl StaticData {
             let own_band = self.security_band(*system)?;
             destinations.push((*system, *hops, route_band, own_band));
         }
-        destinations.sort_unstable_by_key(|(system, _, _, _)| *system);
+        Some(destination_spread(constellation_id, destinations))
+    }
 
-        let systems = destinations.len();
-        let mut bands: std::collections::BTreeMap<i32, usize> = Default::default();
-        let mut own_bands: std::collections::BTreeMap<i32, usize> = Default::default();
-        let mut hop_counts: std::collections::BTreeMap<usize, usize> = Default::default();
-        for (_, hops, route_band, own_band) in &destinations {
-            *bands.entry(*route_band).or_default() += 1;
-            *own_bands.entry(*own_band).or_default() += 1;
-            *hop_counts.entry(*hops).or_default() += 1;
+    /// Burner destinations are a separate uniform distribution over systems in the agent's
+    /// constellation and any constellation with a direct stargate connection to it. The five
+    /// standard NPC trade hubs are excluded as destinations and route transit; route reachability
+    /// is checked on the full gate graph with those systems removed, so a detour through another
+    /// constellation is allowed but does not make that constellation part of the destination pool.
+    /// This is the chosen model rule, not a measured distribution of offers or site spawns.
+    ///
+    /// `None` means the origin system is unknown. A known origin with no eligible reachable system
+    /// returns a spread with zero destinations; callers can explain that exclusion rather than
+    /// inventing a 100% probability for the origin.
+    pub fn burner_mission_spread(&self, agent_system: i32) -> Option<DestinationSpread> {
+        let constellation_id = self.constellation_of_system(agent_system)?;
+        if let Ok(cache) = self.burner_spreads.lock()
+            && let Some(cached) = cache.get(&agent_system)
+        {
+            return cached.clone();
         }
-        let tally = |counts: std::collections::BTreeMap<i32, usize>| {
-            counts
-                .into_iter()
-                .map(|(band, count)| (band, DestinationSpread::share(count, systems)))
-                .collect::<Vec<_>>()
-        };
+        let spread = self.compute_burner_mission_spread(agent_system, constellation_id);
+        if let Ok(mut cache) = self.burner_spreads.lock() {
+            cache.insert(agent_system, spread.clone());
+        }
+        spread
+    }
 
-        Some(DestinationSpread {
-            constellation_id,
-            systems,
-            bands: tally(bands),
-            own_bands: tally(own_bands),
-            hops: hop_counts
-                .into_iter()
-                .map(|(distance, count)| (distance, DestinationSpread::share(count, systems)))
-                .collect(),
-            destinations,
-        })
+    fn compute_burner_mission_spread(
+        &self,
+        agent_system: i32,
+        constellation_id: i32,
+    ) -> Option<DestinationSpread> {
+        let mut destination_constellations = HashSet::from([constellation_id]);
+        for member in self.constellation_members(constellation_id) {
+            for neighbour in self.gate_neighbours(*member) {
+                if let Some(other) = self.constellation_of_system(*neighbour) {
+                    destination_constellations.insert(other);
+                }
+            }
+        }
+        let blocked: HashSet<i32> = BURNER_BLACKLIST.into_iter().collect();
+        let mut candidates: Vec<i32> = destination_constellations
+            .into_iter()
+            .flat_map(|constellation| self.constellation_members(constellation).iter().copied())
+            .filter(|system| !blocked.contains(system))
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        // The origin remains a valid starting point even if a data set places it in a blacklisted
+        // hub. Blacklisted systems are not entered again as transit, and they are never destinations.
+        let route_blocked: HashSet<i32> = BURNER_BLACKLIST
+            .into_iter()
+            .filter(|system| *system != agent_system)
+            .collect();
+        let routes = self.best_routes(agent_system, None, &route_blocked)?;
+        let mut destinations = Vec::new();
+        for system in candidates {
+            let Some((floor, hops, _)) = routes.get(&system) else {
+                continue;
+            };
+            destinations.push((
+                system,
+                *hops,
+                displayed_security(*floor),
+                self.security_band(system)?,
+            ));
+        }
+        Some(destination_spread(constellation_id, destinations))
+    }
+
+    /// Agent systems for which the same corporation has a level 4 Basic Security agent that passes
+    /// the active filters. Burner capability is a property of that matching agent row, not merely
+    /// of any level-4 agent in the system: when filters select a different agent, its row does not
+    /// display a burner distribution.
+    pub fn burner_agent_systems(
+        &self,
+        corporation_id: i32,
+        filter: &AgentFilter,
+    ) -> Vec<(i32, String, f64)> {
+        let Some(security) = self.security_division_id() else {
+            return Vec::new();
+        };
+        let Some(basic) = self.agent_type_id("Basic") else {
+            return Vec::new();
+        };
+        if filter.level.is_some_and(|level| level != 4)
+            || filter
+                .division_id
+                .is_some_and(|division| division != security)
+            || filter
+                .agent_type_id
+                .is_some_and(|agent_type| agent_type != basic)
+        {
+            return Vec::new();
+        }
+        let scoped = AgentFilter {
+            level: Some(4),
+            division_id: Some(security),
+            agent_type_id: Some(basic),
+            ..*filter
+        };
+        self.agent_systems(corporation_id, &scoped)
+    }
+
+    /// The safest routes from an origin. `inside` restricts traversal when present; `blocked`
+    /// systems cannot be entered, except that a blocked origin is allowed as the starting point.
+    /// The queue-based widest-path relaxation is deterministic because neighbours are sorted and
+    /// equal floor/hop routes use the lexicographically smaller system path.
+    fn best_routes(
+        &self,
+        origin: i32,
+        inside: Option<&HashSet<i32>>,
+        blocked: &HashSet<i32>,
+    ) -> Option<HashMap<i32, Route>> {
+        let start = self.mission_security(origin)?;
+        let mut score: HashMap<i32, Route> = HashMap::from([(origin, (start, 0, vec![origin]))]);
+        let mut queue = VecDeque::from([origin]);
+        while let Some(system) = queue.pop_front() {
+            let (floor, hops, path) = score.get(&system)?.clone();
+            for next in self.gate_neighbours(system) {
+                if blocked.contains(next) || inside.is_some_and(|set| !set.contains(next)) {
+                    continue;
+                }
+                let Some(security) = self.mission_security(*next) else {
+                    continue;
+                };
+                let mut next_path = path.clone();
+                next_path.push(*next);
+                let candidate = (floor.min(security), hops + 1, next_path);
+                let improve = score
+                    .get(next)
+                    .is_none_or(|current| better_route(&candidate, current));
+                if improve {
+                    score.insert(*next, candidate);
+                    queue.push_back(*next);
+                }
+            }
+        }
+        Some(score)
     }
 
     /// The true security of a system, which is what a route's floor is measured in before it is
@@ -1320,6 +1447,7 @@ impl StaticData {
                 .collect(),
             neighbours,
             constellation_members,
+            burner_spreads: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -1591,9 +1719,22 @@ mod tests {
     /// A `StaticData` with agent rows, for the listing questions the destination pane asks. Each
     /// agent is (corporation, system, level, division), and the division ids are the archive's.
     fn fixture_with_agents(rows: &[FixtureRow], agents: &[(i32, i32, i32, i32)]) -> StaticData {
-        let mut data = fixture(rows, &[]);
+        let agents: Vec<(i32, i32, i32, i32, i32)> = agents
+            .iter()
+            .map(|(corp, system, level, division)| (*corp, *system, *level, *division, 2))
+            .collect();
+        fixture_with_agents_and_gates(rows, &[], &agents)
+    }
+
+    /// As above, but with a gate fixture too, for route filters and burner destination pools.
+    fn fixture_with_agents_and_gates(
+        rows: &[FixtureRow],
+        gates: &[(i32, i32)],
+        agents: &[(i32, i32, i32, i32, i32)],
+    ) -> StaticData {
+        let mut data = fixture(rows, gates);
         let mut by_corporation: HashMap<i32, Vec<AgentRow>> = HashMap::new();
-        for (corporation, system, level, division) in agents {
+        for (corporation, system, level, division, agent_type) in agents {
             let true_sec = data
                 .systems
                 .get(system)
@@ -1606,7 +1747,7 @@ mod tests {
                     level: *level,
                     tenths: displayed_security(true_sec),
                     division_id: *division,
-                    agent_type_id: 2,
+                    agent_type_id: *agent_type,
                     system_id: *system,
                 });
         }
@@ -1616,7 +1757,144 @@ mod tests {
             (23, "Mining".to_string()),
             (24, "Security".to_string()),
         ];
+        data.agent_types = vec![
+            (1, "ResearchAgent".to_string()),
+            (2, "BasicAgent".to_string()),
+        ];
         data
+    }
+
+    /// Burner graph fixture. The eligible pool is systems 1-5 plus Jita: systems 1 and 2 share the
+    /// agent constellation, 3-5 are in its directly neighbouring constellation, and Jita is in a
+    /// second neighbouring constellation. System 4 can only be reached through Jita, which is
+    /// blacklisted. System 5 can be reached only by leaving the destination pool through transit
+    /// system 6, then returning to its constellation; that route is permitted by the chosen rule.
+    fn burner_graph() -> StaticData {
+        let rows: [FixtureRow; 7] = [
+            (1, ("Origin", 0.9, 7, 100)),
+            (2, ("Home", 0.8, 7, 100)),
+            (3, ("Neighbour", 0.7, 8, 200)),
+            (4, ("HubLocked", 0.6, 8, 200)),
+            (5, ("DetourTarget", 0.5, 8, 200)),
+            (6, ("TransitOnly", 0.95, 9, 300)),
+            (30000142, ("Jita", 0.99, 10, 400)),
+        ];
+        let gates = [(1, 2), (1, 3), (1, 30000142), (30000142, 4), (3, 6), (6, 5)];
+        fixture_with_agents_and_gates(&rows, &gates, &[])
+    }
+
+    fn burner_agent_fixture() -> StaticData {
+        let rows: [FixtureRow; 6] = [
+            (1, ("Origin", 0.9, 7, 100)),
+            (2, ("Home", 0.8, 7, 100)),
+            (3, ("Neighbour", 0.7, 8, 200)),
+            (4, ("HubLocked", 0.6, 8, 200)),
+            (5, ("DetourTarget", 0.5, 8, 200)),
+            (6, ("TransitOnly", 0.95, 9, 300)),
+        ];
+        let agents = [
+            (77, 1, 4, 24, 2), // Level 4, Basic, Security: can offer burners.
+            (77, 1, 1, 24, 2), // Same system, but not a burner-capable agent.
+            (77, 2, 1, 24, 2),
+            (77, 3, 4, 22, 2), // Distribution is out of scope.
+            (77, 5, 4, 24, 1), // Research is out of scope.
+            (77, 6, 4, 24, 2), // Another qualifying system, used for active-filter tests.
+        ];
+        fixture_with_agents_and_gates(&rows, &[(1, 2), (1, 3), (3, 6), (6, 5)], &agents)
+    }
+
+    #[test]
+    fn burner_pool_uses_current_and_directly_neighbouring_constellations() {
+        assert_eq!(
+            BURNER_BLACKLIST,
+            [30000142, 30002187, 30002659, 30002510, 30002053],
+            "Jita, Amarr, Dodixie, Rens, Hek"
+        );
+        let data = burner_graph();
+        let spread = data.burner_mission_spread(1).unwrap();
+        assert_eq!(
+            spread.constellation_id, 100,
+            "the agent's home constellation"
+        );
+        assert_eq!(
+            spread
+                .destinations
+                .iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 5],
+            "home and direct-neighbour systems only; the blacklisted hub, its locked system, and the transit-only system are absent"
+        );
+        assert_eq!(spread.systems, 4);
+        assert_eq!(
+            spread
+                .destinations
+                .iter()
+                .find(|row| row.0 == 5)
+                .map(|row| row.1),
+            Some(3),
+            "system 5 is reachable by the allowed detour through another constellation"
+        );
+        assert!(
+            !spread.destinations.iter().any(|row| row.0 == 4),
+            "system 4 is reachable only through blacklisted Jita"
+        );
+        assert!(
+            !spread.destinations.iter().any(|row| row.0 == 6),
+            "the transit constellation is not a destination constellation"
+        );
+    }
+
+    #[test]
+    fn burner_spread_cache_returns_the_same_computed_distribution() {
+        let data = burner_graph();
+        let first = data.burner_mission_spread(1).unwrap();
+        let second = data.burner_mission_spread(1).unwrap();
+        assert_eq!(
+            first, second,
+            "redrawing the Details pane does not change or recompute its result"
+        );
+    }
+
+    #[test]
+    fn only_matching_level_four_basic_security_agents_show_burner_support() {
+        let data = burner_agent_fixture();
+        assert_eq!(data.security_division_id(), Some(24));
+        assert_eq!(data.agent_type_id("Basic"), Some(2));
+        assert_eq!(data.agent_systems(77, &AgentFilter::default()).len(), 5);
+        let systems = data.burner_agent_systems(77, &AgentFilter::default());
+        assert_eq!(
+            systems.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![1, 6],
+            "only Level 4 Basic Security agents qualify"
+        );
+        let level_one = AgentFilter {
+            level: Some(1),
+            ..Default::default()
+        };
+        assert!(data.burner_agent_systems(77, &level_one).is_empty());
+        let system_six = AgentFilter {
+            system: Some(6),
+            ..Default::default()
+        };
+        assert_eq!(
+            data.burner_agent_systems(77, &system_six)
+                .iter()
+                .map(|row| row.0)
+                .collect::<Vec<_>>(),
+            vec![6],
+            "active system filters also apply to the qualifying agent row"
+        );
+        let research = AgentFilter {
+            agent_type_id: Some(1),
+            ..Default::default()
+        };
+        assert!(data.burner_agent_systems(77, &research).is_empty());
+        let distribution = AgentFilter {
+            division_id: Some(22),
+            ..Default::default()
+        };
+        assert!(data.burner_agent_systems(77, &distribution).is_empty());
     }
 
     /// The four fixture systems with one Security agent in each at level 1 to 4.

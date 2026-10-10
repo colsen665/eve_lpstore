@@ -444,19 +444,27 @@ Deferred to a later phase:
       not a single destination system. Burner sites can spawn in the agent's constellation or in a
       neighbouring constellation, so modelling burners is a separate destination distribution, as
       specified for this work below.
-- [ ] Implement the separate burner distribution for a listed agent system only when an agent passing
-      the active filters is Level 4, Basic type, Security division. The pool is the systems in the
-      current constellation plus any neighbouring constellation. Exclude these five standard NPC
-      trade hubs from both destination candidates and route transit: Jita (30000142), Amarr (30002187),
-      Dodixie (30002659), Rens (30002510), Hek (30002053). A candidate is eligible only if it is
-      reachable over the full stargate graph with those systems removed; the route may cross other
-      constellations, but they do not enter the destination pool. Weight eligible systems uniformly.
-      Show this as a separate distribution in the Details pane so it is not added to the regular
-      mission percentages. These are the chosen model rules, not a measured distribution of mission
-      offers or site spawns.
-- [ ] Keep an eye on the size of the Details block when both distributions are present: the cap at ten
-      agent systems remains, and each eligible system adds another distribution summary. The `m` pane
-      still shows the regular per-destination detail only unless separately extended.
+- [x] The Details pane has a second, explicitly labelled Burner distribution; it is not added to the
+      regular-mission percentages. It appears only if an agent row for the displayed corporation and
+      system passes the active filters **and** is level 4, Basic type, Security division. That makes a
+      level-1 row for a system with a level-4 agent elsewhere show no burner summary unless that
+      level-4 row also passes the active filters. Measured from the cached SDE: 502 such agent rows,
+      across 125 corporations and 457 distinct systems.
+- [x] Chosen model for that second marginal, supplied for the feature rather than measured from offered
+      missions: candidate systems are in the agent's constellation or any constellation with a direct
+      stargate connection to it, weighted uniformly over systems. The five standard NPC trade hubs are
+      excluded both as destinations and as route transit: Jita (30000142), Amarr (30002187), Dodixie
+      (30002659), Rens (30002510) and Hek (30002053). A candidate is eligible only if a route to it
+      exists over the full gate graph with those systems removed; such a route may detour through other
+      constellations, but those transit systems do not join the candidate set. For each candidate the
+      route floor is the safest full-graph gate route under that restriction, including the origin as
+      for the regular marginal; hops count that route too. Tests pin the current/neighbor pool boundary,
+      a destination reachable only through blacklisted Jita being rejected, a permitted detour through
+      a non-destination constellation, and the Level-4/Basic/Security intersection with active filters.
+- [ ] Check the Details pane's height with both summaries for a burner-capable system. The ten-system
+      cap remains; each matching system can now add one burner line as well as its regular summary, and
+      at the 80x24 terminal size some lines may wrap. The `m` pane still enumerates regular destinations
+      only, as requested; whether it should also show burner destinations has not been decided.
 - [ ] The remaining agent rows, 6,128 of them, covering non-security divisions and the research,
       story, factional warfare, epic arc and event types.
 - [ ] Authenticated character data of any kind, and the CSV and JSON exports, neither of which has a

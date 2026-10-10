@@ -16,7 +16,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 pub const MIN_WIDTH: u16 = 80;
 /// The smallest view the app draws. Twelve filter rows need room, and the notes under them carry
@@ -463,6 +463,18 @@ fn summary_text(
     true_sec: f64,
     spread: &eve_lpstore::static_data::DestinationSpread,
 ) -> String {
+    let (bands, hops) = distribution_parts(spread);
+    format!("  {name} ({true_sec:.2}) {bands}  {hops}")
+}
+
+/// A separate burner marginal, shown only when a matching level-4 Basic Security agent is at the
+/// system. Its indented label keeps it visually apart from the regular-mission distribution above.
+fn burner_summary_text(spread: &eve_lpstore::static_data::DestinationSpread) -> String {
+    let (bands, hops) = distribution_parts(spread);
+    format!("    Burners: {bands}  {hops}")
+}
+
+fn distribution_parts(spread: &eve_lpstore::static_data::DestinationSpread) -> (String, String) {
     let bands = spread
         .bands
         .iter()
@@ -475,7 +487,7 @@ fn summary_text(
         .map(|(distance, part)| format!("{distance}J/{}", percent(*part)))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("  {name} ({true_sec:.2}) {bands}  {hops}")
+    (bands, hops)
 }
 
 /// Tenths to the one-decimal label the panes and `--security` both use.
@@ -1299,12 +1311,25 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
         // the largest case pushed the offer breakdown 107 rows down. The systems past the cap are
         // named by count and pointed at the pane that lists them all.
         let (shown, hidden) = cap_systems(systems);
+        let burner_systems: HashSet<i32> = sdata
+            .burner_agent_systems(id, &app.agent_filter)
+            .into_iter()
+            .map(|(system, _, _)| system)
+            .collect();
         for (system_id, name, true_sec) in shown {
             let text = match sdata.mission_spread(system_id) {
                 Some(spread) => summary_text(&name, true_sec, &spread),
                 None => format!("  {name} ({true_sec:.2})  no constellation data"),
             };
             lines.push((text, plain));
+            if burner_systems.contains(&system_id) {
+                let text = match sdata.burner_mission_spread(system_id) {
+                    Some(spread) if spread.systems > 0 => burner_summary_text(&spread),
+                    Some(_) => "    Burners: no eligible destination systems".to_string(),
+                    None => "    Burners: no constellation data".to_string(),
+                };
+                lines.push((text, plain));
+            }
         }
         if hidden > 0 {
             lines.push((more_systems_row(hidden), plain));
@@ -2322,6 +2347,18 @@ mod tests {
         assert_eq!(
             summary_text("Annancale", 0.0941, &two_band_spread()),
             "  Annancale (0.09) 0.1/50%, 0.2/50%  0J/50%, 1J/50%"
+        );
+    }
+
+    #[test]
+    fn burner_probability_is_a_separate_details_line() {
+        assert_eq!(
+            burner_summary_text(&two_band_spread()),
+            "    Burners: 0.1/50%, 0.2/50%  0J/50%, 1J/50%"
+        );
+        assert!(
+            !burner_summary_text(&two_band_spread()).starts_with("  Babirmoult"),
+            "the burner marginal is not merged into the regular-agent summary"
         );
     }
 
