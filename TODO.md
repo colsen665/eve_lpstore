@@ -326,11 +326,15 @@ The requested shape, kept as the spec the tests are written against:
       Annancale 0.0941), so only the probabilities were invented. Both corporations have Security
       agents, so the scope applied today keeps them in: 29 agents in 16 systems and 26 in 14. Across
       the 158 corporations with any Security agent the systems per corporation run 1 to 53, median 11,
-      and 81 of them have more than the 10 that `corp_line` used to cut at. They are listed uncapped
-      and the pane scrolls, chosen over a cap because dropping systems silently would hide exactly the
-      spread the feature is for; the cost is that a 53-system corporation pushes the offer breakdown
-      well below the fold. Open question: whether some cap, or a count line that says how many systems
-      follow, reads better at the common 11-to-35 sizes.
+      and 81 of them have more than the 10 that `corp_line` used to cut at. Settled: **capped at the
+      same `MAX_SYSTEMS_SHOWN` the CLI report cuts at**, with the rest named by count on a line that
+      points at the pane that shows them all — `  +43 more systems, press m for all of them`. Chosen
+      over listing them all because a 53-system corporation pushed the offer breakdown 107 rows down at
+      80 columns (each summary wraps to two rows there), and over reordering the pane because the
+      economics of the selected offer are what the pane is for. Data order is kept so the visible ten
+      are the same ten `corp_line` prints, and exactly-at-cap prints no count line, because nothing is
+      withheld at ten. Verified against the archive: the 53-system corporation shows ten rows plus the
+      count line, and the `m` pane really lists all 53 systems and their 317 destination rows.
       A summary line measured 65 characters at the median and 126 at the longest, against the 78
       columns a border leaves at the minimum width, so both panes wrap rather than clip; the indent is
       kept on every wrapped row, because a continuation at column 0 reads as a new system.

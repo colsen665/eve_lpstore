@@ -368,6 +368,26 @@ fn read_band(chars: &[char], at: usize) -> Option<(i32, usize)> {
     Some((if negative { -value } else { value }, i))
 }
 
+/// The agent systems a corporation's block shows, and how many it withholds. Data order is kept, so
+/// the first rows are the same systems `corp_line` lists in the CLI report. Exactly at the cap shows
+/// them all and says nothing about it, because there is nothing withheld.
+fn cap_systems<T>(systems: Vec<T>) -> (Vec<T>, usize) {
+    let hidden = systems.len().saturating_sub(output::MAX_SYSTEMS_SHOWN);
+    (
+        systems
+            .into_iter()
+            .take(output::MAX_SYSTEMS_SHOWN)
+            .collect(),
+        hidden,
+    )
+}
+
+/// The line that stands in for the agent systems a corporation has more of than the pane shows.
+fn more_systems_row(hidden: usize) -> String {
+    let word = if hidden == 1 { "system" } else { "systems" };
+    format!("  +{hidden} more {word}, press m for all of them")
+}
+
 /// The details-pane line for one agent system: its name and true security, then the band groups and
 /// the hop groups. The destinations pane spells the same numbers with the system id and the word
 /// `route`; here the row sits under its corporation, so the security stands in for the id.
@@ -1204,12 +1224,20 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
             lines.push(("  no security agents match the filters".to_string(), plain));
             continue;
         }
-        for (system_id, name, true_sec) in systems {
+        // A corporation can hold far more agent systems than the pane has rows for: measured on the
+        // archive, 1 to 53 with a median of 11, and at 80 columns each summary wraps to two rows, so
+        // the largest case pushed the offer breakdown 107 rows down. The systems past the cap are
+        // named by count and pointed at the pane that lists them all.
+        let (shown, hidden) = cap_systems(systems);
+        for (system_id, name, true_sec) in shown {
             let text = match sdata.mission_spread(system_id) {
                 Some(spread) => summary_text(&name, true_sec, &spread),
                 None => format!("  {name} ({true_sec:.2})  no constellation data"),
             };
             lines.push((text, plain));
+        }
+        if hidden > 0 {
+            lines.push((more_systems_row(hidden), plain));
         }
     }
     lines.push((String::new(), plain));
@@ -2155,6 +2183,50 @@ mod tests {
             "the destination row is intact"
         );
         assert_eq!(body.last().unwrap().1, Style::new().dark_gray());
+    }
+
+    #[test]
+    fn the_system_block_caps_at_what_the_cli_report_cuts_at() {
+        // One constant governs both views, so a corporation cannot show ten systems in the report and
+        // twelve in the pane. 53 is the largest count measured on the archive.
+        let ids: Vec<i32> = (1..=53).collect();
+        let (shown, hidden) = cap_systems(ids);
+        assert_eq!(shown.len(), output::MAX_SYSTEMS_SHOWN);
+        assert_eq!(hidden, 43);
+        assert_eq!(
+            shown,
+            (1..=10).collect::<Vec<_>>(),
+            "data order, the first ten"
+        );
+        let exactly = cap_systems((1..=10).collect::<Vec<i32>>());
+        assert_eq!(
+            (exactly.0.len(), exactly.1),
+            (10, 0),
+            "at the cap, nothing is withheld"
+        );
+        let few = cap_systems((1..=3).collect::<Vec<i32>>());
+        assert_eq!((few.0.len(), few.1), (3, 0));
+        assert_eq!(
+            cap_systems(Vec::<i32>::new()).1,
+            0,
+            "and an empty list stays empty"
+        );
+    }
+
+    #[test]
+    fn the_overflow_line_counts_what_it_hides_and_names_the_way_to_see_it() {
+        assert_eq!(
+            more_systems_row(43),
+            "  +43 more systems, press m for all of them"
+        );
+        assert_eq!(
+            more_systems_row(1),
+            "  +1 more system, press m for all of them"
+        );
+        // The largest count this can reach is 43, the biggest corporation measured on the archive
+        // holding 53 systems, so the line stays well inside the 52 columns the details pane has at
+        // the minimum size and never wraps onto a second row of its own.
+        assert_eq!(more_systems_row(43).chars().count(), 43);
     }
 
     #[test]

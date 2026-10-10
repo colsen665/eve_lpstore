@@ -10,6 +10,11 @@ pub struct Message {
     pub is_error: bool,
 }
 
+/// How many of a corporation's agent systems are listed before the rest are summarised. The CLI
+/// report cuts its inline list at this many, and the details pane caps its indented rows at the
+/// same number, so the two views agree about which systems earn a row.
+pub const MAX_SYSTEMS_SHOWN: usize = 10;
+
 /// The corporation's name and id on its own, for panes that list systems separately.
 pub fn corporation_label(sdata: &StaticData, corp_id: i32) -> String {
     corp_label(sdata, corp_id)
@@ -29,7 +34,7 @@ pub fn corp_line(sdata: &StaticData, corp_id: i32, filter: &AgentFilter) -> Stri
     if !systems.is_empty() {
         let shown: Vec<String> = systems
             .iter()
-            .take(10)
+            .take(MAX_SYSTEMS_SHOWN)
             .map(|(name, true_sec)| format!("{} ({:.2})", name, true_sec))
             .collect();
         line.push_str(": ");
