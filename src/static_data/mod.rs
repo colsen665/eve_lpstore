@@ -202,7 +202,8 @@ struct SdeNpcStation {
     solar_system_id: i32,
 }
 
-/// Solar system record, used for its name, security status, and owning region.
+/// Solar system record, used for its name, security status, and the region and constellation it
+/// belongs to.
 #[derive(Debug, Deserialize)]
 struct SdeSolarSystem {
     #[serde(rename = "_key")]
@@ -211,7 +212,24 @@ struct SdeSolarSystem {
     security_status: f64,
     #[serde(rename = "regionID")]
     region_id: i32,
+    #[serde(rename = "constellationID")]
+    constellation_id: i32,
     name: SdeSystemName,
+}
+
+/// Stargate record, used only for the pair of systems it joins. The archive lists one record per
+/// direction, so every edge appears twice, which the cache builder deduplicates.
+#[derive(Debug, Deserialize)]
+struct SdeStargate {
+    #[serde(rename = "solarSystemID")]
+    system_id: i32,
+    destination: SdeStargateDestination,
+}
+
+#[derive(Debug, Deserialize)]
+struct SdeStargateDestination {
+    #[serde(rename = "solarSystemID")]
+    system_id: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,17 +302,22 @@ struct AgentCache {
     corporations: Vec<(i32, Vec<AgentRow>)>,
     divisions: Vec<(i32, String)>,
     agent_types: Vec<(i32, String)>,
-    /// Id, name, displayed security, and the region the system is in.
-    systems: Vec<(i32, String, f64, i32)>,
+    /// Id, name, true security, region and constellation.
+    systems: Vec<(i32, String, f64, i32, i32)>,
     corporation_factions: Vec<(i32, i32)>,
     factions: Vec<(i32, String)>,
     stations: Vec<(i64, i32)>,
+    /// Stargate connections, one entry per direction the archive lists, so both ways round for a
+    /// gate between two systems.
+    gates: Vec<(i32, i32)>,
 }
 
 /// The shape `load` expects in the cached agent data. A file from an older build, or one written
 /// before the version field existed, is treated as missing: the caller is then asked to download,
 /// which is cheaper than silently reading a mapping that is not there.
-const AGENT_CACHE_VERSION: u32 = 2;
+///
+/// Version 2 added each system's region, version 3 its constellation and the stargate connections.
+const AGENT_CACHE_VERSION: u32 = 3;
 
 /// NPC corporation record, used for its faction.
 #[derive(Debug, Deserialize)]
@@ -349,7 +372,10 @@ pub struct StaticData {
     corporation_agents: HashMap<i32, Vec<AgentRow>>,
     divisions: Vec<(i32, String)>,
     agent_types: Vec<(i32, String)>,
-    systems: HashMap<i32, (String, f64, i32)>,
+    systems: HashMap<i32, (String, f64, i32, i32)>,
+    /// Solar systems reachable through one stargate, keyed by the system you start in. Built once
+    /// at load so a hop count is a map lookup rather than a scan of the gate list.
+    neighbours: HashMap<i32, Vec<i32>>,
     corporation_factions: HashMap<i32, i32>,
     factions: Vec<(i32, String)>,
     stations: Vec<(i64, i32)>,
@@ -436,12 +462,43 @@ impl StaticData {
 
     /// Get all known solar system names.
     pub fn system_names(&self) -> impl Iterator<Item = &String> {
-        self.systems.values().map(|(name, _, _)| name)
+        self.systems.values().map(|(name, _, _, _)| name)
+    }
+
+    /// One entry per stargate record, both directions, so hop counting can walk from either side of
+    /// a connection. Duplicate entries for a pair are collapsed, and each list is sorted so the same
+    /// archive always produces the same map.
+    fn neighbour_map(gates: &[(i32, i32)]) -> HashMap<i32, Vec<i32>> {
+        let mut seen: HashMap<i32, std::collections::HashSet<i32>> = HashMap::new();
+        for (from, to) in gates {
+            seen.entry(*from).or_default().insert(*to);
+        }
+        seen.into_iter()
+            .map(|(system, list)| {
+                let mut list: Vec<i32> = list.into_iter().collect();
+                list.sort_unstable();
+                (system, list)
+            })
+            .collect()
+    }
+
+    /// The systems one stargate away from `system_id`, in id order. Empty for a system the archive
+    /// lists no gates for, which is also the answer for an unknown id, so a caller that needs to
+    /// tell those apart should check the system exists first.
+    pub fn gate_neighbours(&self, system_id: i32) -> &[i32] {
+        self.neighbours.get(&system_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The constellation a solar system is in, or `None` when the system is not known.
+    pub fn constellation_of_system(&self, system_id: i32) -> Option<i32> {
+        self.systems.get(&system_id).map(|(_, _, _, c)| *c)
     }
 
     /// The region a solar system is in, or `None` when the system is not known.
     pub fn region_of_system(&self, system_id: i32) -> Option<i32> {
-        self.systems.get(&system_id).map(|(_, _, region)| *region)
+        self.systems
+            .get(&system_id)
+            .map(|(_, _, region, _)| *region)
     }
 
     /// Look up a type name by type ID.
@@ -493,7 +550,7 @@ impl StaticData {
             if !filter.matches(row) {
                 continue;
             }
-            if let Some((name, true_sec, _)) = self.systems.get(&row.system_id) {
+            if let Some((name, true_sec, _, _)) = self.systems.get(&row.system_id) {
                 if !names.iter().any(|(existing, _)| existing == name) {
                     names.push((name.clone(), *true_sec));
                 }
@@ -511,7 +568,7 @@ impl StaticData {
         }
         self.systems
             .iter()
-            .find(|(_, (name, _, _))| name.eq_ignore_ascii_case(value))
+            .find(|(_, (name, _, _, _))| name.eq_ignore_ascii_case(value))
             .map(|(id, _)| *id)
     }
 
@@ -796,8 +853,18 @@ impl StaticData {
                 record.name.en,
                 record.security_status,
                 record.region_id,
+                record.constellation_id,
             ));
             system_security.insert(record.system_id, record.security_status);
+        }
+
+        let mut gates = Vec::new();
+        for line in Self::read_sde_file(bytes, "mapStargates.jsonl")?.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: SdeStargate = serde_json::from_str(line).map_err(EsiError::Deserialize)?;
+            gates.push((record.system_id, record.destination.system_id));
         }
 
         let mut corporation_factions = Vec::new();
@@ -886,6 +953,7 @@ impl StaticData {
             corporation_factions,
             factions,
             stations,
+            gates,
         })
     }
 
@@ -947,8 +1015,11 @@ impl StaticData {
             systems: agents
                 .systems
                 .into_iter()
-                .map(|(id, name, true_sec, region_id)| (id, (name, true_sec, region_id)))
+                .map(|(id, name, true_sec, region_id, constellation_id)| {
+                    (id, (name, true_sec, region_id, constellation_id))
+                })
                 .collect(),
+            neighbours: Self::neighbour_map(&agents.gates),
         })
     }
 }
@@ -1081,17 +1152,79 @@ mod tests {
     }
 
     #[test]
-    fn a_system_reports_the_region_it_is_in() {
+    fn a_system_reports_its_region_and_constellation() {
         let data = StaticData {
-            systems: [(30000142, ("Jita".to_string(), 0.9, 10000002))]
+            systems: [(30000142, ("Jita".to_string(), 0.9, 10000002, 20000020))]
                 .into_iter()
                 .collect(),
             ..Default::default()
         };
         assert_eq!(data.region_of_system(30000142), Some(10000002));
+        assert_eq!(data.constellation_of_system(30000142), Some(20000020));
         // Unknown systems answer nothing rather than guessing, so a caller cannot read a missing
         // mapping as a mismatch.
         assert_eq!(data.region_of_system(30000001), None);
+        assert_eq!(data.constellation_of_system(30000001), None);
+    }
+
+    /// Jita's constellation, Kimotoro, measured from ESI on 2026-10-10: the seven member systems
+    /// and every stargate that stays inside the constellation, one entry per direction as the SDE
+    /// lists them. Ids are 30000139 Urlen, 30000140 Maurasi, 30000141 Kisogo, 30000142 Jita,
+    /// 30000143 Niyabainen, 30000144 Perimeter, 30000145 New Caldari.
+    const KIMOTORO: &[(i32, i32)] = &[
+        (30000139, 30000141),
+        (30000139, 30000144),
+        (30000140, 30000142),
+        (30000140, 30000144),
+        (30000141, 30000139),
+        (30000142, 30000140),
+        (30000142, 30000143),
+        (30000142, 30000144),
+        (30000142, 30000145),
+        (30000143, 30000142),
+        (30000143, 30000144),
+        (30000143, 30000145),
+        (30000144, 30000139),
+        (30000144, 30000140),
+        (30000144, 30000142),
+        (30000144, 30000143),
+        (30000145, 30000142),
+        (30000145, 30000143),
+    ];
+
+    #[test]
+    fn hop_counts_from_jita_match_the_measured_constellation() {
+        let map = StaticData::neighbour_map(KIMOTORO);
+        let mut hops = std::collections::HashMap::from([(30000142, 0usize)]);
+        let mut frontier = vec![30000142];
+        while !frontier.is_empty() {
+            let mut next = Vec::new();
+            for system in frontier {
+                for to in map[&system].iter().copied() {
+                    if !hops.contains_key(&to) {
+                        hops.insert(to, hops[&system] + 1);
+                        next.push(to);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        // Every system in the constellation is reachable without leaving it.
+        let members: std::collections::HashSet<i32> =
+            KIMOTORO.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        assert_eq!(members.len(), 7);
+        for system in &members {
+            assert!(hops.contains_key(system), "{system} unreachable from Jita");
+        }
+        let count_at = |d: usize| members.iter().filter(|s| hops[*s] == d).count();
+        assert_eq!(count_at(0), 1, "Jita itself");
+        assert_eq!(
+            count_at(1),
+            4,
+            "Maurasi, Niyabainen, Perimeter, New Caldari"
+        );
+        assert_eq!(count_at(2), 1, "Urlen, reached through Perimeter");
+        assert_eq!(count_at(3), 1, "Kisogo, reached through Urlen");
     }
 
     #[test]
@@ -1108,6 +1241,9 @@ mod tests {
         // A file from before the version field existed reads as zero, not unreadable.
         std::fs::write(&file, r#"{"corporations":[]}"#).unwrap();
         assert_eq!(StaticData::agent_cache_version(&dir), Some(0));
+        // The previous shape, which has each system's region but no constellation or gates.
+        std::fs::write(&file, r#"{"version":2}"#).unwrap();
+        assert_eq!(StaticData::agent_cache_version(&dir), Some(2));
         std::fs::write(&file, format!(r#"{{"version":{AGENT_CACHE_VERSION}}}"#)).unwrap();
         assert_eq!(
             StaticData::agent_cache_version(&dir),
@@ -1125,6 +1261,9 @@ mod tests {
         for path in StaticData::files(&dir) {
             std::fs::write(path, "[]").unwrap();
         }
+        // A version 2 file exists but is stale, which is the case the gate needs to catch.
+        std::fs::write(StaticData::security_path(&dir), r#"{"version":2}"#).unwrap();
+        assert!(!StaticData::is_cached(&dir), "a stale shape is not cached");
         // All five files exist, so a purely existence-based check would say yes and then read a
         // mapping that is not there.
         assert!(!StaticData::is_cached(&dir));

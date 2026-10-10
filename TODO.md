@@ -223,11 +223,10 @@ needs the gate edges as well.
 
 What the data supports, after one assumed gap closed and one question opened:
 
-- [ ] Constellation membership is available and thrown away. `mapSolarSystems.jsonl` carries 17 fields
-      per system including `constellationID`, `stargateIDs`, `border`, `hub` and `securityClass`, and
-      `SdeSolarSystem` keeps four of them: id, name, true security and region. Keeping
-      `constellationID` is one more field, which means an `AgentCache` version bump so an existing
-      install reads as uncached and asks before refetching, the way the system-to-region mapping did.
+- [x] Constellation membership is loaded. `SdeSolarSystem` keeps `constellationID` beside the id, name,
+      true security and region it already kept, so `AgentCache.systems` is a five-element tuple and
+      `constellation_of_system` answers without a second source. Measured on a fresh download: 8,490
+      systems across 1,184 constellation ids.
 - [x] Gate edges are in the archive and simply not read. `mapStargates.jsonl` and
       `mapConstellations.jsonl` are among the archive's 102 files, confirmed by reading the zip's
       central directory with a range request rather than refetching 99 MB. `mapStargates` is the
@@ -235,8 +234,13 @@ What the data supports, after one assumed gap closed and one question opened:
       tool already performs. This corrects an earlier claim here that the archive holds no jumps file:
       that scan filtered names on containing `system` or `region`, and `mapStargates` matches neither,
       so the absence was an artifact of the filter rather than of the data.
-- [ ] No adjacency of any kind is loaded today: `extract_agent_cache` reads seven SDE files and none
-      of them links systems.
+- [x] Adjacency is loaded and cached. `mapStargates.jsonl` is parsed into `AgentCache.gates`, 13,978
+      records measured on a fresh download, and `StaticData::neighbour_map` turns them into a sorted,
+      deduplicated map carrying both directions, which held with zero asymmetric edges.
+      `AGENT_CACHE_VERSION` went to 3, so the version 2 cache an existing install holds now reads as
+      uncached and asks before refetching. Verified end to end against the real archive with `HOME`
+      pointed at a temporary directory: Jita's row reads `[30000142, "Jita", 0.945913, 10000002,
+      20000020]` and its seven gates include the four that stay inside Kimotoro.
 - [ ] Under uniform weighting, an incomplete membership list skews every number rather than merely
       omitting a row. A constellation missing one of its real systems has too small a denominator, so
       the remaining probabilities are inflated and a band can shift: if a four-system constellation is
@@ -245,16 +249,16 @@ What the data supports, after one assumed gap closed and one question opened:
       `GET /universe/constellations/{id}` answers the same question for a spot check, so a few
       constellations are worth comparing against the game before any table is trusted. What is not
       settled is whether mission destinations sit inside that set at all, below.
-- [ ] Whether a destination is a solar system at all is unresolved, and a claim here is withdrawn.
-      What is established about `Jita Space` is narrow: it is not among the 8,490 cached systems, and
-      `POST /universe/ids` returns no system by that name, resolving it only as a character. Two
-      sources agreeing there is no solar system called `Jita Space` is not evidence about mission
-      destinations generally. The wider question the phase depends on is whether a mission's location
-      is a system or a site inside one, which would move probability from systems to sites with their
-      own security values. The stronger claim that the data "excludes space systems" rested on 15
-      probed names, most of which may simply not be real systems, and is withdrawn pending the research
-      below. If destinations are systems, `mapStargates` pairs each gate with its two systems, so the
-      set is as complete as the archive.
+- [ ] Whether a destination is a solar system at all is unresolved, and the earlier claim about space
+      systems stays withdrawn. The gate data now argues against the separate-system reading. Of 8,490 systems, 5,268 have at
+      least one stargate and 3,222 have none: 2,604 in the 310xxxxx range, which is wormhole space and
+      expected to have no gates, 400 in the 320xxxxx and 340xxxxx ranges, and 217 in the 300xxxxx
+      range. No constellation mixes gated and gate-less systems, the 418 all-gate-less constellations
+      being wholly separate, so there is no pocket system sitting in Kimotoro beside Jita, which is the
+      shape a `Jita Space` destination would need. Two sources agree no such system exists: the cached
+      `mapSolarSystems` rows, and ESI's `POST /universe/ids`, which resolves the name only as a
+      character. The claim that the data "excludes space systems" stays withdrawn, since 14 of the 15
+      probed names may not be real.
 
 Two ESI endpoints are verified as useful here: `POST /route/{origin}/{destination}` with a JSON body
 carrying `preference` and `security_penalty` plus an `X-Compatibility-Date` header returns
@@ -300,25 +304,26 @@ Deferred to a later phase:
       agent that offers the ordinary mission, so excluding them is a rule about the mission variant and
       not about the agent: 502 such agents across 125 corporations sit in 457 systems. A system
       hosting one has two destination sets, and a single probability per destination would mix them.
-- [ ] Burner destinations cannot be named from this data, which the probe above answers rather than
-      leaves open: the cached `mapSolarSystems` rows are known space only, so other-space systems are
-      not reachable by name, id or security band. A burner phase needs a system source that includes
-      them, and until then it can state the chance of a mission being a burner mission without naming
-      where it would go.
+- [ ] Whether burner destinations can be named now hinges on the question above rather than on the
+      withdrawn probe. What is measured is that the non-known-space systems are in the set, and the
+      2,604 wormhole systems among them carry no stargate at all, so under a gate-only model they
+      cannot be a destination however they are named. If burner destinations turn out to be sites
+      rather than systems, this item goes away with the model instead of needing data.
 - [ ] The remaining agent rows, 6,128 of them, covering non-security divisions and the research,
       story, factional warfare, epic arc and event types.
 - [ ] Authenticated character data of any kind, and the CSV and JSON exports, neither of which has a
       shape today for a list of destinations per system.
-- [ ] Tests that do not depend on the missing data. The four-system example is a good fixture, because
-      it pins the band rounding (0.49, 0.5 and 0.51 to 0.5, and 0.6 to 0.6) and the weights (0.75 and
-      0.25), and its security marginal is the same for every topology and every agent system, which is
-      worth asserting as an invariant: uniform weight per system makes the security grouping a count,
-      so a change that alters it while the membership did not change is a bug in the rounding or the
-      weights. Distance grouping needs a graph, so it can be tested on a hand-built chain and star with
-      the table above as the expectation. Also: zero and negative bands, and the cache-version gate for
-      a file without a new field. No live terminal check is claimed for the display, per the standing
-      note on such checks.
-
+- [x] Tests for the layer now in place: `neighbour_map` sorted and free of duplicate edges, every gate
+      reaching back to where it came from, empty neighbours for an unknown system, hop counts over the
+      measured Kimotoro graph at 0, 1, 2 and 3 jumps for 1, 4, 1 and 1 systems, the region and
+      constellation accessors answering `None` rather than guessing, and the cache-version gate for both
+      a missing version key and the version 2 shape.
+- [ ] Tests still owed: the band grouping itself, which has rounding tests from the security filter but
+      no grouping that consumes them, and the invariant that the security marginal is the same for
+      every topology and every agent system, since uniform weight per system makes that grouping a
+      count — a change that moves it while membership did not is a bug in the rounding or the weights, and the four-system worked example as the fixture that exercises a
+      split band, since real Kimotoro is degenerate at 0.9 for all seven systems. No live terminal check
+      is claimed for the display, per the standing note on such checks.
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
