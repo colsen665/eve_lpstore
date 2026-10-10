@@ -37,6 +37,8 @@ pub struct SavedFilters {
     pub agent_level: Option<String>,
     pub agent_division: Option<String>,
     pub agent_type: Option<String>,
+    pub agent_region: Option<String>,
+    pub agent_system: Option<String>,
     pub faction: Option<String>,
     pub system: Option<String>,
     pub depth: Option<String>,
@@ -63,6 +65,8 @@ impl SavedFilters {
             agent_level: pick(&cli.agent_level, &self.agent_level),
             agent_division: pick(&cli.agent_division, &self.agent_division),
             agent_type: pick(&cli.agent_type, &self.agent_type),
+            agent_region: pick(&cli.agent_region, &self.agent_region),
+            agent_system: pick(&cli.agent_system, &self.agent_system),
             faction: pick(&cli.faction, &self.faction),
             system: pick(&cli.system, &self.system),
             depth: pick(&cli.depth, &self.depth),
@@ -82,6 +86,8 @@ impl From<&LpStoreOptions> for SavedFilters {
             agent_level: options.agent_level.clone(),
             agent_division: options.agent_division.clone(),
             agent_type: options.agent_type.clone(),
+            agent_region: options.agent_region.clone(),
+            agent_system: options.agent_system.clone(),
             faction: options.faction.clone(),
             system: options.system.clone(),
             depth: options.depth.clone(),
@@ -97,8 +103,10 @@ impl From<&LpStoreOptions> for SavedFilters {
 pub enum Loaded {
     /// No file is there, which is the state until a run is applied for the first time.
     Absent,
-    /// The filters from the last applied run.
-    Filters(SavedFilters),
+    /// The filters from the last applied run. Boxed because the struct is now eleven fields, and an
+    /// unboxed variant of its size next to a bare `String` is what `large_enum_variant` asks about:
+    /// the whole enum would be that large for the one case that reads it once at start-up.
+    Filters(Box<SavedFilters>),
     /// A file is there and cannot be used. The reason is for a log line.
     Unusable(String),
 }
@@ -139,7 +147,7 @@ pub fn load_from(file: &Path) -> Loaded {
         }
     };
     match serde_json::from_str::<SavedFilters>(&text) {
-        Ok(filters) => Loaded::Filters(filters),
+        Ok(filters) => Loaded::Filters(Box::new(filters)),
         Err(error) => Loaded::Unusable(format!("{} is not valid JSON: {}", file.display(), error)),
     }
 }
@@ -174,6 +182,8 @@ mod tests {
             agent_level: Some("4".to_string()),
             agent_division: Some("security".to_string()),
             agent_type: Some("research".to_string()),
+            agent_region: Some("Black Rise".to_string()),
+            agent_system: Some("4-3L53".to_string()),
             faction: Some("caldari".to_string()),
             system: Some("Jita".to_string()),
             depth: Some("25".to_string()),
@@ -267,7 +277,7 @@ mod tests {
             region: Some("Sinq Laison".to_string()),
             ..Default::default()
         };
-        let merged = Loaded::Filters(all_fields()).merge(cli);
+        let merged = Loaded::Filters(Box::new(all_fields())).merge(cli);
         assert_eq!(
             merged.region.as_deref(),
             Some("Sinq Laison"),
@@ -308,7 +318,7 @@ mod tests {
             max_inflight: Some("6".to_string()),
             ..Default::default()
         };
-        let merged = Loaded::Filters(all_fields()).merge(cli);
+        let merged = Loaded::Filters(Box::new(all_fields())).merge(cli);
         assert!(
             merged.expire,
             "--expire came from the command line and stays"
@@ -355,7 +365,7 @@ mod tests {
         // file has to hold the empties rather than keep the previous run's values.
         let saved = SavedFilters::from(&LpStoreOptions::default());
         assert_eq!(saved, SavedFilters::default());
-        let merged = Loaded::Filters(saved).merge(LpStoreOptions::default());
+        let merged = Loaded::Filters(Box::new(saved)).merge(LpStoreOptions::default());
         assert_eq!(merged, LpStoreOptions::default());
     }
 

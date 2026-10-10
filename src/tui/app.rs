@@ -88,6 +88,9 @@ pub struct RunInfo {
     /// The region prices are read from, as an id. The label above is for the header; this is what
     /// says whether a new run moved regions.
     pub region_id: i32,
+    /// The region the last run filtered agents by, if it filtered by one. `None` means no agent
+    /// region filter, which is not a place a system can have moved out of.
+    pub agent_region_id: Option<i32>,
     pub corporations: usize,
     pub filters: String,
     pub depth: usize,
@@ -98,6 +101,8 @@ pub struct App {
     pub region: String,
     /// The region of the run in progress, or the one last started. Zero until a run exists.
     pub region_id: i32,
+    /// The region the run in progress filtered agents by, if it named one.
+    pub agent_region_id: Option<i32>,
     pub corporations: usize,
     pub filters: String,
     pub depth: usize,
@@ -146,6 +151,7 @@ impl App {
         Self {
             region: String::new(),
             region_id: 0,
+            agent_region_id: None,
             corporations: 0,
             filters,
             depth: DEFAULT_DEPTH,
@@ -243,6 +249,7 @@ impl App {
     pub(crate) fn begin_run(&mut self, info: RunInfo) {
         self.region = info.region;
         self.region_id = info.region_id;
+        self.agent_region_id = info.agent_region_id;
         self.corporations = info.corporations;
         self.filters = info.filters;
         self.agent_filter = info.agent_filter;
@@ -681,6 +688,7 @@ mod tests {
         RunInfo {
             region: "The Forge".to_string(),
             region_id: 10000002,
+            agent_region_id: None,
             corporations: 3,
             filters: "none".to_string(),
             depth,

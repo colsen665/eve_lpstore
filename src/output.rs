@@ -49,6 +49,16 @@ pub fn print_resolution(resolved: &Resolved) {
             summary.kept, summary.removed
         );
     }
+    // The agent-side places are named because they decided which corporations are below. The market
+    // region on the next line is a different thing: where the prices are read from.
+    match (&resolved.agent_region, &resolved.agent_system) {
+        (Some(region), Some(system)) => {
+            println!("Agents in {}, system {}", region.label, system.label);
+        }
+        (Some(region), None) => println!("Agents in {}", region.label),
+        (None, Some(system)) => println!("Agents in {}", system.label),
+        (None, None) => {}
+    }
     println!("Region: {}", resolved.region_label);
     if resolved.corp_ids.len() > 1 {
         println!("Processing {} corporations...", resolved.corp_ids.len());

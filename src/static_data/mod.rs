@@ -398,14 +398,30 @@ pub struct AgentFilter {
     pub level: Option<i32>,
     pub division_id: Option<i32>,
     pub agent_type_id: Option<i32>,
+    /// Keeps agents standing in a system inside this region. The row carries only its system, so
+    /// the region is asked of the static data, which is why `matches` takes it.
+    pub region: Option<i32>,
+    /// Keeps agents standing in this exact system.
+    pub system: Option<i32>,
 }
 
 impl AgentFilter {
-    fn matches(&self, row: &AgentRow) -> bool {
+    /// Whether one agent row satisfies every condition set. They all have to hold for the **same**
+    /// agent, which is what the help text promises: a corporation with a level 1 agent in the region
+    /// and a level 5 agent elsewhere does not pass a region filter combined with a level.
+    ///
+    /// The two place conditions are written `is_none_or` and the four older ones `map_or(true, ..)`:
+    /// clippy asks for the newer form, and changing the lines this change did not touch would bury
+    /// the diff in reformatting.
+    fn matches(&self, row: &AgentRow, sdata: &StaticData) -> bool {
         self.security.map_or(true, |filter| filter.matches(row.tenths))
             && self.level.map_or(true, |level| row.level == level)
             && self.division_id.map_or(true, |division| row.division_id == division)
             && self.agent_type_id.map_or(true, |agent_type| row.agent_type_id == agent_type)
+            && self.system.is_none_or(|system| row.system_id == system)
+            && self.region.is_none_or(|region| {
+                sdata.region_of_system(row.system_id) == Some(region)
+            })
     }
 }
 
@@ -496,6 +512,15 @@ impl StaticData {
     /// Look up a region name by region ID.
     pub fn region_name(&self, region_id: i32) -> Option<&String> {
         self.region_names_by_id.get(&region_id)
+    }
+
+    /// How a region is written when it has to be named to a user: `The Forge (10000002)`, or the
+    /// bare id when the archive does not name it, which is the state before the data is fetched.
+    pub fn region_label(&self, region_id: i32) -> String {
+        match self.region_name(region_id) {
+            Some(name) => format!("{} ({})", name, region_id),
+            None => region_id.to_string(),
+        }
     }
 
     /// Look up a corporation ID by name (case-insensitive).
@@ -740,7 +765,7 @@ impl StaticData {
     pub fn corporation_passes(&self, corporation_id: i32, filter: &AgentFilter) -> bool {
         self.corporation_agents
             .get(&corporation_id)
-            .is_some_and(|rows| rows.iter().any(|row| filter.matches(row)))
+            .is_some_and(|rows| rows.iter().any(|row| filter.matches(row, self)))
     }
 
     /// Names of the systems where the corporation's agents matching the filter are, in data order.
@@ -804,7 +829,7 @@ impl StaticData {
             .into_iter()
             .flatten()
         {
-            if !filter.matches(row) {
+            if !filter.matches(row, self) {
                 continue;
             }
             if let Some((name, true_sec, _, _)) = self.systems.get(&row.system_id) {
@@ -1607,6 +1632,176 @@ mod tests {
                 (7, 3, 1, 23),
             ],
         )
+    }
+
+    /// One corporation with agents on both sides of a region border, so a region filter has
+    /// something to keep and something to drop. Systems 1 and 2 stand in region 7, systems 3 and 4
+    /// in region 8. Corporation 7 has an agent in each: level 1 in Alpha, level 2 in Beta, level 4
+    /// in Gamma, level 1 in Delta. Corporation 8 has none, so `corporation_passes` has a no answer.
+    fn two_regions() -> StaticData {
+        let rows: [FixtureRow; 4] = [
+            (1, ("Alpha", 0.49, 7, 100)),
+            (2, ("Beta", 0.50, 7, 100)),
+            (3, ("Gamma", 0.51, 8, 101)),
+            (4, ("Delta", 0.60, 8, 101)),
+        ];
+        fixture_with_agents(
+            &rows,
+            &[(7, 1, 1, 24), (7, 2, 2, 24), (7, 3, 4, 24), (7, 4, 1, 24)],
+        )
+    }
+
+    /// The ids a listing returned, in the order the listing gives them.
+    fn ids(listed: &[(i32, String, f64)]) -> Vec<i32> {
+        listed.iter().map(|(id, _, _)| *id).collect()
+    }
+
+    #[test]
+    fn a_region_filter_keeps_only_the_agents_standing_there() {
+        let data = two_regions();
+        let in_eight = AgentFilter {
+            region: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&data.security_agent_systems(7, &in_eight)),
+            vec![3, 4],
+            "the two agents across the border are kept"
+        );
+        let in_seven = AgentFilter {
+            region: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(ids(&data.security_agent_systems(7, &in_seven)), vec![1, 2]);
+        let everywhere = AgentFilter::default();
+        assert_eq!(
+            ids(&data.security_agent_systems(7, &everywhere)),
+            vec![1, 2, 3, 4],
+            "no region filter keeps all four, so the filter above removed something real"
+        );
+        assert!(
+            !data.corporation_passes(8, &in_eight),
+            "a corporation with no agents at all passes nothing, not even an empty filter"
+        );
+        assert!(data.corporation_passes(7, &in_eight), "and one does pass");
+    }
+
+    #[test]
+    fn a_system_filter_keeps_that_system_alone() {
+        let data = two_regions();
+        let only_two = AgentFilter {
+            system: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(ids(&data.security_agent_systems(7, &only_two)), vec![2]);
+        let unknown = AgentFilter {
+            system: Some(99),
+            ..Default::default()
+        };
+        assert!(
+            data.security_agent_systems(7, &unknown).is_empty(),
+            "a system nothing stands in keeps nothing"
+        );
+    }
+
+    #[test]
+    fn region_and_level_must_hold_for_the_same_agent() {
+        // Region 8 has a level 4 agent in Gamma and a level 1 agent in Delta; the level 2 agent is
+        // in Beta, which is in region 7. So region 8 together with level 2 matches no single agent,
+        // even though each half matches somewhere. The help text promises this reading: "All filters
+        // given must match the same agent."
+        let data = two_regions();
+        let pair = AgentFilter {
+            region: Some(8),
+            level: Some(2),
+            ..Default::default()
+        };
+        assert!(
+            !data.corporation_passes(7, &pair),
+            "neither half alone is the answer; they have to be one agent"
+        );
+        assert_eq!(
+            ids(&data.security_agent_systems(7, &pair)),
+            Vec::<i32>::new()
+        );
+        let matches = AgentFilter {
+            region: Some(8),
+            level: Some(4),
+            ..Default::default()
+        };
+        assert!(
+            data.corporation_passes(7, &matches),
+            "Gamma is level 4 in region 8"
+        );
+        assert_eq!(ids(&data.security_agent_systems(7, &matches)), vec![3]);
+    }
+
+    #[test]
+    fn a_system_named_outside_the_region_named_keeps_nothing() {
+        let data = two_regions();
+        assert_eq!(data.region_of_system(3), Some(8));
+        let agrees = AgentFilter {
+            region: Some(8),
+            system: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(ids(&data.security_agent_systems(7, &agrees)), vec![3]);
+        let disagrees = AgentFilter {
+            region: Some(7),
+            system: Some(3),
+            ..Default::default()
+        };
+        assert!(
+            data.security_agent_systems(7, &disagrees).is_empty(),
+            "the pair the view refuses to run anyway keeps nothing on its own"
+        );
+    }
+
+    /// A `StaticData` that names its two regions, so a filter written as a name can be resolved and
+    /// tested against the same ids the flag form produces.
+    fn named_places() -> StaticData {
+        let mut data = two_regions();
+        // Both maps the load fills: names by id for the header, ids by lowercase name for a filter
+        // typed as a name.
+        data.region_names_by_id =
+            HashMap::from([(7, "The Forge".to_string()), (8, "Black Rise".to_string())]);
+        data.regions = HashMap::from([("the forge".to_string(), 7), ("black rise".to_string(), 8)]);
+        data
+    }
+
+    #[test]
+    fn a_region_filter_resolved_from_a_name_is_the_same_filter_as_the_id() {
+        let data = named_places();
+        let by_name = data.region_id("black rise");
+        assert_eq!(by_name, Some(8), "region names ignore case");
+        let listed: Vec<i32> = data
+            .security_agent_systems(
+                7,
+                &AgentFilter {
+                    region: by_name,
+                    ..Default::default()
+                },
+            )
+            .iter()
+            .map(|(id, _, _)| *id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![3, 4],
+            "the name selects the region it resolves to"
+        );
+        assert_eq!(
+            data.security_agent_systems(
+                7,
+                &AgentFilter {
+                    region: Some(8),
+                    ..Default::default()
+                },
+            )
+            .len(),
+            listed.len(),
+            "and the id form agrees with it"
+        );
     }
 
     #[test]

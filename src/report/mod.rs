@@ -7,8 +7,8 @@ use crate::lpstore::{OfferError, OfferResult};
 use std::time::Duration;
 
 pub use options::{
-    DEFAULT_DEPTH, DEFAULT_REGION_ID, Field, FilterSummary, LpStoreOptions, OptionError, Parsed,
-    Resolved, SystemSummary,
+    DEFAULT_DEPTH, DEFAULT_REGION_ID, Field, FilterSummary, LpStoreOptions, NamedValue,
+    OptionError, Parsed, Resolved, SystemSummary,
 };
 pub use pipeline::run;
 

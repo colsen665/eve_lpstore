@@ -22,6 +22,10 @@ pub enum Field {
     AgentDivision,
     AgentType,
     Faction,
+    /// The region the agents must stand in, which is not the region prices are read from.
+    AgentRegion,
+    /// The system the agents must stand in.
+    AgentSystem,
     System,
     CacheMinutes,
     Concurrency,
@@ -38,6 +42,8 @@ impl Field {
             Field::AgentLevel => "--agent-level",
             Field::AgentDivision => "--agent-division",
             Field::AgentType => "--agent-type",
+            Field::AgentRegion => "--agent-region",
+            Field::AgentSystem => "--agent-system",
             Field::Faction => "--faction",
             Field::System => "--system",
             Field::CacheMinutes => "--cache-minutes",
@@ -69,7 +75,12 @@ pub struct LpStoreOptions {
     pub agent_level: Option<String>,
     pub agent_division: Option<String>,
     pub agent_type: Option<String>,
+    /// Region the agents must stand in, as an ID or name. Not the region prices come from, which is
+    /// `region`: a corporation's agents can be anywhere while its LP store is priced in one region.
+    pub agent_region: Option<String>,
     pub faction: Option<String>,
+    /// Solar system the agents must stand in, as an ID or name.
+    pub agent_system: Option<String>,
     /// Solar system as an ID or name. Prices come only from its NPC stations.
     pub system: Option<String>,
     pub cache_minutes: Option<String>,
@@ -103,6 +114,11 @@ pub struct Resolved {
     pub corp_ids: Vec<i32>,
     pub filter_summary: Option<FilterSummary>,
     pub agent_filter: AgentFilter,
+    /// The agent-side region and system filters as typed and resolved, kept apart from
+    /// `agent_filter` because the view asks what they name in order to say so, and to check the
+    /// pair against each other the way the market pair is checked.
+    pub agent_region: Option<NamedValue>,
+    pub agent_system: Option<NamedValue>,
     pub region_id: i32,
     pub region_label: String,
     pub system: Option<SystemSummary>,
@@ -121,6 +137,16 @@ pub struct Resolved {
 pub struct FilterSummary {
     pub kept: usize,
     pub removed: usize,
+}
+
+/// An ID-or-name filter value as typed, and the ID it resolved to. Used by the agent-side region and
+/// system filters, which name a place but price nothing, so they carry no station list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedValue {
+    pub value: String,
+    pub id: i32,
+    /// What the id is called in the static data, or the id itself when the data does not name it.
+    pub label: String,
 }
 
 /// The `--system` value as typed, the system it names, and the number of NPC stations in it.
@@ -221,16 +247,63 @@ impl LpStoreOptions {
             id
         });
 
+        // Both are resolved the way the market pair is: a number is taken as an ID without checking
+        // that it exists, and a name is looked up and refused when nothing answers it.
+        let agent_region = self.agent_region.as_deref().and_then(|value| {
+            let id = match value.parse::<i32>() {
+                Ok(id) => id,
+                Err(_) => match sdata.region_id(value) {
+                    Some(id) => id,
+                    None => {
+                        errors.push(OptionError {
+                            field: Field::AgentRegion,
+                            message: format!("Region '{}' not found", value),
+                        });
+                        return None;
+                    }
+                },
+            };
+            Some(NamedValue {
+                label: sdata.region_label(id),
+                value: value.to_string(),
+                id,
+            })
+        });
+        let agent_system =
+            self.agent_system
+                .as_deref()
+                .and_then(|value| match sdata.system_id(value) {
+                    Some(id) => Some(NamedValue {
+                        label: sdata
+                            .system_name(id)
+                            .cloned()
+                            .unwrap_or_else(|| id.to_string()),
+                        value: value.to_string(),
+                        id,
+                    }),
+                    None => {
+                        errors.push(OptionError {
+                            field: Field::AgentSystem,
+                            message: format!("Unknown --agent-system '{}'", value),
+                        });
+                        None
+                    }
+                });
+
         let agent_filter = AgentFilter {
             security: parsed.security,
             level: parsed.agent_level,
             division_id,
             agent_type_id,
+            region: agent_region.as_ref().map(|found| found.id),
+            system: agent_system.as_ref().map(|found| found.id),
         };
         let agent_filtering = parsed.security.is_some()
             || parsed.agent_level.is_some()
             || division_id.is_some()
-            || agent_type_id.is_some();
+            || agent_type_id.is_some()
+            || agent_region.is_some()
+            || agent_system.is_some();
         let mut filter_summary = None;
         if agent_filtering || faction_id.is_some() {
             let before = corp_ids.len();
@@ -257,10 +330,7 @@ impl LpStoreOptions {
             },
             None => DEFAULT_REGION_ID,
         };
-        let region_label = match sdata.region_name(region_id) {
-            Some(name) => format!("{} ({})", name, region_id),
-            None => region_id.to_string(),
-        };
+        let region_label = sdata.region_label(region_id);
 
         let (locations, system) = match self.system.as_deref() {
             Some(value) => match sdata.system_id(value) {
@@ -298,6 +368,8 @@ impl LpStoreOptions {
             corp_ids,
             filter_summary,
             agent_filter,
+            agent_region,
+            agent_system,
             region_id,
             region_label,
             system,
@@ -433,6 +505,110 @@ mod tests {
             .map(|e| e.field)
             .collect();
         assert_eq!(fields, [Field::Security, Field::AgentLevel, Field::Depth]);
+    }
+
+    // `resolve` asks the runtime for its worker count, so these run inside one.
+    #[tokio::test]
+    async fn an_agent_region_written_as_an_id_needs_no_static_data() {
+        // A numeric region is taken as an ID without checking it exists, exactly as `--region`
+        // behaves, so a typo in a number names a region nothing stands in rather than failing to
+        // parse. An empty `StaticData` is the state before the archive is fetched.
+        let sdata = StaticData::default();
+        let options = LpStoreOptions {
+            lpstore: Some("1000002".to_string()),
+            agent_region: Some("10000043".to_string()),
+            ..Default::default()
+        };
+        let resolved = options.resolve(&sdata).expect("an id is accepted");
+        assert_eq!(
+            resolved.agent_region,
+            Some(NamedValue {
+                value: "10000043".to_string(),
+                id: 10000043,
+                // Nothing names it on an empty cache, so the id stands in for the name.
+                label: "10000043".to_string(),
+            })
+        );
+        assert_eq!(resolved.agent_filter.region, Some(10000043));
+        assert_eq!(
+            resolved.agent_filter.system, None,
+            "only the region was asked for"
+        );
+    }
+
+    // `resolve` asks the runtime for its worker count, so these run inside one.
+    #[tokio::test]
+    async fn an_agent_region_name_no_data_names_is_refused_on_its_own_field() {
+        let sdata = StaticData::default();
+        let options = LpStoreOptions {
+            agent_region: Some("Black Rise".to_string()),
+            ..Default::default()
+        };
+        let errors = options
+            .resolve(&sdata)
+            .expect_err("no data names that region");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field, Field::AgentRegion);
+        assert_eq!(errors[0].message, "Region 'Black Rise' not found");
+    }
+
+    // `resolve` asks the runtime for its worker count, so these run inside one.
+    #[tokio::test]
+    async fn an_agent_system_no_data_names_is_refused_with_its_flag() {
+        // `--agent-system` must name a system the static data holds, as `--system` must, because a
+        // name is looked up rather than trusted.
+        let sdata = StaticData::default();
+        let options = LpStoreOptions {
+            agent_system: Some("Jita".to_string()),
+            ..Default::default()
+        };
+        let errors = options
+            .resolve(&sdata)
+            .expect_err("no data names that system");
+        assert_eq!(errors[0].field, Field::AgentSystem);
+        assert_eq!(errors[0].message, "Unknown --agent-system 'Jita'");
+    }
+
+    #[test]
+    fn the_agent_place_filters_are_flags_the_filter_list_carries() {
+        // The two new filters must reach the field list, or the view could not show an error beside
+        // the box that caused it.
+        assert_eq!(Field::AgentRegion.flag(), "--agent-region");
+        assert_eq!(Field::AgentSystem.flag(), "--agent-system");
+    }
+
+    // `resolve` asks the runtime for its worker count, so these run inside one.
+    #[tokio::test]
+    async fn an_agent_place_filter_narrows_the_corporations_even_on_an_empty_cache() {
+        // With no agent rows at all, a corporation list that would otherwise stand is filtered to
+        // nothing, which is the honest answer on a cache that cannot confirm an agent stands there.
+        let sdata = StaticData::default();
+        let plain = LpStoreOptions {
+            lpstore: Some("1000002".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            plain.resolve(&sdata).expect("no filters").corp_ids,
+            vec![1000002],
+            "without a filter the named corporation stands"
+        );
+        // A system, named or numbered, has to be one the data knows, so the narrowing is tested
+        // with a region id, which is taken as written.
+        let placed = LpStoreOptions {
+            lpstore: Some("1000002".to_string()),
+            agent_region: Some("10000043".to_string()),
+            ..Default::default()
+        };
+        let resolved = placed.resolve(&sdata).expect("a region id is accepted");
+        assert!(
+            resolved.corp_ids.is_empty(),
+            "the filter asked for a system nothing is recorded in"
+        );
+        assert_eq!(
+            resolved.filter_summary.map(|summary| summary.removed),
+            Some(1),
+            "and the view is told one corporation was removed"
+        );
     }
 
     #[test]

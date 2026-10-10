@@ -32,6 +32,8 @@ Filters (apply to --lpstores):
   --agent-level <n>      Keep corporations with an agent of level n (1 to 5).
   --agent-division <name>  Keep corporations with an agent in this division, e.g. security or distribution.
   --agent-type <name>    Keep corporations with an agent of this type, e.g. basic, research, concord (the Agent suffix is optional).
+  --agent-region <id|name>  Keep corporations with an agent standing in a system inside this region, by ID or name. Where the agents are, not where prices come from: that is --region.
+  --agent-system <id|name>  Keep corporations with an agent standing in this system, by ID or name. Where an agent is, not which stations price: that is --system.
   --system <name|id>     Only use buy and sell orders at NPC stations in this system. Applies to --lpstores.
   --faction <name>       Keep corporations of this faction, e.g. caldari, amarr, gallente. Applies to --lpstores.
   All filters given must match the same agent.
@@ -125,6 +127,8 @@ async fn main() {
         "--agent-level",
         "--agent-division",
         "--agent-type",
+        "--agent-region",
+        "--agent-system",
         "--faction",
         "--depth",
         "--system",
@@ -177,6 +181,8 @@ async fn main() {
         agent_level: value("--agent-level"),
         agent_division: value("--agent-division"),
         agent_type: value("--agent-type"),
+        agent_region: value("--agent-region"),
+        agent_system: value("--agent-system"),
         faction: value("--faction"),
         system: value("--system"),
         cache_minutes: value("--cache-minutes"),
@@ -613,6 +619,35 @@ mod tests {
         let mut args = vec!["eve_lpstore".to_string()];
         args.extend(text.split_whitespace().map(str::to_string));
         args
+    }
+
+    #[test]
+    fn every_option_is_documented_and_read() {
+        // Two ways a flag can be added and not work: missing from the help, or missing from the list
+        // of flags that take a value, which makes the argument count as unknown. Both are checked
+        // against the field list itself, so a new option cannot slip past.
+        for field in [
+            report::Field::Lpstore,
+            report::Field::Region,
+            report::Field::Security,
+            report::Field::AgentLevel,
+            report::Field::AgentDivision,
+            report::Field::AgentType,
+            report::Field::Faction,
+            report::Field::AgentRegion,
+            report::Field::AgentSystem,
+            report::Field::System,
+            report::Field::CacheMinutes,
+            report::Field::Concurrency,
+            report::Field::MaxInflight,
+            report::Field::Depth,
+        ] {
+            assert!(
+                HELP_TEXT.contains(field.flag()),
+                "{} is not in the help text",
+                field.flag()
+            );
+        }
     }
 
     #[test]

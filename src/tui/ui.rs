@@ -19,7 +19,11 @@ use ratatui::widgets::{
 use std::collections::VecDeque;
 
 pub const MIN_WIDTH: u16 = 80;
-pub const MIN_HEIGHT: u16 = 20;
+/// The smallest view the app draws. Twelve filter rows need room, and the notes under them carry
+/// the hints, the valid values and every validation error: at 20 rows the filters dialog had two
+/// rows of notes left, and adding the two agent place filters would have taken them to zero, which
+/// is a form that cannot report a mistake. 24 leaves four.
+pub const MIN_HEIGHT: u16 = 24;
 
 /// The width of the form's label column. `pub(crate)` so a test can check that a field's name fits
 /// it, which is what lets the market fields be grouped without a layout change.
@@ -731,6 +735,14 @@ fn hint(field: FormField, sdata: &StaticData) -> String {
             "0.5 exact, 0.5..0.7 for a range.\n0.5.. is at least, ..0.5 is at most. Blank for any."
                 .to_string()
         }
+        // Two lines like the market fields: what the filter keeps, then how to write it. The names
+        // of the two pairs are close enough to mix up, so each line says which side of it this is.
+        FormField::AgentRegion => {
+            "Keeps agents standing in it.\nID or name. Blank for any region.".to_string()
+        }
+        FormField::AgentSystem => {
+            "Keeps agents in this system.\nID or name. Blank for any system.".to_string()
+        }
         FormField::AgentLevel => "1 to 5. Blank for any.".to_string(),
         FormField::Division => format!(
             "One of: {}. Blank for any.",
@@ -769,8 +781,13 @@ fn suggestions(app: &App, sdata: &StaticData) -> Option<String> {
             .filter(|name| name.to_lowercase().contains(&query))
             .cloned()
             .collect(),
-        FormField::System => sdata
+        FormField::System | FormField::AgentSystem => sdata
             .system_names()
+            .filter(|name| name.to_lowercase().contains(&query))
+            .cloned()
+            .collect(),
+        FormField::AgentRegion => sdata
+            .region_names()
             .filter(|name| name.to_lowercase().contains(&query))
             .cloned()
             .collect(),
@@ -1432,7 +1449,7 @@ mod tests {
     use crate::tui::form::FilterForm;
     use eve_lpstore::ExpenseBreakdown;
     use eve_lpstore::esi::loyalty::LoyaltyOffer;
-    use eve_lpstore::report::{LpStoreOptions, Report};
+    use eve_lpstore::report::{Field, LpStoreOptions, OptionError, Report};
     use eve_lpstore::static_data::AgentFilter;
 
     #[test]
@@ -1651,6 +1668,7 @@ mod tests {
         let info = RunInfo {
             region: "The Forge".to_string(),
             region_id: 10000002,
+            agent_region_id: None,
             corporations: 1,
             filters: "none".to_string(),
             depth,
@@ -1960,6 +1978,26 @@ mod tests {
     }
 
     #[test]
+    fn the_focused_place_field_shows_both_hint_lines() {
+        // The market fields ask for two lines, and the place fields do the same. This is what the
+        // raised minimum height pays for: at the old size the second line had nowhere to go.
+        for (focus, syntax) in [
+            (FormField::AgentRegion, "ID or name. Blank for any region."),
+            (FormField::AgentSystem, "ID or name. Blank for any system."),
+        ] {
+            let mut app = App::new(LpStoreOptions::default());
+            let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+            form.focus = focus;
+            app.show_filters(form);
+            let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+            assert!(
+                text.contains(syntax),
+                "{focus:?} lost its syntax line: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn the_pane_words_a_collapsed_band_group() {
         // Sazdih from Bayuka: every route starts in the lowest system, so the route bands
         // collapse to one row while the destination lines still name Moh's own 0.5.
@@ -2203,6 +2241,64 @@ mod tests {
     }
 
     #[test]
+    fn the_new_place_fields_still_leave_room_for_a_hint() {
+        // The height this view accepts was raised when the form grew to twelve fields, so that the
+        // notes under them — hints, valid values, and every validation error — keep a row. If the
+        // form ever fills the dialog again, this fails rather than the error going unseen.
+        let mut app = App::new(LpStoreOptions::default());
+        let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        app.show_filters(form);
+        for focus in [FormField::AgentRegion, FormField::AgentSystem] {
+            app.form.focus = focus;
+            let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+            let hint = hint_line(focus, &StaticData::default());
+            assert!(
+                text.contains(&hint),
+                "{focus:?}'s hint was pushed out of a {}x{} dialog: {text}",
+                MIN_WIDTH,
+                MIN_HEIGHT
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_error_on_a_place_filter_is_visible_at_the_minimum_size() {
+        let mut app = App::new(LpStoreOptions::default());
+        let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        app.show_filters(form);
+        app.form.focus = FormField::AgentRegion;
+        app.form.set_errors(vec![OptionError {
+            field: Field::AgentRegion,
+            message: "Region 'Black Riss' not found".to_string(),
+        }]);
+        let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+        assert!(
+            text.contains("Region 'Black Riss' not found"),
+            "the error is on screen, not cut by the field rows: {text}"
+        );
+    }
+
+    #[test]
+    fn the_place_fields_offer_name_matches_like_the_market_ones() {
+        // The suggestions come from the static data, so an empty cache says so rather than nothing.
+        for (field, typed) in [
+            (FormField::AgentRegion, "bla"),
+            (FormField::AgentSystem, "jit"),
+        ] {
+            let mut app = App::new(LpStoreOptions::default());
+            let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+            form.focus = field;
+            match field {
+                FormField::AgentRegion => form.agent_region = typed.to_string(),
+                _ => form.agent_system = typed.to_string(),
+            }
+            app.show_filters(form);
+            let shown = suggestions(&app, &StaticData::default()).expect("a name field suggests");
+            assert_eq!(shown, "No matches", "{field:?} on empty data: {shown}");
+        }
+    }
+
+    #[test]
     fn the_missions_notes_fit_the_narrowest_view() {
         // The notes sit above the body and must not wrap, or they eat the rows they describe.
         for note in DESTINATION_NOTES {
@@ -2355,7 +2451,13 @@ mod tests {
             "0.5 exact, 0.5..0.7 for a range."
         );
         let detail = usize::from(MIN_WIDTH - 2) - (LABEL_WIDTH + VALUE_WIDTH + 2);
-        for field in [FormField::Region, FormField::System, FormField::Security] {
+        for field in [
+            FormField::Region,
+            FormField::System,
+            FormField::Security,
+            FormField::AgentRegion,
+            FormField::AgentSystem,
+        ] {
             let line = hint_line(field, &StaticData::default());
             assert!(
                 line.chars().count() <= detail,
@@ -2386,6 +2488,8 @@ mod tests {
         for label in [
             "Corporations",
             "Security",
+            "Agent region",
+            "Agent system",
             "Agent level",
             "Division",
             "Agent type",

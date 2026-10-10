@@ -384,20 +384,92 @@ fn clear_system_on_region_move(
 /// Only the dialog asks. `resolve` is shared with `--lpstores`, and the command line keeps its
 /// current behaviour of letting a mismatched pair through, which prices against nothing.
 fn system_outside_region(
-    system: Option<&eve_lpstore::report::SystemSummary>,
+    system: Option<&str>,
     region_id: i32,
     region_label: &str,
     region_of_system: Option<i32>,
+    field: eve_lpstore::report::Field,
 ) -> Option<eve_lpstore::report::OptionError> {
     let system = system?;
     let actual = region_of_system?;
     (actual != region_id).then(|| eve_lpstore::report::OptionError {
-        field: eve_lpstore::report::Field::System,
+        field,
         message: format!(
             "'{}' is not in {}. Clear the system, or choose a system in it",
-            system.value, region_label
+            system, region_label
         ),
     })
+}
+
+/// Whether the run's agent region differs from the region the last run filtered agents by. Both
+/// sides have to name a region: blanking the field lifts the filter rather than moving it, and a
+/// system left over under no region filter is not a mistake.
+fn agent_region_moved(
+    has_run: bool,
+    current: Option<i32>,
+    resolved: &Resolved,
+) -> Option<(i32, i32)> {
+    let previous = current?;
+    let now = resolved.agent_region.as_ref()?.id;
+    (has_run && previous != now).then_some((previous, now))
+}
+
+/// Clears `Agent system` when the agent region moved out from under it, and returns `false` if the
+/// form has to show errors instead of running. The same reasoning as the market pair: an agent
+/// system from the previous region can still be a real system, but the pair then keeps nothing, and
+/// the field the user did not touch is the one that has to go.
+fn clear_agent_system_on_region_move(
+    app: &mut App,
+    options: &mut LpStoreOptions,
+    resolved: &mut Resolved,
+    sdata: &StaticData,
+    has_run: bool,
+) -> bool {
+    if agent_region_moved(has_run, app.agent_region_id, resolved).is_none()
+        || resolved.agent_system.is_none()
+    {
+        return true;
+    }
+    options.agent_system = None;
+    app.form.agent_system = String::new();
+    match options.resolve(sdata) {
+        Ok(next) => {
+            *resolved = next;
+            app.push_log(LogLine {
+                text: "Cleared the agent system, which belonged to the previous agent region"
+                    .to_string(),
+                is_error: false,
+            });
+            true
+        }
+        Err(errors) => {
+            app.form.set_errors(errors);
+            false
+        }
+    }
+}
+
+/// The agent pair's own mismatch check. The error lands on the system field, as it does for the
+/// market pair, because the system is the value that cannot be reached from the region named.
+fn agent_system_outside_region(
+    resolved: &Resolved,
+    sdata: &StaticData,
+) -> Option<eve_lpstore::report::OptionError> {
+    let region = resolved.agent_region.as_ref()?;
+    let label = sdata.region_label(region.id);
+    system_outside_region(
+        resolved
+            .agent_system
+            .as_ref()
+            .map(|found| found.value.as_str()),
+        region.id,
+        &label,
+        resolved
+            .agent_system
+            .as_ref()
+            .and_then(|found| sdata.region_of_system(found.id)),
+        eve_lpstore::report::Field::AgentSystem,
+    )
 }
 
 /// Checks every field of the form. If they are all valid, a change to the depth only
@@ -428,14 +500,30 @@ fn apply(app: &mut App, session: &mut Session) {
     // also reported as an error: the user sees one change, not a complaint about a value they no
     // longer have.
     if let Some(error) = system_outside_region(
-        resolved.system.as_ref(),
+        resolved.system.as_ref().map(|system| system.value.as_str()),
         resolved.region_id,
         &resolved.region_label,
         resolved
             .system
             .as_ref()
             .and_then(|system| session.sdata.region_of_system(system.system_id)),
+        eve_lpstore::report::Field::System,
     ) {
+        app.form.set_errors(vec![error]);
+        return;
+    }
+    // The agent pair is checked the same way, after its own clearing step, so a system the region
+    // move already removed is not also reported.
+    if !clear_agent_system_on_region_move(
+        app,
+        &mut options,
+        &mut resolved,
+        &session.sdata,
+        session.current.is_some(),
+    ) {
+        return;
+    }
+    if let Some(error) = agent_system_outside_region(&resolved, &session.sdata) {
         app.form.set_errors(vec![error]);
         return;
     }
@@ -513,6 +601,7 @@ fn run_info(resolved: &Resolved, filters: String) -> RunInfo {
     RunInfo {
         region: resolved.region_label.clone(),
         region_id: resolved.region_id,
+        agent_region_id: resolved.agent_region.as_ref().map(|found| found.id),
         corporations: resolved.corp_ids.len(),
         filters,
         depth: resolved.depth,
@@ -542,6 +631,8 @@ fn filter_summary(options: &LpStoreOptions) -> String {
     let filters = [
         ("--lpstore", &options.lpstore),
         ("--security", &options.security),
+        ("--agent-region", &options.agent_region),
+        ("--agent-system", &options.agent_system),
         ("--agent-level", &options.agent_level),
         ("--agent-division", &options.agent_division),
         ("--agent-type", &options.agent_type),
@@ -574,6 +665,7 @@ mod tests {
         let info = RunInfo {
             region: "The Forge".to_string(),
             region_id: 10000002,
+            agent_region_id: None,
             corporations: 1,
             filters: "none".to_string(),
             depth: 10,
@@ -669,6 +761,94 @@ mod tests {
         let error = app.export_error.expect("the reason shows beside the name");
         assert!(error.contains("Could not write"), "{}", error);
         assert!(error.contains("no/such/directory"), "{}", error);
+    }
+
+    #[test]
+    fn the_place_filters_appear_in_the_header_summary() {
+        let options = LpStoreOptions {
+            security: Some("0.5..0.7".to_string()),
+            agent_region: Some("Black Rise".to_string()),
+            agent_system: Some("4-3L53".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            filter_summary(&options),
+            "--security 0.5..0.7 --agent-region Black Rise --agent-system 4-3L53",
+            "the two sit beside the other agent filters, in the order the form shows them"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_agent_pair_is_reported_on_the_agent_system() {
+        // The same rule as the market pair, landing on the field that cannot be reached from the
+        // region named: 4-3L53 is in Black Rise, so filtering agents by The Forge is the mistake.
+        let error = system_outside_region(
+            Some("4-3L53"),
+            10000002,
+            "The Forge (10000002)",
+            Some(10000014),
+            eve_lpstore::report::Field::AgentSystem,
+        )
+        .expect("a mismatch is reported");
+        assert_eq!(error.field, eve_lpstore::report::Field::AgentSystem);
+        assert!(
+            error.message.contains("'4-3L53' is not in The Forge"),
+            "{}",
+            error.message
+        );
+        assert!(
+            system_outside_region(
+                Some("4-3L53"),
+                10000014,
+                "Black Rise (10000014)",
+                Some(10000014),
+                eve_lpstore::report::Field::AgentSystem
+            )
+            .is_none(),
+            "a pair that agrees is not a mistake"
+        );
+    }
+
+    #[test]
+    fn an_agent_region_only_moves_when_both_sides_name_one() {
+        let in_forge = eve_lpstore::report::NamedValue {
+            value: "The Forge".to_string(),
+            id: 10000002,
+            label: "The Forge (10000002)".to_string(),
+        };
+        let in_domain = eve_lpstore::report::NamedValue {
+            value: "Domain".to_string(),
+            id: 10000043,
+            label: "Domain (10000043)".to_string(),
+        };
+        let mut moved = resolved_fixture();
+        assert_eq!(
+            agent_region_moved(true, None, &moved),
+            None,
+            "no previous region"
+        );
+        moved.agent_region = Some(in_forge.clone());
+        assert_eq!(
+            agent_region_moved(true, None, &moved),
+            None,
+            "blanking the field lifts the filter rather than moving it"
+        );
+        assert_eq!(
+            agent_region_moved(true, Some(10000002), &moved),
+            None,
+            "the same region typed differently has not moved"
+        );
+        moved.agent_region = Some(in_domain.clone());
+        assert_eq!(
+            agent_region_moved(true, Some(10000002), &moved),
+            Some((10000002, 10000043)),
+            "and a different one has"
+        );
+        assert_eq!(
+            agent_region_moved(false, Some(10000002), &moved),
+            None,
+            "before the first run there is nothing to have moved"
+        );
     }
 
     #[test]
@@ -779,6 +959,7 @@ mod tests {
         app.start_run(RunInfo {
             region: "The Forge".to_string(),
             region_id: 10000002,
+            agent_region_id: None,
             corporations: 1,
             filters: "none".to_string(),
             depth: 10,
@@ -871,9 +1052,14 @@ mod tests {
             stations: 1,
         };
         // Jita is in The Forge, so pricing in Domain is the mistake.
-        let error =
-            system_outside_region(Some(&system), 10000043, "Domain (10000043)", Some(10000002))
-                .expect("a mismatch is reported");
+        let error = system_outside_region(
+            Some(system.value.as_str()),
+            10000043,
+            "Domain (10000043)",
+            Some(10000002),
+            eve_lpstore::report::Field::System,
+        )
+        .expect("a mismatch is reported");
         assert_eq!(error.field, eve_lpstore::report::Field::System);
         assert!(
             error.message.contains("'Jita' is not in Domain"),
@@ -895,10 +1081,26 @@ mod tests {
             stations: 1,
         };
         assert!(
-            system_outside_region(Some(&system), 10000002, "The Forge", Some(10000002)).is_none(),
+            system_outside_region(
+                Some(system.value.as_str()),
+                10000002,
+                "The Forge",
+                Some(10000002),
+                eve_lpstore::report::Field::System,
+            )
+            .is_none(),
             "the same region is not a mismatch"
         );
-        assert!(system_outside_region(None, 10000002, "The Forge", None).is_none());
+        assert!(
+            system_outside_region(
+                None,
+                10000002,
+                "The Forge",
+                None,
+                eve_lpstore::report::Field::System
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -910,7 +1112,16 @@ mod tests {
             system_id: 30000142,
             stations: 1,
         };
-        assert!(system_outside_region(Some(&system), 10000043, "Domain", None).is_none());
+        assert!(
+            system_outside_region(
+                Some(system.value.as_str()),
+                10000043,
+                "Domain",
+                None,
+                eve_lpstore::report::Field::System
+            )
+            .is_none()
+        );
     }
 
     /// The re-resolve goes through `resolve`, which reads the runtime's worker count for the
@@ -1052,6 +1263,8 @@ mod tests {
             corp_ids: vec![1000002],
             filter_summary: None,
             agent_filter: AgentFilter::default(),
+            agent_region: None,
+            agent_system: None,
             region_id: 10000002,
             region_label: "The Forge".to_string(),
             system: None,

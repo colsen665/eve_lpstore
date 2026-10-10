@@ -9,6 +9,8 @@ pub enum FormField {
     Corporations,
     Region,
     Security,
+    AgentRegion,
+    AgentSystem,
     AgentLevel,
     Division,
     Type,
@@ -21,10 +23,13 @@ pub enum FormField {
 impl FormField {
     /// The fields in the order the dialog shows them and Tab moves through them. Grouped: which
     /// corporations and agents, then where the prices are read from, then how the results are
-    /// shown. `Expire` stays last so the space toggle is always the final stop.
-    pub const ALL: [FormField; 10] = [
+    /// shown. The two agent place filters sit directly below `Security`, which is also a filter on
+    /// where an agent stands, and `Expire` stays last so the space toggle is always the final stop.
+    pub const ALL: [FormField; 12] = [
         FormField::Corporations,
         FormField::Security,
+        FormField::AgentRegion,
+        FormField::AgentSystem,
         FormField::AgentLevel,
         FormField::Division,
         FormField::Type,
@@ -39,6 +44,10 @@ impl FormField {
         match self {
             FormField::Corporations => "Corporations",
             FormField::Security => "Security",
+            // Named for the agents they filter, standing beside the market pair further down, which
+            // is named for the prices it moves.
+            FormField::AgentRegion => "Agent region",
+            FormField::AgentSystem => "Agent system",
             FormField::AgentLevel => "Agent level",
             FormField::Division => "Division",
             FormField::Type => "Agent type",
@@ -62,6 +71,8 @@ impl FormField {
             Field::AgentLevel => Some(FormField::AgentLevel),
             Field::AgentDivision => Some(FormField::Division),
             Field::AgentType => Some(FormField::Type),
+            Field::AgentRegion => Some(FormField::AgentRegion),
+            Field::AgentSystem => Some(FormField::AgentSystem),
             Field::Faction => Some(FormField::Faction),
             Field::System => Some(FormField::System),
             Field::Depth => Some(FormField::Depth),
@@ -77,6 +88,8 @@ pub struct FilterForm {
     pub corporations: String,
     pub region: String,
     pub security: String,
+    pub agent_region: String,
+    pub agent_system: String,
     pub agent_level: String,
     pub division: String,
     pub agent_type: String,
@@ -96,6 +109,8 @@ impl FilterForm {
             corporations: text(&options.lpstore),
             region: text(&options.region),
             security: text(&options.security),
+            agent_region: text(&options.agent_region),
+            agent_system: text(&options.agent_system),
             agent_level: text(&options.agent_level),
             division: text(&options.agent_division),
             agent_type: text(&options.agent_type),
@@ -132,6 +147,8 @@ impl FilterForm {
             lpstore: blank_to_none(&self.corporations),
             region: blank_to_none(&self.region),
             security: blank_to_none(&self.security),
+            agent_region: blank_to_none(&self.agent_region),
+            agent_system: blank_to_none(&self.agent_system),
             agent_level: blank_to_none(&self.agent_level),
             agent_division: blank_to_none(&self.division),
             agent_type: blank_to_none(&self.agent_type),
@@ -148,6 +165,8 @@ impl FilterForm {
             FormField::Corporations => self.corporations.as_str(),
             FormField::Region => self.region.as_str(),
             FormField::Security => self.security.as_str(),
+            FormField::AgentRegion => self.agent_region.as_str(),
+            FormField::AgentSystem => self.agent_system.as_str(),
             FormField::AgentLevel => self.agent_level.as_str(),
             FormField::Division => self.division.as_str(),
             FormField::Type => self.agent_type.as_str(),
@@ -163,6 +182,8 @@ impl FilterForm {
             FormField::Corporations => Some(&mut self.corporations),
             FormField::Region => Some(&mut self.region),
             FormField::Security => Some(&mut self.security),
+            FormField::AgentRegion => Some(&mut self.agent_region),
+            FormField::AgentSystem => Some(&mut self.agent_system),
             FormField::AgentLevel => Some(&mut self.agent_level),
             FormField::Division => Some(&mut self.division),
             FormField::Type => Some(&mut self.agent_type),
@@ -257,6 +278,8 @@ impl FilterForm {
             FormField::Corporations => self.corporations.rsplit(',').next().unwrap_or(""),
             FormField::Region => self.region.as_str(),
             FormField::System => self.system.as_str(),
+            FormField::AgentRegion => self.agent_region.as_str(),
+            FormField::AgentSystem => self.agent_system.as_str(),
             _ => return None,
         };
         let query = query.trim();
@@ -504,5 +527,113 @@ mod tests {
         assert_eq!(position(FormField::Region) + 1, position(FormField::System));
         assert!(position(FormField::Faction) < position(FormField::Region));
         assert!(position(FormField::Region) < position(FormField::Depth));
+    }
+
+    #[test]
+    fn the_two_place_filters_sit_directly_below_security() {
+        let names: Vec<&str> = FormField::ALL.iter().map(|field| field.label()).collect();
+        assert_eq!(
+            &names[1..5],
+            ["Security", "Agent region", "Agent system", "Agent level"],
+            "the dialog order is what the request asked for: {names:?}"
+        );
+        assert_eq!(FormField::ALL.len(), 12);
+    }
+
+    #[test]
+    fn the_new_fields_round_trip_through_the_options() {
+        let options = LpStoreOptions {
+            agent_region: Some("Black Rise".to_string()),
+            agent_system: Some("4-3L53".to_string()),
+            ..Default::default()
+        };
+        let form = FilterForm::from_options(&options);
+        assert_eq!(form.agent_region, "Black Rise");
+        assert_eq!(form.agent_system, "4-3L53");
+        let back = form.to_options(&LpStoreOptions::default());
+        assert_eq!(back.agent_region, Some("Black Rise".to_string()));
+        assert_eq!(back.agent_system, Some("4-3L53".to_string()));
+    }
+
+    #[test]
+    fn blank_place_fields_are_no_filter() {
+        let mut form = FilterForm::from_options(&LpStoreOptions::default());
+        form.agent_region = "   ".to_string();
+        let options = form.to_options(&LpStoreOptions::default());
+        assert_eq!(options.agent_region, None, "spaces are not a region");
+    }
+
+    #[test]
+    fn both_place_fields_offer_name_matches() {
+        let mut form = FilterForm::from_options(&LpStoreOptions {
+            agent_region: Some("bla".to_string()),
+            ..Default::default()
+        });
+        form.focus = FormField::AgentRegion;
+        assert_eq!(form.name_query(), Some("bla"));
+        form.focus = FormField::AgentSystem;
+        form.agent_system = "Jita".to_string();
+        assert_eq!(form.name_query(), Some("Jita"));
+    }
+
+    #[test]
+    fn tab_walks_the_places_without_skipping_or_repeating() {
+        let mut form = FilterForm::from_options(&LpStoreOptions::default());
+        form.focus = FormField::Security;
+        form.next_field();
+        assert_eq!(form.focus, FormField::AgentRegion);
+        form.next_field();
+        assert_eq!(form.focus, FormField::AgentSystem);
+        form.next_field();
+        assert_eq!(
+            form.focus,
+            FormField::AgentLevel,
+            "the market fields stay where they were"
+        );
+        form.previous_field();
+        assert_eq!(form.focus, FormField::AgentSystem);
+    }
+
+    #[test]
+    fn typing_and_backspacing_land_in_the_right_box() {
+        let mut form = FilterForm::from_options(&LpStoreOptions::default());
+        form.focus = FormField::AgentSystem;
+        for c in "Jita".chars() {
+            form.type_char(c);
+        }
+        assert_eq!(form.agent_system, "Jita");
+        form.backspace();
+        assert_eq!(form.agent_system, "Jit");
+        form.clear_focused();
+        assert_eq!(form.agent_system, "");
+        assert_eq!(form.agent_region, "", "the other box is untouched");
+    }
+
+    #[test]
+    fn a_problem_about_an_agent_place_lands_on_its_field() {
+        let mut form = FilterForm::from_options(&LpStoreOptions::default());
+        form.set_errors(vec![
+            OptionError {
+                field: Field::AgentRegion,
+                message: "Region 'Nope' not found".to_string(),
+            },
+            OptionError {
+                field: Field::AgentSystem,
+                message: "Unknown --agent-system 'Nope'".to_string(),
+            },
+        ]);
+        assert_eq!(
+            form.error_for(FormField::AgentRegion),
+            Some("Region 'Nope' not found".to_string())
+        );
+        assert_eq!(
+            form.error_for(FormField::AgentSystem),
+            Some("Unknown --agent-system 'Nope'".to_string())
+        );
+        assert_eq!(
+            form.error_for(FormField::Region),
+            None,
+            "the market fields stay clean"
+        );
     }
 }
