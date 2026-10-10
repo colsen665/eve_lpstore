@@ -372,6 +372,33 @@ fn clear_system_on_region_move(
     }
 }
 
+/// Whether the system the run prices from is inside the region it prices in, as an error to show on
+/// the field, or `None` when there is no problem or nothing to check.
+///
+/// Takes the system's region rather than the static data, so the rule is testable on its own. An
+/// unknown region is not reported: `resolve` only accepts systems the static data names, so a
+/// missing answer means the mapping is not there, as it is on a cache from an older build, and
+/// complaining would stop a run for something the user did nothing wrong about.
+///
+/// Only the dialog asks. `resolve` is shared with `--lpstores`, and the command line keeps its
+/// current behaviour of letting a mismatched pair through, which prices against nothing.
+fn system_outside_region(
+    system: Option<&eve_lpstore::report::SystemSummary>,
+    region_id: i32,
+    region_label: &str,
+    region_of_system: Option<i32>,
+) -> Option<eve_lpstore::report::OptionError> {
+    let system = system?;
+    let actual = region_of_system?;
+    (actual != region_id).then(|| eve_lpstore::report::OptionError {
+        field: eve_lpstore::report::Field::System,
+        message: format!(
+            "'{}' is not in {}. Clear the system, or choose a system in it",
+            system.value, region_label
+        ),
+    })
+}
+
 /// Checks every field of the form. If they are all valid, a change to the depth only
 /// re-renders, and any other change replaces the current run with one using the new filters.
 /// Otherwise the errors are shown beside their fields and nothing runs.
@@ -394,6 +421,21 @@ fn apply(app: &mut App, session: &mut Session) {
         session.current.is_some(),
     );
     if !keep_going {
+        return;
+    }
+    // Checked after the clearing above, so a system that the region move already removed is not
+    // also reported as an error: the user sees one change, not a complaint about a value they no
+    // longer have.
+    if let Some(error) = system_outside_region(
+        resolved.system.as_ref(),
+        resolved.region_id,
+        &resolved.region_label,
+        resolved
+            .system
+            .as_ref()
+            .and_then(|system| session.sdata.region_of_system(system.system_id)),
+    ) {
+        app.form.set_errors(vec![error]);
         return;
     }
     if is_repeat(session.current.is_some(), &options, &app.applied) {
@@ -820,6 +862,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_system_outside_the_priced_region_is_reported_on_its_own_field() {
+        let system = eve_lpstore::report::SystemSummary {
+            value: "Jita".to_string(),
+            system_id: 30000142,
+            stations: 1,
+        };
+        // Jita is in The Forge, so pricing in Domain is the mistake.
+        let error =
+            system_outside_region(Some(&system), 10000043, "Domain (10000043)", Some(10000002))
+                .expect("a mismatch is reported");
+        assert_eq!(error.field, eve_lpstore::report::Field::System);
+        assert!(
+            error.message.contains("'Jita' is not in Domain"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("Clear the system"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn a_system_inside_the_region_and_no_system_both_pass() {
+        let system = eve_lpstore::report::SystemSummary {
+            value: "Jita".to_string(),
+            system_id: 30000142,
+            stations: 1,
+        };
+        assert!(
+            system_outside_region(Some(&system), 10000002, "The Forge", Some(10000002)).is_none(),
+            "the same region is not a mismatch"
+        );
+        assert!(system_outside_region(None, 10000002, "The Forge", None).is_none());
+    }
+
+    #[test]
+    fn an_unknown_system_region_is_not_reported_as_a_mismatch() {
+        // A cache from an older build has no mapping, and stopping the run for that would blame the
+        // user for a file they did not choose.
+        let system = eve_lpstore::report::SystemSummary {
+            value: "Jita".to_string(),
+            system_id: 30000142,
+            stations: 1,
+        };
+        assert!(system_outside_region(Some(&system), 10000043, "Domain", None).is_none());
+    }
+
     /// The re-resolve goes through `resolve`, which reads the runtime's worker count for the
     /// concurrency default, so this one needs a runtime rather than a plain test.
     #[tokio::test]
@@ -838,6 +930,7 @@ mod tests {
             region_id: 10000043,
             system: Some(eve_lpstore::report::SystemSummary {
                 value: "Jita".to_string(),
+                system_id: 30000142,
                 stations: 1,
             }),
             locations: Some(stations.into()),
@@ -873,6 +966,7 @@ mod tests {
         let mut resolved = Resolved {
             system: Some(eve_lpstore::report::SystemSummary {
                 value: "Jita".to_string(),
+                system_id: 30000142,
                 stations: 1,
             }),
             ..resolved_fixture()
@@ -907,6 +1001,7 @@ mod tests {
             region_id: 10000043,
             system: Some(eve_lpstore::report::SystemSummary {
                 value: "Jita".to_string(),
+                system_id: 30000142,
                 stations: 1,
             }),
             ..resolved_fixture()

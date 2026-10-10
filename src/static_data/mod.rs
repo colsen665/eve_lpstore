@@ -202,13 +202,15 @@ struct SdeNpcStation {
     solar_system_id: i32,
 }
 
-/// Solar system record, used for its name and security status.
+/// Solar system record, used for its name, security status, and owning region.
 #[derive(Debug, Deserialize)]
 struct SdeSolarSystem {
     #[serde(rename = "_key")]
     system_id: i32,
     #[serde(rename = "securityStatus")]
     security_status: f64,
+    #[serde(rename = "regionID")]
+    region_id: i32,
     name: SdeSystemName,
 }
 
@@ -274,14 +276,25 @@ pub struct AgentRow {
 /// The agent data cached from the SDE.
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentCache {
+    /// Bumped whenever the meaning of a stored field changes, so an old cache is refetched rather
+    /// than read with the new shape. Version 2 added the owning region to each system. A cache
+    /// written before this field existed has no key, which `serde(default)` reads as zero.
+    #[serde(default)]
+    version: u32,
     corporations: Vec<(i32, Vec<AgentRow>)>,
     divisions: Vec<(i32, String)>,
     agent_types: Vec<(i32, String)>,
-    systems: Vec<(i32, String, f64)>,
+    /// Id, name, displayed security, and the region the system is in.
+    systems: Vec<(i32, String, f64, i32)>,
     corporation_factions: Vec<(i32, i32)>,
     factions: Vec<(i32, String)>,
     stations: Vec<(i64, i32)>,
 }
+
+/// The shape `load` expects in the cached agent data. A file from an older build, or one written
+/// before the version field existed, is treated as missing: the caller is then asked to download,
+/// which is cheaper than silently reading a mapping that is not there.
+const AGENT_CACHE_VERSION: u32 = 2;
 
 /// NPC corporation record, used for its faction.
 #[derive(Debug, Deserialize)]
@@ -336,21 +349,42 @@ pub struct StaticData {
     corporation_agents: HashMap<i32, Vec<AgentRow>>,
     divisions: Vec<(i32, String)>,
     agent_types: Vec<(i32, String)>,
-    systems: HashMap<i32, (String, f64)>,
+    systems: HashMap<i32, (String, f64, i32)>,
     corporation_factions: HashMap<i32, i32>,
     factions: Vec<(i32, String)>,
     stations: Vec<(i64, i32)>,
 }
 
 impl StaticData {
-    /// Whether every file [`load`](Self::load) reads from disk is there. It says nothing about
-    /// whether they parse, so a `true` answer can still fail to load.
+    /// Whether every file [`load`](Self::load) reads from disk is there and current. It says nothing
+    /// about whether they parse, so a `true` answer can still fail to load.
     ///
     /// `load` downloads on its own when this is `false`, which is a several hundred megabyte fetch
     /// of the whole static data archive. Callers that want to ask before spending that, rather than
     /// finding out silently, check this first.
+    ///
+    /// The agent file is read rather than merely stat-ed, because a cache written by an older build
+    /// exists and is the wrong shape: a version field is how that is told apart, and it cannot be
+    /// seen without opening the file.
     pub fn is_cached(data: &Path) -> bool {
-        Self::files(data).iter().all(|path| path.exists())
+        if !Self::files(data).iter().all(|path| path.exists()) {
+            return false;
+        }
+        Self::agent_cache_version(data) == Some(AGENT_CACHE_VERSION)
+    }
+
+    /// The version recorded in the cached agent data, or `None` when it cannot be read. A file from
+    /// before the version field existed reports zero, not `None`, so only an unreadable file is
+    /// `None`.
+    fn agent_cache_version(data: &Path) -> Option<u32> {
+        let text = std::fs::read_to_string(Self::security_path(data)).ok()?;
+        #[derive(Deserialize)]
+        struct VersionOnly {
+            #[serde(default)]
+            version: u32,
+        }
+        let parsed: VersionOnly = serde_json::from_str(&text).ok()?;
+        Some(parsed.version)
     }
 
     /// Load static data from the local cache under `data`.
@@ -402,7 +436,12 @@ impl StaticData {
 
     /// Get all known solar system names.
     pub fn system_names(&self) -> impl Iterator<Item = &String> {
-        self.systems.values().map(|(name, _)| name)
+        self.systems.values().map(|(name, _, _)| name)
+    }
+
+    /// The region a solar system is in, or `None` when the system is not known.
+    pub fn region_of_system(&self, system_id: i32) -> Option<i32> {
+        self.systems.get(&system_id).map(|(_, _, region)| *region)
     }
 
     /// Look up a type name by type ID.
@@ -454,7 +493,7 @@ impl StaticData {
             if !filter.matches(row) {
                 continue;
             }
-            if let Some((name, true_sec)) = self.systems.get(&row.system_id) {
+            if let Some((name, true_sec, _)) = self.systems.get(&row.system_id) {
                 if !names.iter().any(|(existing, _)| existing == name) {
                     names.push((name.clone(), *true_sec));
                 }
@@ -472,7 +511,7 @@ impl StaticData {
         }
         self.systems
             .iter()
-            .find(|(_, (name, _))| name.eq_ignore_ascii_case(value))
+            .find(|(_, (name, _, _))| name.eq_ignore_ascii_case(value))
             .map(|(id, _)| *id)
     }
 
@@ -752,7 +791,12 @@ impl StaticData {
                 continue;
             }
             let record: SdeSolarSystem = serde_json::from_str(line).map_err(EsiError::Deserialize)?;
-            system_names.push((record.system_id, record.name.en, record.security_status));
+            system_names.push((
+                record.system_id,
+                record.name.en,
+                record.security_status,
+                record.region_id,
+            ));
             system_security.insert(record.system_id, record.security_status);
         }
 
@@ -831,6 +875,7 @@ impl StaticData {
             .collect();
 
         Ok(AgentCache {
+            version: AGENT_CACHE_VERSION,
             corporations: corporations
                 .into_iter()
                 .map(|(corporation_id, rows)| (corporation_id, rows.into_iter().collect()))
@@ -902,7 +947,7 @@ impl StaticData {
             systems: agents
                 .systems
                 .into_iter()
-                .map(|(id, name, true_sec)| (id, (name, true_sec)))
+                .map(|(id, name, true_sec, region_id)| (id, (name, true_sec, region_id)))
                 .collect(),
         })
     }
@@ -1033,5 +1078,62 @@ mod tests {
         assert_eq!(displayed_security(0.5), 5);
         assert_eq!(displayed_security(-0.5), -5);
         assert_eq!(displayed_security(1.0), 10);
+    }
+
+    #[test]
+    fn a_system_reports_the_region_it_is_in() {
+        let data = StaticData {
+            systems: [(30000142, ("Jita".to_string(), 0.9, 10000002))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(data.region_of_system(30000142), Some(10000002));
+        // Unknown systems answer nothing rather than guessing, so a caller cannot read a missing
+        // mapping as a mismatch.
+        assert_eq!(data.region_of_system(30000001), None);
+    }
+
+    #[test]
+    fn an_empty_cache_knows_no_regions() {
+        assert_eq!(StaticData::default().region_of_system(30000142), None);
+    }
+
+    #[test]
+    fn the_cached_agent_version_is_read_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("eve_lpstore_ver_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = StaticData::security_path(&dir);
+
+        // A file from before the version field existed reads as zero, not unreadable.
+        std::fs::write(&file, r#"{"corporations":[]}"#).unwrap();
+        assert_eq!(StaticData::agent_cache_version(&dir), Some(0));
+        std::fs::write(&file, format!(r#"{{"version":{AGENT_CACHE_VERSION}}}"#)).unwrap();
+        assert_eq!(
+            StaticData::agent_cache_version(&dir),
+            Some(AGENT_CACHE_VERSION)
+        );
+        std::fs::write(&file, "not json").unwrap();
+        assert_eq!(StaticData::agent_cache_version(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_stale_agent_cache_is_not_reported_as_cached() {
+        let dir = std::env::temp_dir().join(format!("eve_lpstore_stale_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for path in StaticData::files(&dir) {
+            std::fs::write(path, "[]").unwrap();
+        }
+        // All five files exist, so a purely existence-based check would say yes and then read a
+        // mapping that is not there.
+        assert!(!StaticData::is_cached(&dir));
+        std::fs::write(
+            StaticData::security_path(&dir),
+            format!(r#"{{"version":{AGENT_CACHE_VERSION}}}"#),
+        )
+        .unwrap();
+        assert!(StaticData::is_cached(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

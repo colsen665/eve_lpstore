@@ -123,10 +123,13 @@ pub struct FilterSummary {
     pub removed: usize,
 }
 
-/// The `--system` value as typed, and the number of NPC stations in that system.
+/// The `--system` value as typed, the system it names, and the number of NPC stations in it.
 #[derive(Debug, Clone)]
 pub struct SystemSummary {
     pub value: String,
+    /// The system the typed value resolved to, so a caller can ask anything of it without
+    /// resolving the name a second time.
+    pub system_id: i32,
     pub stations: usize,
 }
 
@@ -265,6 +268,7 @@ impl LpStoreOptions {
                     let stations = sdata.station_ids_in_system(system_id);
                     let summary = SystemSummary {
                         value: value.to_string(),
+                        system_id,
                         stations: stations.len(),
                     };
                     (Some(Arc::new(stations)), Some(summary))
