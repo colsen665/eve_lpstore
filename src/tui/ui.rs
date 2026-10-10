@@ -413,7 +413,10 @@ fn hint(field: FormField, sdata: &StaticData) -> String {
             "Prices come from its market orders.\nID or name. Blank for The Forge.".to_string()
         }
         FormField::Security => {
-            "+0.5 at least, -0.5 at most, =0.5 exactly. Blank for any.".to_string()
+            // Two lines like the market fields: the first has to fit the row's detail column at the
+            // minimum terminal width.
+            "0.5 exact, 0.5..0.7 for a range.\n0.5.. is at least, ..0.5 is at most. Blank for any."
+                .to_string()
         }
         FormField::AgentLevel => "1 to 5. Blank for any.".to_string(),
         FormField::Division => format!(
@@ -1575,11 +1578,15 @@ mod tests {
             hint_line(FormField::System, &StaticData::default()),
             "Prices use its NPC stations."
         );
-        // The market fields are the ones this change worded, and both fit the detail column at the
-        // minimum terminal width so their purpose is never cut. Other hints are longer and already
+        // The fields these changes worded have to fit the detail column at the minimum terminal
+        // width, so their extra wording goes on the second line. Other hints are longer and already
         // truncate there, which is existing behaviour this test does not cover.
+        assert_eq!(
+            hint_line(FormField::Security, &StaticData::default()),
+            "0.5 exact, 0.5..0.7 for a range."
+        );
         let detail = usize::from(MIN_WIDTH - 2) - (LABEL_WIDTH + VALUE_WIDTH + 2);
-        for field in [FormField::Region, FormField::System] {
+        for field in [FormField::Region, FormField::System, FormField::Security] {
             let line = hint_line(field, &StaticData::default());
             assert!(
                 line.chars().count() <= detail,

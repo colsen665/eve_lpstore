@@ -290,7 +290,7 @@ mod tests {
     fn options_survive_a_round_trip() {
         let options = LpStoreOptions {
             lpstore: Some("Caldari Navy,Amarr Navy".to_string()),
-            security: Some("+0.5".to_string()),
+            security: Some("0.5..0.7".to_string()),
             depth: Some("5".to_string()),
             cache_minutes: Some("30".to_string()),
             expire: true,

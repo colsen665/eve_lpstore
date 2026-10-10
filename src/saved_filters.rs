@@ -165,7 +165,7 @@ mod tests {
         SavedFilters {
             lpstore: Some("1000002".to_string()),
             region: Some("Domain".to_string()),
-            security: Some("+0.5".to_string()),
+            security: Some("0.5..0.7".to_string()),
             agent_level: Some("4".to_string()),
             agent_division: Some("security".to_string()),
             agent_type: Some("research".to_string()),

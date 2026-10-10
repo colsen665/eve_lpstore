@@ -25,7 +25,7 @@ Modes:
 
 Filters (apply to --lpstores):
   --lpstore <list>       Corporations to process, as a comma-separated list of IDs or names. Without it, all corporations are processed.
-  --security <op><level> Keep corporations with an agent in a system whose rounded security is +x (at least x), -x (at most x), or =x. Rounding: https://wiki.eveuniversity.org/System_security
+  --security <level|range> Keep corporations with an agent in a system whose rounded security is the level, or inside the range. Write 0.5 for exactly, 0.5..0.7 for a range with both bounds included, 0.5.. for at least, and ..0.7 for at most. A level can be negative, so the old -0.5 no longer means at most. Rounding: https://wiki.eveuniversity.org/System_security
   --agent-level <n>      Keep corporations with an agent of level n (1 to 5).
   --agent-division <name>  Keep corporations with an agent in this division, e.g. security or distribution.
   --agent-type <name>    Keep corporations with an agent of this type, e.g. basic, research, concord (the Agent suffix is optional).
@@ -56,6 +56,9 @@ Examples:
 
   eve_lpstore --lpstores --lpstore \"Caldari Navy,Amarr Navy\" --region Domain
       Show the top 10 offers for two corporations by name, priced in Domain.
+
+  eve_lpstore --lpstores --security 0.5..0.7
+      Show the top 10 offers for corporations with an agent in a system whose rounded security is between 0.5 and 0.7, both included.
 
   eve_lpstore --lpstores --expire --verbose
       Refresh cached responses and show cache activity.
@@ -202,7 +205,7 @@ async fn main() {
             clear_cache_dir();
         } else {
             println!(
-                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <op><level>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
+                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <level|range>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
                 args[0]
             );
         }

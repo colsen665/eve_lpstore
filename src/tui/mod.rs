@@ -546,13 +546,13 @@ mod tests {
         assert_eq!(filter_summary(&LpStoreOptions::default()), "none");
         let options = LpStoreOptions {
             region: Some("Domain".to_string()),
-            security: Some("+0.5".to_string()),
+            security: Some("0.5..0.7".to_string()),
             faction: Some("caldari".to_string()),
             ..Default::default()
         };
         assert_eq!(
             filter_summary(&options),
-            "--security +0.5 --faction caldari"
+            "--security 0.5..0.7 --faction caldari"
         );
     }
 
