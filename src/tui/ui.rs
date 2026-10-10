@@ -847,6 +847,9 @@ fn hint(field: FormField, sdata: &StaticData) -> String {
             "Prices use its NPC stations.\nName or ID. Blank for all systems.".to_string()
         }
         FormField::Depth => "Offers per group, 1 or more. Blank for 10.".to_string(),
+        FormField::CacheMinutes => {
+            "Minutes past ESI Expires.\nBlank: filtered corp count; 0 disables.".to_string()
+        }
         FormField::Expire => {
             "Space toggles. Ignore cached responses and call the API again.".to_string()
         }
@@ -2093,6 +2096,20 @@ mod tests {
     }
 
     #[test]
+    fn the_cache_minutes_field_explains_the_blank_default_and_zero() {
+        let mut app = App::new(LpStoreOptions::default());
+        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        form.focus = FormField::CacheMinutes;
+        app.show_filters(form);
+        let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+        assert!(text.contains("Minutes past ESI Expires."), "{text}");
+        assert!(
+            text.contains("Blank: filtered corp count; 0 disables."),
+            "the two existing defaults are explained: {text}"
+        );
+    }
+
+    #[test]
     fn the_pane_words_a_collapsed_band_group() {
         // Sazdih from Bayuka: every route starts in the lowest system, so the route bands
         // collapse to one row while the destination lines still name Moh's own 0.5.
@@ -2725,6 +2742,7 @@ mod tests {
             FormField::Security,
             FormField::AgentRegion,
             FormField::AgentSystem,
+            FormField::CacheMinutes,
         ] {
             let line = hint_line(field, &StaticData::default());
             assert!(
@@ -2765,6 +2783,7 @@ mod tests {
             "Market region",
             "Market system",
             "Depth",
+            "Cache minutes",
             "Expire cache",
         ] {
             assert!(text.contains(label), "{label:?} did not render");

@@ -42,6 +42,7 @@ pub struct SavedFilters {
     pub faction: Option<String>,
     pub system: Option<String>,
     pub depth: Option<String>,
+    pub cache_minutes: Option<String>,
 }
 
 impl SavedFilters {
@@ -70,8 +71,9 @@ impl SavedFilters {
             faction: pick(&cli.faction, &self.faction),
             system: pick(&cli.system, &self.system),
             depth: pick(&cli.depth, &self.depth),
-            // cache_minutes, concurrency, max_inflight, expire, and verbose are command line only,
-            // so they come from `cli` and there is no saved value that could override them.
+            cache_minutes: pick(&cli.cache_minutes, &self.cache_minutes),
+            // concurrency, max_inflight, expire, and verbose are command line only, so they come
+            // from `cli` and there is no saved value that could override them.
             ..cli.clone()
         }
     }
@@ -91,6 +93,7 @@ impl From<&LpStoreOptions> for SavedFilters {
             faction: options.faction.clone(),
             system: options.system.clone(),
             depth: options.depth.clone(),
+            cache_minutes: options.cache_minutes.clone(),
         }
     }
 }
@@ -187,6 +190,7 @@ mod tests {
             faction: Some("caldari".to_string()),
             system: Some("Jita".to_string()),
             depth: Some("25".to_string()),
+            cache_minutes: Some("90".to_string()),
         }
     }
 
@@ -196,6 +200,7 @@ mod tests {
             lpstore: Some("Caldari Navy".to_string()),
             region: Some("The Forge".to_string()),
             depth: Some("5".to_string()),
+            cache_minutes: Some("17".to_string()),
             ..Default::default()
         };
         let dir =
@@ -213,6 +218,7 @@ mod tests {
         assert_eq!(filters.lpstore.as_deref(), Some("Caldari Navy"));
         assert_eq!(filters.region.as_deref(), Some("The Forge"));
         assert_eq!(filters.depth.as_deref(), Some("5"));
+        assert_eq!(filters.cache_minutes.as_deref(), Some("17"));
         assert_eq!(filters.faction, None, "an unset field stays unset");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -248,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn expire_and_the_command_line_only_fields_are_never_written() {
+    fn expire_and_the_remaining_command_line_only_fields_are_never_written() {
         let options = LpStoreOptions {
             expire: true,
             verbose: true,
@@ -259,15 +265,13 @@ mod tests {
             ..Default::default()
         };
         let text = serde_json::to_string_pretty(&SavedFilters::from(&options)).unwrap();
-        for name in [
-            "expire",
-            "verbose",
-            "cache_minutes",
-            "concurrency",
-            "max_inflight",
-        ] {
+        for name in ["expire", "verbose", "concurrency", "max_inflight"] {
             assert!(!text.contains(name), "{} reached the file: {}", name, text);
         }
+        assert!(
+            text.contains("\"cache_minutes\": \"90\""),
+            "the TUI setting is remembered: {text}"
+        );
         assert!(text.contains("Domain"));
     }
 
@@ -275,6 +279,7 @@ mod tests {
     fn the_command_line_wins_field_by_field() {
         let cli = LpStoreOptions {
             region: Some("Sinq Laison".to_string()),
+            cache_minutes: Some("120".to_string()),
             ..Default::default()
         };
         let merged = Loaded::Filters(Box::new(all_fields())).merge(cli);
@@ -289,6 +294,11 @@ mod tests {
             "the file fills the rest"
         );
         assert_eq!(merged.depth.as_deref(), Some("25"));
+        assert_eq!(
+            merged.cache_minutes.as_deref(),
+            Some("120"),
+            "the CLI still wins"
+        );
         assert_eq!(merged.faction.as_deref(), Some("caldari"));
     }
 

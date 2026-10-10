@@ -83,6 +83,9 @@ pub struct LpStoreOptions {
     pub agent_system: Option<String>,
     /// Solar system as an ID or name. Prices come only from its NPC stations.
     pub system: Option<String>,
+    /// Minutes past an ESI response's Expires time to keep using the response. If absent, `--lpstores`
+    /// defaults to the number of corporations that remain after filtering; zero disables the
+    /// extension. The TUI remembers this value in `filters.json` along with its other form fields.
     pub cache_minutes: Option<String>,
     pub concurrency: Option<String>,
     pub max_inflight: Option<String>,

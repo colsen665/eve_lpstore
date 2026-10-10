@@ -17,6 +17,7 @@ pub enum FormField {
     Faction,
     System,
     Depth,
+    CacheMinutes,
     Expire,
 }
 
@@ -24,8 +25,9 @@ impl FormField {
     /// The fields in the order the dialog shows them and Tab moves through them. Grouped: which
     /// corporations and agents, then where the prices are read from, then how the results are
     /// shown. The two agent place filters sit directly below `Security`, which is also a filter on
-    /// where an agent stands, and `Expire` stays last so the space toggle is always the final stop.
-    pub const ALL: [FormField; 12] = [
+    /// where an agent stands. Cache timing follows depth; `Expire` stays last so the space toggle is
+    /// always the final stop.
+    pub const ALL: [FormField; 13] = [
         FormField::Corporations,
         FormField::Security,
         FormField::AgentRegion,
@@ -37,6 +39,7 @@ impl FormField {
         FormField::Region,
         FormField::System,
         FormField::Depth,
+        FormField::CacheMinutes,
         FormField::Expire,
     ];
 
@@ -58,6 +61,7 @@ impl FormField {
             FormField::Region => "Market region",
             FormField::System => "Market system",
             FormField::Depth => "Depth",
+            FormField::CacheMinutes => "Cache minutes",
             FormField::Expire => "Expire cache",
         }
     }
@@ -76,7 +80,8 @@ impl FormField {
             Field::Faction => Some(FormField::Faction),
             Field::System => Some(FormField::System),
             Field::Depth => Some(FormField::Depth),
-            Field::CacheMinutes | Field::Concurrency | Field::MaxInflight => None,
+            Field::CacheMinutes => Some(FormField::CacheMinutes),
+            Field::Concurrency | Field::MaxInflight => None,
         }
     }
 }
@@ -96,6 +101,7 @@ pub struct FilterForm {
     pub faction: String,
     pub system: String,
     pub depth: String,
+    pub cache_minutes: String,
     pub expire: bool,
     errors: Vec<(FormField, String)>,
     general_error: Option<String>,
@@ -117,6 +123,7 @@ impl FilterForm {
             faction: text(&options.faction),
             system: text(&options.system),
             depth: text(&options.depth),
+            cache_minutes: text(&options.cache_minutes),
             expire: options.expire,
             errors: Vec::new(),
             general_error: None,
@@ -155,6 +162,7 @@ impl FilterForm {
             faction: blank_to_none(&self.faction),
             system: blank_to_none(&self.system),
             depth: blank_to_none(&self.depth),
+            cache_minutes: blank_to_none(&self.cache_minutes),
             expire: self.expire,
             ..base.clone()
         }
@@ -173,6 +181,7 @@ impl FilterForm {
             FormField::Faction => self.faction.as_str(),
             FormField::System => self.system.as_str(),
             FormField::Depth => self.depth.as_str(),
+            FormField::CacheMinutes => self.cache_minutes.as_str(),
             FormField::Expire => "",
         }
     }
@@ -190,6 +199,7 @@ impl FilterForm {
             FormField::Faction => Some(&mut self.faction),
             FormField::System => Some(&mut self.system),
             FormField::Depth => Some(&mut self.depth),
+            FormField::CacheMinutes => Some(&mut self.cache_minutes),
             FormField::Expire => None,
         }
     }
@@ -385,7 +395,11 @@ mod tests {
             form.error_for(FormField::Division).as_deref(),
             Some("bad division")
         );
-        assert_eq!(form.general_error(), Some("bad minutes"));
+        assert_eq!(
+            form.error_for(FormField::CacheMinutes).as_deref(),
+            Some("bad minutes")
+        );
+        assert_eq!(form.general_error(), None);
     }
 
     #[test]
@@ -537,7 +551,21 @@ mod tests {
             ["Security", "Agent region", "Agent system", "Agent level"],
             "the dialog order is what the request asked for: {names:?}"
         );
-        assert_eq!(FormField::ALL.len(), 12);
+        let position = |field| {
+            FormField::ALL
+                .iter()
+                .position(|candidate| *candidate == field)
+                .unwrap()
+        };
+        assert_eq!(
+            position(FormField::Depth) + 1,
+            position(FormField::CacheMinutes)
+        );
+        assert_eq!(
+            position(FormField::CacheMinutes) + 1,
+            position(FormField::Expire)
+        );
+        assert_eq!(FormField::ALL.len(), 13);
     }
 
     #[test]
@@ -545,14 +573,17 @@ mod tests {
         let options = LpStoreOptions {
             agent_region: Some("Black Rise".to_string()),
             agent_system: Some("4-3L53".to_string()),
+            cache_minutes: Some("90".to_string()),
             ..Default::default()
         };
         let form = FilterForm::from_options(&options);
         assert_eq!(form.agent_region, "Black Rise");
         assert_eq!(form.agent_system, "4-3L53");
+        assert_eq!(form.cache_minutes, "90");
         let back = form.to_options(&LpStoreOptions::default());
         assert_eq!(back.agent_region, Some("Black Rise".to_string()));
         assert_eq!(back.agent_system, Some("4-3L53".to_string()));
+        assert_eq!(back.cache_minutes, Some("90".to_string()));
     }
 
     #[test]
@@ -561,6 +592,17 @@ mod tests {
         form.agent_region = "   ".to_string();
         let options = form.to_options(&LpStoreOptions::default());
         assert_eq!(options.agent_region, None, "spaces are not a region");
+    }
+
+    #[test]
+    fn cache_minutes_stays_blank_when_unset() {
+        let form = FilterForm::from_options(&LpStoreOptions::default());
+        assert_eq!(form.cache_minutes, "");
+        assert_eq!(
+            form.to_options(&LpStoreOptions::default()).cache_minutes,
+            None,
+            "blank leaves the existing default to resolve"
+        );
     }
 
     #[test]
