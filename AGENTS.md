@@ -14,6 +14,10 @@ When work is pending and nothing is unresolved, offer it as a dialog rather than
 waiting to be told. State the scope options concretely, such as one phase, one item within a phase,
 or everything pending, so the choice is about how far to go rather than whether to ask.
 
+When a piece of work is finished, offer to commit it in a dialog before offering the next pending
+work. Commit only on an answer that says to, and keep unrelated changes in separate commits when
+there are any to keep apart.
+
 ## Language
 
 Keep the writing objective and verifiable.
