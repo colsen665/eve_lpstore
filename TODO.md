@@ -204,7 +204,7 @@ because each listed system is itself an agent system and the counting starts the
 
 Worked through the four-system example, which shows why the two groupings behave differently. The
 marginal **by the systems' own security** is `0.75 / 0.25` in every case, because it counts systems per
-band and ignores the graph. The grouping `bands` reports is by the security flown on the route, and
+band and ignores the graph. The grouping the pane leads with is by the security flown on the route, and
 the graph does affect that: a route starts at the agent system, so when the start is the lowest of the
 four the whole example groups as `1.00` at the start's band, and it splits only from a start that is
 not the lowest. The distance grouping depends on the graph and on where the agent sits too, and these
@@ -291,10 +291,11 @@ per listed system describes the scoped case. Two things follow from the model ra
 decisions, and belong to it: the share of missions that are burner missions is still level dependent,
 since only level 4 offers them, and that is deferred with burners; and the weighting is a stated
 assumption about the game, not a measurement, so the view should present it as the model it is.
-- [ ] Where it appears. Options are an overlay on its own key, lines under each system in the details
-      pane, a compact suffix on the corporation line, or a column in the groups pane. The details pane
-      is already the tallest region of the view and holds the offer breakdown, which argues against
-      adding rows there.
+- [x] It appears in a pane of its own, opened by `m` for the selected group: one summary line per
+      agent system with its band groups and hop groups, then one line per destination. Probabilities
+      are whole percents, since the counts are single digits and a decimal would suggest a precision
+      the model does not have. Up and Down scroll it in the details-pane direction, not the log's
+      inverted one, and `Esc` closes while `q` still quits.
 - [x] Grouping uses the same rounding the security filter already applies, so a band on screen is a
       band a user can type: `security_band` returns tenths through `displayed_security` rather than
       rounding a second time, and the negative and zero cases the filter accepts are reachable here
@@ -311,14 +312,13 @@ assumption about the game, not a measurement, so the view should present it as t
       probabilities sum to one. Unknown agent systems and empty constellations give `None`.
 - [x] Because that rule collapses the grouping whenever the agent system is among the constellation's
       lowest, the spread also carries `own_bands`, the same destinations grouped by their own
-      security, and `destinations` carries both bands per destination so that a display can show the
-      difference rather than only the collapsed one.
+      security, and a destination line names its own band when it differs from the route band.
       Sazdih from Bayuka is that case: `0.4/100%` as the grouping and `own 0.5` on Moh.
-- [ ] What the model assumes without evidence: that destinations stay inside the constellation, that
-      every system in it is equally likely, and that the agent's own system carries the same weight as
-      a neighbour. That is a stated model rather than a measurement of how missions are routed, and
-      whatever displays it will have to say so; the wording waits on the research below rather than
-      being guessed at now.
+- [ ] What the model assumes and the pane repeats without evidence: that destinations stay inside
+      the constellation, that every system in it is equally likely, and that the agent's own system
+      carries the same weight as a neighbour. The pane states "route" and "own" per destination so a
+      reader can see the derivation, but nothing yet marks the whole thing as an assumption on
+      screen; that wording should be reviewed with the research below rather than guessed at now.
 Deferred to a later phase:
 
 - [ ] Burner and anomic variants. These are acquired from a level 4 basic security agent, the same
@@ -361,10 +361,10 @@ Deferred to a later phase:
       moving any system between bands. Kimotoro stays as the fixture for the hop counts measured
       against ESI; it is not exercised as a band case, since all seven of its systems share one band
       and so it would prove nothing about a split.
-- [ ] No live terminal check is claimed for any of it, per the standing note on such checks, and none
-      is possible yet: the grouping and the routing are pinned by tests against the four-system
-      example and against Sazdih measured from ESI, but there is no display until the option above is
-      taken.
+- [ ] No live terminal check is claimed for any of it, per the standing note on such checks. The
+      pane's text is pinned by assertions on the exact rendered lines, including the collapsed
+      Sazdih case and a destination whose id is unknown, but nobody has opened it with `m` in a real
+      terminal, and the pane has never been drawn from a version 3 cache.
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The

@@ -52,14 +52,17 @@ const SPREAD_WIDE: f64 = 50.0;
 /// this stays yellow, so a book that favours nobody is not reported as a win.
 const IMBALANCE_STRONG: f64 = 25.0;
 
-/// Draws the whole view. Returns the details pane's (total rows, rows on screen), or (0, 0)
-/// when the results are not on screen.
-pub fn draw(
-    frame: &mut Frame,
-    app: &App,
-    sdata: &StaticData,
-    stats: &ClientStats,
-) -> (usize, usize) {
+/// What the last frame measured about the scrollable panes, fed back so the keys can bound the
+/// scroll without the view holding the static data it renders from.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaneLayout {
+    pub detail_rows: usize,
+    pub detail_visible: usize,
+    pub destinations_rows: usize,
+}
+
+/// Draws the whole view. Reports what each scrollable pane needs to know about itself.
+pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStats) -> PaneLayout {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         let message = format!(
@@ -67,7 +70,7 @@ pub fn draw(
             MIN_WIDTH, MIN_HEIGHT, area.width, area.height
         );
         frame.render_widget(Paragraph::new(message).red(), area);
-        return (0, 0);
+        return PaneLayout::default();
     }
 
     let [header, body, footer] = Layout::vertical([
@@ -104,16 +107,17 @@ pub fn draw(
     let layout = match app.overlay {
         Overlay::Log => {
             draw_log(frame, body, app);
-            (0, 0)
+            PaneLayout::default()
         }
         Overlay::Filters => {
             draw_form(frame, body, app, sdata);
-            (0, 0)
+            PaneLayout::default()
         }
+        Overlay::Destinations => draw_destinations(frame, body, app, sdata),
         _ if app.report.is_some() => draw_results(frame, body, app, sdata),
         _ => {
             draw_progress(frame, body, app);
-            (0, 0)
+            PaneLayout::default()
         }
     };
     if app.overlay == Overlay::Help {
@@ -202,6 +206,123 @@ fn draw_export(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(lines).block(Block::bordered().title(" Export ")),
         popup,
     );
+}
+
+/// One line per probability group: whole percents, since the counts are small and a decimal
+/// suggests a precision the model does not have.
+fn percent(part: f64) -> String {
+    format!("{:.0}%", part * 100.0)
+}
+
+/// The destination table as plain text, one line per system and per destination. Split out from the
+/// drawing so the wording is testable without a frame.
+fn destination_rows(app: &App, sdata: &StaticData) -> Vec<String> {
+    let Some(group) = app.selected_group() else {
+        return vec!["No group selected.".to_string()];
+    };
+    let mut rows = Vec::new();
+    for corp_id in &group.corp_ids {
+        rows.push(output::corporation_label(sdata, *corp_id));
+        let systems = sdata.agent_systems(*corp_id, &app.agent_filter);
+        if systems.is_empty() {
+            rows.push("  no agent systems match the filters".to_string());
+            continue;
+        }
+        for (system_id, name, _) in systems {
+            let Some(spread) = sdata.mission_spread(system_id) else {
+                rows.push(format!("  {name} ({system_id})  no constellation data"));
+                continue;
+            };
+            rows.extend(system_lines(system_id, &name, &spread, &|other| {
+                sdata.system_name(other).cloned()
+            }));
+        }
+    }
+    rows
+}
+
+/// The lines for one agent system: a summary of the bands and the hop distances, then one line per
+/// destination. Split out so the wording is testable against a hand-built spread without static
+/// data. `name_of` resolves a destination id, which the caller reads from the archive.
+fn system_lines(
+    system_id: i32,
+    name: &str,
+    spread: &eve_lpstore::static_data::DestinationSpread,
+    name_of: &dyn Fn(i32) -> Option<String>,
+) -> Vec<String> {
+    let bands = spread
+        .bands
+        .iter()
+        .map(|(band, part)| format!("{}/{}", band_tenths(*band), percent(*part)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hops = spread
+        .hops
+        .iter()
+        .map(|(distance, part)| format!("{distance}J/{}", percent(*part)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut rows = vec![format!("  {name} ({system_id})  route {bands}  {hops}")];
+    for (dest_id, distance, route_band, own_band) in &spread.destinations {
+        if *distance == 0 {
+            // The agent system itself is a destination, but listing it under its own summary adds
+            // nothing and repeats the header.
+            continue;
+        }
+        let dest = name_of(*dest_id).unwrap_or_else(|| format!("system {dest_id}"));
+        let note = if route_band == own_band {
+            String::new()
+        } else {
+            // Only worth spelling out when they disagree: the route forces you lower than the
+            // destination's own security.
+            format!("  own {own}", own = band_tenths(*own_band))
+        };
+        rows.push(format!(
+            "    {dest} {distance}J route {route}{note}",
+            route = band_tenths(*route_band)
+        ));
+    }
+    rows
+}
+
+/// Tenths to the one-decimal label the panes and `--security` both use.
+fn band_tenths(tenths: i32) -> String {
+    format!("{:.1}", tenths as f64 / 10.0)
+}
+
+/// The mission destinations pane for the selected group. Probabilities are even shares of the
+/// systems in the agent system's constellation, which is an assumption this tool makes rather than a
+/// measurement of how missions are routed, and the band a destination lands in is the lowest
+/// security on the safest way to reach it, which is why it can sit below the destination's own.
+fn draw_destinations(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> PaneLayout {
+    let block = pane_block("Mission destinations", false, app);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let rows = destination_rows(app, sdata);
+    let height = usize::from(inner.height);
+    let end = rows.len().saturating_sub(app.destinations_scroll);
+    let start = end.saturating_sub(height);
+    let lines: Vec<Line<'static>> = rows[start..end]
+        .iter()
+        .map(|row| {
+            // System lines are indented two, destinations four; anything less is a corporation name.
+            let style = if row.starts_with("    ") {
+                Style::new().dark_gray()
+            } else if row.starts_with("  ") {
+                Style::new()
+            } else {
+                Style::new().bold()
+            };
+            Line::from(Span::styled(row.clone(), style))
+        })
+        .collect();
+    // Sliced to the visible window already, so no `.scroll()` offset on top of that.
+    frame.render_widget(Paragraph::new(lines), inner);
+    PaneLayout {
+        detail_rows: 0,
+        detail_visible: 0,
+        destinations_rows: rows.len(),
+    }
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, app: &App) {
@@ -468,14 +589,19 @@ fn suggestions(app: &App, sdata: &StaticData) -> Option<String> {
     })
 }
 
-fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> (usize, usize) {
+fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> PaneLayout {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).areas(area);
     let [offers, details] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Min(0)]).areas(right);
     draw_groups(frame, left, app, sdata);
     draw_offers(frame, offers, app, sdata);
-    draw_details(frame, details, app, sdata)
+    let (detail_rows, detail_visible) = draw_details(frame, details, app, sdata);
+    PaneLayout {
+        detail_rows,
+        detail_visible,
+        destinations_rows: 0,
+    }
 }
 
 /// A bordered pane. Its title says so when the results it shows are stale.
@@ -935,6 +1061,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ("PgUp, PgDn", "move a page at a time"),
         ("f", "edit the filters; Enter runs them, Esc cancels"),
         ("e", "write the view to a .csv or .json file"),
+        (
+            "m",
+            "where missions from the selected group's agents can take you",
+        ),
         ("d", "show the donation address as a QR code"),
         ("l", "show or hide the full log"),
         ("?", "show or hide this help"),
@@ -1030,6 +1160,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, app: &App) {
             "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
         }
         Overlay::Export => "Enter write  Esc cancel  Ctrl+U clear  Ctrl+C quit",
+        Overlay::Destinations => "Up/Down scroll  Esc close  Ctrl+C quit",
         Overlay::StaticData => {
             if app.downloading {
                 "Downloading...  Ctrl+C quits"
@@ -1037,7 +1168,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, app: &App) {
                 "Enter or d download  Esc exit"
             }
         }
-        _ => "Tab panes  Up/Down move  f filters  e export  d donate  l log  ? help  q quit",
+        _ => {
+            "Tab panes  Up/Down move  f filters  e export  m missions  d donate  l log  ? help  q quit"
+        }
     };
     let lines = vec![
         Line::from(format!(
@@ -1575,6 +1708,119 @@ mod tests {
         assert!(
             text.contains("Name or ID. Blank for all systems."),
             "the syntax line shows under the focused field"
+        );
+    }
+
+    #[test]
+    fn the_pane_words_a_collapsed_band_group() {
+        // Sazdih from Bayuka: every route starts in the lowest system, so the route bands
+        // collapse to one row while the destination lines still name Moh's own 0.5.
+        let spread = eve_lpstore::static_data::DestinationSpread {
+            constellation_id: 20000006,
+            systems: 6,
+            bands: vec![(4, 1.0)],
+            own_bands: vec![(4, 5.0 / 6.0), (5, 1.0 / 6.0)],
+            hops: vec![(0, 1.0 / 6.0), (1, 3.0 / 6.0), (2, 2.0 / 6.0)],
+            destinations: vec![
+                (30000039, 0, 4, 4),
+                (30000038, 1, 4, 4),
+                (30000040, 1, 4, 4),
+                (30000041, 1, 4, 4),
+                (30000042, 2, 4, 5),
+                (30000043, 2, 4, 4),
+            ],
+        };
+        let names = std::collections::HashMap::from([
+            (30000039, "Bayuka"),
+            (30000038, "Dooz"),
+            (30000040, "Uzistoon"),
+            (30000041, "Bairshir"),
+            (30000042, "Moh"),
+            (30000043, "Sari"),
+        ]);
+        let rows = system_lines(30000039, "Bayuka", &spread, &|id| {
+            names.get(&id).map(|found| found.to_string())
+        });
+        assert_eq!(
+            rows[0],
+            "  Bayuka (30000039)  route 0.4/100%  0J/17% 1J/50% 2J/33%"
+        );
+        assert_eq!(
+            rows[1], "    Dooz 1J route 0.4",
+            "same band as its own, so no note"
+        );
+        let moh = rows.iter().find(|r| r.contains("Moh")).expect("Moh listed");
+        assert_eq!(moh, "    Moh 2J route 0.4  own 0.5");
+        assert_eq!(rows.len(), 6, "one summary plus five destinations");
+        assert!(
+            !rows.iter().any(|r| r.contains("Bayuka (30000039)  0J")),
+            "the agent system is not repeated as a destination"
+        );
+    }
+
+    #[test]
+    fn the_pane_splits_bands_when_the_routes_allow_it() {
+        let spread = eve_lpstore::static_data::DestinationSpread {
+            constellation_id: 100,
+            systems: 4,
+            bands: vec![(5, 0.75), (6, 0.25)],
+            own_bands: vec![(5, 0.75), (6, 0.25)],
+            hops: vec![(0, 0.25), (1, 0.25), (2, 0.25), (3, 0.25)],
+            destinations: vec![(1, 0, 5, 5), (2, 1, 5, 5), (3, 2, 5, 5), (4, 3, 5, 6)],
+        };
+        let rows = system_lines(1, "A", &spread, &|id| Some(format!("S{id}")));
+        assert_eq!(
+            rows[0],
+            "  A (1)  route 0.5/75% 0.6/25%  0J/25% 1J/25% 2J/25% 3J/25%"
+        );
+        assert_eq!(rows.len(), 4, "one summary plus the three other systems");
+        assert_eq!(rows[3], "    S4 3J route 0.5  own 0.6");
+    }
+
+    #[test]
+    fn an_unknown_destination_id_still_gets_a_line() {
+        let spread = eve_lpstore::static_data::DestinationSpread {
+            constellation_id: 1,
+            systems: 2,
+            bands: vec![(4, 1.0)],
+            own_bands: vec![(4, 1.0)],
+            hops: vec![(0, 0.5), (1, 0.5)],
+            destinations: vec![(9, 0, 4, 4), (99, 1, 4, 4)],
+        };
+        let rows = system_lines(9, "Here", &spread, &|_| None);
+        assert_eq!(rows[1], "    system 99 1J route 0.4");
+    }
+
+    #[test]
+    fn probabilities_are_whole_percent() {
+        assert_eq!(percent(1.0 / 6.0), "17%");
+        assert_eq!(percent(5.0 / 6.0), "83%");
+        assert_eq!(percent(1.0), "100%");
+        assert_eq!(percent(0.0), "0%");
+    }
+
+    #[test]
+    fn the_missions_pane_reports_what_it_cannot_show() {
+        // An empty static data has no agent systems and no constellation, which is the state before
+        // the data has been fetched, and the pane must say so rather than print nothing.
+        let mut app = results_app(one_priced_offer(), 10);
+        app.overlay = Overlay::Destinations;
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("Mission destinations"), "the pane is titled");
+        assert!(
+            text.contains("no agent systems match the filters"),
+            "it says why a line is empty: {text}"
+        );
+    }
+
+    #[test]
+    fn the_missions_pane_names_a_group_only_after_a_selection() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.overlay = Overlay::Destinations;
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("No group selected."),
+            "empty view is explicit"
         );
     }
 

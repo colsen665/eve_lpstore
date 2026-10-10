@@ -10,6 +10,11 @@ pub struct Message {
     pub is_error: bool,
 }
 
+/// The corporation's name and id on its own, for panes that list systems separately.
+pub fn corporation_label(sdata: &StaticData, corp_id: i32) -> String {
+    corp_label(sdata, corp_id)
+}
+
 fn corp_label(sdata: &StaticData, corp_id: i32) -> String {
     match sdata.corporation_name(corp_id) {
         Some(name) => format!("{} ({})", name, corp_id),

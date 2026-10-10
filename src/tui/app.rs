@@ -64,6 +64,8 @@ pub enum Overlay {
     Filters,
     Donate,
     Export,
+    /// Where the missions of the selected group's agent systems can take you.
+    Destinations,
     /// Asking whether to download the static data, shown when it is not on disk.
     StaticData,
 }
@@ -115,6 +117,9 @@ pub struct App {
     pub detail_rows: usize,
     pub detail_visible: usize,
     pub log_scroll: usize,
+    /// Scrolling within the mission destinations pane.
+    pub destinations_rows: usize,
+    pub destinations_scroll: usize,
     pub overlay: Overlay,
     /// The file name typed into the export prompt.
     pub export_path: String,
@@ -156,6 +161,8 @@ impl App {
             detail_rows: 0,
             detail_visible: 0,
             log_scroll: 0,
+            destinations_rows: 0,
+            destinations_scroll: 0,
             overlay: Overlay::None,
             export_path: String::new(),
             export_error: None,
@@ -387,6 +394,13 @@ impl App {
 
     /// Records how the details pane was drawn: its total rows, and how many fit on screen.
     /// Scrolling uses these, so the last row can always be reached.
+    /// Records how tall the destinations pane was last frame, which bounds its scrolling. The pane
+    /// is only measured while it is open, so a closed pane keeps the last count rather than
+    /// resetting it; the scroll is clamped against it either way.
+    pub fn set_destinations_rows(&mut self, rows: usize) {
+        self.destinations_rows = rows;
+    }
+
     pub fn set_detail_layout(&mut self, rows: usize, visible: usize) {
         self.detail_rows = rows;
         self.detail_visible = visible;
@@ -473,6 +487,7 @@ impl App {
             KeyCode::Char('f') => self.open_form(),
             KeyCode::Char('e') if self.report.is_some() => self.open_export(),
             KeyCode::Char('d') => self.toggle(Overlay::Donate),
+            KeyCode::Char('m') if self.report.is_some() => self.toggle(Overlay::Destinations),
             _ if self.overlay == Overlay::Help => {}
             KeyCode::Tab => {
                 if self.overlay == Overlay::None && self.report.is_some() {
@@ -585,6 +600,13 @@ impl App {
         if self.overlay == Overlay::Log {
             let max = self.log.len().saturating_sub(1);
             self.log_scroll = shift(self.log_scroll, -delta, max);
+            return;
+        }
+        if self.overlay == Overlay::Destinations {
+            // The details-pane direction, not the log's: this table reads top to bottom, so Down
+            // moves to later rows. The log is inverted because its newest line is at the bottom.
+            let max = self.destinations_rows.saturating_sub(1);
+            self.destinations_scroll = shift(self.destinations_scroll, delta, max);
             return;
         }
         if self.overlay != Overlay::None || self.report.is_none() {
@@ -923,6 +945,50 @@ mod tests {
         assert_eq!(
             app.export_request().map(|request| request.format),
             Some(eve_lpstore::export::ExportFormat::Csv)
+        );
+    }
+
+    #[test]
+    fn m_opens_the_missions_pane_only_once_there_are_results() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.on_key(press(KeyCode::Char('m')));
+        assert_eq!(app.overlay, Overlay::Destinations);
+        // Before the first run there is no selected group to describe.
+        let mut idle = App::new(LpStoreOptions::default());
+        idle.on_key(press(KeyCode::Char('m')));
+        assert_eq!(idle.overlay, Overlay::None, "nothing to show yet");
+    }
+
+    #[test]
+    fn the_missions_pane_closes_on_escape_and_quits_on_q() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.on_key(press(KeyCode::Char('m')));
+        assert_eq!(app.overlay, Overlay::Destinations);
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key(press(KeyCode::Char('m')));
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    #[test]
+    fn the_missions_pane_scrolls_without_moving_the_selection() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.on_key(press(KeyCode::Char('m')));
+        app.set_destinations_rows(30);
+        let group_before = app.group;
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.destinations_scroll, 1, "down shows lower rows");
+        app.on_key(press(KeyCode::PageDown));
+        assert_eq!(app.destinations_scroll, 11);
+        app.on_key(press(KeyCode::Up));
+        assert_eq!(app.destinations_scroll, 10);
+        assert_eq!(app.group, group_before, "scrolling is not selection");
+        for _ in 0..40 {
+            app.on_key(press(KeyCode::Down));
+        }
+        assert_eq!(
+            app.destinations_scroll, 29,
+            "stops with the last row on screen"
         );
     }
 

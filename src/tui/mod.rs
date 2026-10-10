@@ -292,9 +292,10 @@ fn ui_loop(
         }
 
         let stats = session.stats();
-        let mut layout = (0, 0);
+        let mut layout = ui::PaneLayout::default();
         terminal.draw(|frame| layout = ui::draw(frame, app, &session.sdata, &stats))?;
-        app.set_detail_layout(layout.0, layout.1);
+        app.set_detail_layout(layout.detail_rows, layout.detail_visible);
+        app.set_destinations_rows(layout.destinations_rows);
 
         if event::poll(TICK)? {
             let action = match event::read()? {
