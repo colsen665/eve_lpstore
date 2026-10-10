@@ -326,8 +326,11 @@ The requested shape, kept as the spec the tests are written against:
       Annancale 0.0941), so only the probabilities were invented. Both corporations have Security
       agents, so the scope applied today keeps them in: 29 agents in 16 systems and 26 in 14. Across
       the 158 corporations with any Security agent the systems per corporation run 1 to 53, median 11,
-      and 81 of them have more than the 10 that `corp_line` used to cut at — which is why the pane
-      lists them without a cap and scrolls instead, the decision the cap question below replaces.
+      and 81 of them have more than the 10 that `corp_line` used to cut at. They are listed uncapped
+      and the pane scrolls, chosen over a cap because dropping systems silently would hide exactly the
+      spread the feature is for; the cost is that a 53-system corporation pushes the offer breakdown
+      well below the fold. Open question: whether some cap, or a count line that says how many systems
+      follow, reads better at the common 11-to-35 sizes.
       A summary line measured 65 characters at the median and 126 at the longest, against the 78
       columns a border leaves at the minimum width, so both panes wrap rather than clip; the indent is
       kept on every wrapped row, because a continuation at column 0 reads as a new system.
@@ -415,11 +418,18 @@ assumption about the game, not a measurement, so the view should present it as t
       lowest, the spread also carries `own_bands`, the same destinations grouped by their own
       security, and a destination line names its own band when it differs from the route band.
       Sazdih from Bayuka is that case: `0.4/100%` as the grouping and `own 0.5` on Moh.
-- [ ] What the model assumes and the pane repeats without evidence: that destinations stay inside
-      the constellation, that every system in it is equally likely, and that the agent's own system
-      carries the same weight as a neighbour. The pane states "route" and "own" per destination so a
-      reader can see the derivation, but nothing yet marks the whole thing as an assumption on
-      screen; that wording should be reviewed with the research below rather than guessed at now.
+- [x] What the model assumes is now labelled on screen, which this item used to say was missing. The
+      `m` pane opens with two italic lines that cannot be scrolled away: that the numbers are a model
+      in which security missions stay in the agent's constellation, and that a band is the lowest
+      security on the safest route rather than the system's own. Per-destination rows show `route` and
+      `own` so the derivation is readable, and hop counts are the gates on that same route.
+      Corrected because the claim that nothing marked it was written before the notes existed and
+      survived an edit whose pattern matched a different bullet, so the file contradicted itself for
+      two commits.
+- [ ] Still unlabelled, because it is still unsourced: that every system in the constellation is
+      equally likely, and that the agent's own system carries the same weight as a neighbour. The
+      notes say the constellation bound is a model; they do not say the weighting is one, and no
+      public data can settle either, per the probe below.
 Deferred to a later phase:
 
 - [x] Burners look like named places rather than a distribution, which changes what modelling them
