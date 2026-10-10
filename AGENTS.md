@@ -10,6 +10,10 @@ the end. Once the questions are answered, continue and do not stop to ask again.
 out not to apply, or a fresh obstacle appears, note it in the report of the finished work rather
 than pausing to ask, unless the obstacle genuinely prevents the work.
 
+When work is pending and nothing is unresolved, offer it as a dialog rather than starting it or
+waiting to be told. State the scope options concretely, such as one phase, one item within a phase,
+or everything pending, so the choice is about how far to go rather than whether to ask.
+
 ## Language
 
 Keep the writing objective and verifiable.
