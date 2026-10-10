@@ -221,37 +221,49 @@ needs the gate edges as well.
 
 
 
-What the data supports, and two gaps that are not the adjacency gap:
+What the data supports, after one assumed gap closed and one question opened:
 
 - [ ] Constellation membership is available and thrown away. `mapSolarSystems.jsonl` carries 17 fields
       per system including `constellationID`, `stargateIDs`, `border`, `hub` and `securityClass`, and
       `SdeSolarSystem` keeps four of them: id, name, true security and region. Keeping
       `constellationID` is one more field, which means an `AgentCache` version bump so an existing
       install reads as uncached and asks before refetching, the way the system-to-region mapping did.
-- [ ] Gate edges need a table the project does not load. `stargateIDs` lists the gates in a system,
-      not the systems they lead to, so an edge list has to come from elsewhere. An earlier scan of the
-      archive filtered names on containing `system` or `region` and found no jumps file, which does
-      hold for a name like `mapSolarSystemJumps.jsonl`, but that scan could not have detected a
-      `mapStargates`-style file, since the name contains neither word. Check the listing unfiltered
-      before either claiming or ruling it out.
+- [x] Gate edges are in the archive and simply not read. `mapStargates.jsonl` and
+      `mapConstellations.jsonl` are among the archive's 102 files, confirmed by reading the zip's
+      central directory with a range request rather than refetching 99 MB. `mapStargates` is the
+      connections table the route guide names, so the graph is available offline from the download the
+      tool already performs. This corrects an earlier claim here that the archive holds no jumps file:
+      that scan filtered names on containing `system` or `region`, and `mapStargates` matches neither,
+      so the absence was an artifact of the filter rather than of the data.
 - [ ] No adjacency of any kind is loaded today: `extract_agent_cache` reads seven SDE files and none
       of them links systems.
-- [ ] Under uniform weighting, the missing space systems stop being a cosmetic gap. A constellation
-      whose real membership includes a system absent from the cached set has too few systems in its
-      denominator, so every probability shown is inflated and the bands can shift: if a four-system
-      constellation is really five counting a space system, the example above reads 0.6 and 0.2 rather
-      than 0.75 and 0.25. Constellation membership therefore has to come from a source complete enough
-      to include those systems, and the counts for a few known constellations are worth checking
-      against the game before any table is trusted. `constellationID` is not cached yet, so this
-      cannot be measured here today.
-- [ ] The systems most likely to be mission destinations are **not in the cached data at all**, which
-      is a separate gap from adjacency. `mapSolarSystems.jsonl` is cached as 8,490 systems, every one
-      resolving to the 114 regions in `regions.json`. Probing 15 names of space-only, wormhole and
-      Pochven systems found only `Tama`, a lowsec system; `Jita Space` is absent, along with `Nami`,
-      `Akkonen`, `Kourri`, `Irala`, `Otomuo` and the rest of the probe. So the example given, a dead-end
-      system reached by one gate from Jita, is exactly the class this data lacks, and no amount of gate
-      edges recovers it. Either the system set is extended from another source, or destinations are
-      limited to known space and the view says that is what it is showing.
+- [ ] Under uniform weighting, an incomplete membership list skews every number rather than merely
+      omitting a row. A constellation missing one of its real systems has too small a denominator, so
+      the remaining probabilities are inflated and a band can shift: if a four-system constellation is
+      really five, the worked example reads 0.6 and 0.2 instead of 0.75 and 0.25. Membership is now
+      cheap to check properly, since `mapConstellations.jsonl` is in the archive and
+      `GET /universe/constellations/{id}` answers the same question for a spot check, so a few
+      constellations are worth comparing against the game before any table is trusted. What is not
+      settled is whether mission destinations sit inside that set at all, below.
+- [ ] Whether a destination is a solar system at all is unresolved, and a claim here is withdrawn.
+      What is established about `Jita Space` is narrow: it is not among the 8,490 cached systems, and
+      `POST /universe/ids` returns no system by that name, resolving it only as a character. Two
+      sources agreeing there is no solar system called `Jita Space` is not evidence about mission
+      destinations generally. The wider question the phase depends on is whether a mission's location
+      is a system or a site inside one, which would move probability from systems to sites with their
+      own security values. The stronger claim that the data "excludes space systems" rested on 15
+      probed names, most of which may simply not be real systems, and is withdrawn pending the research
+      below. If destinations are systems, `mapStargates` pairs each gate with its two systems, so the
+      set is as complete as the archive.
+
+Two ESI endpoints are verified as useful here: `POST /route/{origin}/{destination}` with a JSON body
+carrying `preference` and `security_penalty` plus an `X-Compatibility-Date` header returns
+`{"route": [system ids]}`, measured as 7 systems and 6 jumps for Jita to Amamalka, so it is an
+independent oracle for counts computed from `mapStargates`; `GET /universe/constellations/{id}`
+returns a constellation's member systems, measured as 7 for Kimotoro, which holds Jita. Neither
+`/universe/systems` nor `/universe/stargates` takes a POST, so a full ESI crawl would cost a request
+per system and per gate; the graph should come from the archive instead.
+
 
 Sources named for the research on how many jumps, none of it consulted yet: the EVE University wiki at
 `https://wiki.eveuniversity.org/`, whose mission and system-security pages are the likeliest to state
