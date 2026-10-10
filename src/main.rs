@@ -19,8 +19,8 @@ Modes:
   --example              Run the general ESI and static data example.
   --lpstores             Calculate expenses, profit, and ISK per LP for LP store offers and show the top 10.
   --tui                  Show --lpstores in a full-screen view that updates while it runs. Asks for
-                         the filters first, and for the static data if it is not on disk. Implies
-                         --lpstores.
+                         the filters first, and for the static data if it is not on disk. Remembers
+                         the filters it applies in filters.json. Implies --lpstores.
   --help                 Show this help and exit.
 
 Filters (apply to --lpstores):
@@ -71,7 +71,12 @@ Examples:
       the run, and ? shows the keys once it is going.
 
   eve_lpstore --tui --lpstore \"Caldari Navy\" --region Domain --depth 20
-      Open that view for one corporation in Domain. The filters pre-fill the form that f opens.
+      Open that view for one corporation in Domain. These fill the form the view starts on, and
+      each one still wins over the value an earlier run left in filters.json.
+
+  eve_lpstore --tui --faction Caldari
+      Start from the filters the last run applied, with only the faction overridden. The view keeps
+      what it applies, so a field left off the command line comes back on its own.
 
   eve_lpstore --tui --verbose
       Send cache hits, misses, and writes to the log panel that l opens, not to the terminal.

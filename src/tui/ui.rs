@@ -1472,6 +1472,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_note_about_the_saved_file_shows_on_the_startup_form() {
+        // The form owns the keyboard and the log panel cannot be opened over it, so this is the only
+        // place the reason could be seen before the first run.
+        let mut app = App::new(LpStoreOptions::default());
+        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        form.set_note(Some(
+            "filters.json is not valid JSON: expected value".to_string(),
+        ));
+        app.show_filters(form);
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("is not valid JSON"),
+            "the reason is on screen: {}",
+            text
+        );
+        assert!(
+            text.contains("The Forge"),
+            "the form still shows what it fell back to"
+        );
+    }
+
     fn screen_text(width: u16, height: u16) -> String {
         rendered(width, height, |frame| draw_donate(frame, frame.area()))
     }

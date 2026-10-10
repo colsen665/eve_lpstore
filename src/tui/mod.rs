@@ -13,8 +13,10 @@ use eve_lpstore::StaticData;
 use eve_lpstore::esi::EsiClient;
 use eve_lpstore::export;
 use eve_lpstore::report::{self, LpStoreOptions, Report, Resolved, RunEvent};
+use eve_lpstore::saved_filters;
 use ratatui::DefaultTerminal;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -148,10 +150,26 @@ fn opening(cached: bool, loaded: Option<Result<StaticData, String>>) -> Opening 
 
 /// Runs the view until the user quits. Static data is loaded here when it is on disk, and asked
 /// for in the view when it is not, so a first run does not silently fetch the whole archive.
-pub async fn run(options: LpStoreOptions) -> io::Result<()> {
+pub async fn run(cli: LpStoreOptions) -> io::Result<()> {
     let (events, mut received) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
     let handle = Handle::current();
-    let mut app = App::new(options);
+    // The filters the last applied run used fill in whatever the command line left alone, so the
+    // dialog opens on something the user recognises instead of on the defaults every time. A field
+    // the command line did set keeps its own value, which is what makes the flags still work.
+    let remembered = saved_filters::load();
+    // One message, shown on the form and kept in the log, that names the consequence as well as the
+    // cause: the saved filters were not used.
+    let ignored = remembered
+        .reason()
+        .map(|reason| format!("Ignoring the saved filters: {}", reason));
+    let mut app = App::new(remembered.merge(cli));
+    if let Some(note) = &ignored {
+        // The run still starts from the command line alone, so this is worth saying but not fatal.
+        app.push_log(LogLine {
+            text: note.clone(),
+            is_error: true,
+        });
+    }
 
     // Loading is only attempted when the files are there, so the question comes before the wait.
     let cached = StaticData::is_cached();
@@ -169,7 +187,11 @@ pub async fn run(options: LpStoreOptions) -> io::Result<()> {
     };
     match ask {
         None => {
-            let form = startup_form(&app, &sdata);
+            let mut form = startup_form(&app, &sdata);
+            // The form owns the keyboard and the log panel cannot be opened over it, so a file that
+            // could not be read has to be said here or the user never learns their filters were
+            // dropped.
+            form.set_note(ignored);
             app.show_filters(form);
         }
         Some(reason) => app.open_static_data(reason),
@@ -309,6 +331,22 @@ fn apply(app: &mut App, session: &mut Session) {
     }
     app.set_applied(options);
     app.close_form();
+    remember(app, &saved_filters::path());
+}
+
+/// Keeps the filters this run was applied with, so the next session's dialog starts from them. Both
+/// branches reach it, including a depth-only apply, because "applied" is what the user pressed.
+///
+/// A failure is only worth a log line. The run is already going, and being unable to remember it is
+/// not a reason to stop the view. Split from the loop and given its path so the write can be tested
+/// without a terminal, the same way `write_export` is.
+fn remember(app: &mut App, file: &Path) {
+    if let Err(error) = saved_filters::save_to(file, &app.applied) {
+        app.push_log(LogLine {
+            text: format!("Could not save the filters: {}", error),
+            is_error: true,
+        });
+    }
 }
 
 /// Writes the report on screen to the file the prompt names. Success closes the prompt and says so
@@ -395,12 +433,12 @@ fn filter_summary(options: &LpStoreOptions) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{Overlay, Stage};
     use eve_lpstore::esi::loyalty::LoyaltyOffer;
     use eve_lpstore::report::Group;
     use eve_lpstore::static_data::AgentFilter;
     use eve_lpstore::{ExpenseBreakdown, OfferResult};
-
-    use crate::tui::app::Overlay;
+    use std::path::PathBuf;
 
     /// An app on the results view with the export prompt open and `path` typed into it.
     fn prompt(path: &str) -> App {
@@ -541,6 +579,90 @@ mod tests {
         let reason = Some(Err("data/regions.json is not valid JSON".to_string()));
         let ask = opening(true, reason);
         assert!(matches!(ask, Opening::Ask { reason: Some(_) }));
+    }
+
+    #[test]
+    fn an_applied_run_is_remembered() {
+        let file = PathBuf::from(format!("{}.json", temp_path("remember")));
+        let mut app = App::new(LpStoreOptions {
+            faction: Some("caldari".to_string()),
+            region: Some("Domain".to_string()),
+            expire: true,
+            ..Default::default()
+        });
+        remember(&mut app, &file);
+        let loaded = saved_filters::load_from(&file);
+        let saved_filters::Loaded::Filters(filters) = &loaded else {
+            panic!("expected the run to be remembered");
+        };
+        assert_eq!(filters.faction.as_deref(), Some("caldari"));
+        assert_eq!(filters.region.as_deref(), Some("Domain"));
+        assert!(app.log.back().is_none(), "a save that worked says nothing");
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn remembering_never_keeps_expire() {
+        // A remembered --expire would refetch every offer on every later session, so the run keeps
+        // it and the file does not.
+        let file = PathBuf::from(format!("{}.json", temp_path("expire")));
+        let mut app = App::new(LpStoreOptions {
+            expire: true,
+            ..Default::default()
+        });
+        remember(&mut app, &file);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("expire"), "the file kept it: {}", text);
+        assert!(app.applied.expire, "the run still has it");
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn a_failed_remember_is_only_a_log_line() {
+        // The run is already going, so a file that cannot be written must not stop the view.
+        let mut app = App::new(LpStoreOptions::default());
+        app.start_run(RunInfo {
+            region: "The Forge".to_string(),
+            corporations: 1,
+            filters: "none".to_string(),
+            depth: 10,
+            agent_filter: AgentFilter::default(),
+        });
+        remember(&mut app, Path::new("/no/such/directory/filters.json"));
+        assert_eq!(app.stage, Stage::Starting, "the run is untouched");
+        let line = app.log.back().expect("the failure is reported");
+        assert!(line.is_error);
+        assert!(
+            line.text.contains("Could not save the filters"),
+            "{}",
+            line.text
+        );
+    }
+
+    #[test]
+    fn remembered_filters_fill_the_startup_form() {
+        // The dialog is built from `app.applied`, so a merged run has to show what it will actually
+        // do rather than what the command line alone asked for.
+        let cli = LpStoreOptions {
+            region: Some("Sinq Laison".to_string()),
+            ..Default::default()
+        };
+        let remembered = saved_filters::SavedFilters {
+            lpstore: Some("Caldari Navy".to_string()),
+            depth: Some("20".to_string()),
+            ..Default::default()
+        };
+        let mut app = App::new(remembered.overlay(&cli));
+        let form = startup_form(&app, &StaticData::default());
+        assert_eq!(form.region, "Sinq Laison", "the flag wins");
+        assert_eq!(form.corporations, "Caldari Navy", "the file fills the rest");
+        assert_eq!(form.depth, "20");
+        assert_eq!(
+            app.filters, "--lpstore Caldari Navy",
+            "the remembered filter shows in the header"
+        );
+        app.show_filters(form);
+        assert_eq!(app.overlay, Overlay::Filters);
     }
 
     #[test]

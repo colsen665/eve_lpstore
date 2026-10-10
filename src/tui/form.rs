@@ -233,6 +233,13 @@ impl FilterForm {
         (!messages.is_empty()).then(|| messages.join("; "))
     }
 
+    /// A note about the values as they stand, shown where a field error would be. Used for a saved
+    /// filters file that could not be read: worth saying, but not a validation failure, so it does
+    /// not stop Enter from applying. A later `set_errors` replaces it.
+    pub fn set_note(&mut self, note: Option<String>) {
+        self.general_error = note;
+    }
+
     pub fn general_error(&self) -> Option<&str> {
         self.general_error.as_deref()
     }
@@ -413,6 +420,39 @@ mod tests {
         assert_eq!(applied.system, None);
         assert_eq!(applied.region.as_deref(), Some("The Forge"));
         assert_eq!(applied.depth.as_deref(), Some("10"));
+    }
+
+    #[test]
+    fn a_note_shows_where_a_field_error_would() {
+        let mut form = form();
+        assert_eq!(form.general_error(), None);
+        form.set_note(Some("filters.json is not valid JSON".to_string()));
+        assert_eq!(form.general_error(), Some("filters.json is not valid JSON"));
+        // A note is not a validation failure, so it must not stop the form from being applied.
+        assert_eq!(form.error_for(FormField::Corporations), None);
+    }
+
+    #[test]
+    fn a_validation_failure_replaces_the_note() {
+        let mut form = form();
+        form.set_note(Some("filters.json is not valid JSON".to_string()));
+        form.set_errors(vec![OptionError {
+            field: Field::Region,
+            message: "no such region".to_string(),
+        }]);
+        assert_eq!(form.general_error(), None, "the note is gone");
+        assert_eq!(
+            form.error_for(FormField::Region),
+            Some("no such region".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_the_note_leaves_nothing_shown() {
+        let mut form = form();
+        form.set_note(Some("anything".to_string()));
+        form.set_note(None);
+        assert_eq!(form.general_error(), None);
     }
 
     #[test]
