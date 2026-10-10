@@ -73,6 +73,21 @@ CLI output stays the same, except that it prints every filter error, and lists c
   bytes. The required items and the offers that failed to price are JSON only, since a flat row has
   nowhere for them.
 
+#### Phase 7: Filters first on startup
+
+- [ ] Extract the cache check from `load` as `StaticData::is_cached`. It is already there as four `exists()` calls on `data/`, and `data/` is gitignored, so a fresh clone takes the uncached path on first run.
+- [ ] When static data is missing under `--tui`, start the TUI with `StaticData::default()` and show a download/exit dialog as a new overlay, beside Log, Help, Filters, Donate, and Export. Download writes the four `data/` files and then the filters dialog opens; exit stops the application.
+- [ ] Run the download on the async runtime, not the UI thread. `ui_loop` is sync inside `spawn_blocking` and `StaticData::load` is async, so spawn it on `session.handle` with a oneshot for the result, the way `spawn_run` already does. While it runs show an indeterminate "Downloading static data" line: `download_and_cache` reads the whole response in one `bytes().await` and reports nothing, and byte progress would mean switching it to a streamed read.
+- [ ] On success, assign the loaded data to `session.sdata`, which every draw reads fresh, and open the filters dialog. On failure, keep the dialog open with the reason and offer to try again or exit, instead of the `eprintln!` and `exit(1)` in `main` today.
+- [ ] Move `resolve` and `run_info` to the Enter that starts the first run, so the cached and uncached paths take one route. Consequence: an unresolvable command-line value, such as a region name that does not exist, now lands in the filter form through `set_errors` rather than printing to a normal terminal and exiting. Unknown flags are still rejected in `main` before the TUI starts, which narrows the Phase 2 guarantee to parsing.
+- [ ] Open the filters dialog before the first run is spawned, so no ESI request goes out until Enter is pressed.
+- [ ] Pre-fill region and depth from their defaults when the command line did not set them, and leave the seven filter fields blank. Blank is what means "all" or "any" for corporations, security, agent level, division, type, faction, and system, and the hint text already says so; a pre-filled value would silently narrow the run.
+- [ ] Make the first Enter start a run even when nothing changed. `apply` compares against `app.applied` with `same_run`, and the startup dialog opens with the command-line options already in `applied`, so an unchanged Enter matches and only re-renders.
+- [ ] Give `Session.current` a no-run state. The footer reads `current.client.status()` every frame, so show `ClientStats::default()` until the first run exists.
+- [ ] Esc in the startup filters dialog quits. There are no results to return to, and no ESI request should go out unless Enter was pressed. The dialog opened later with `f` keeps its current Esc-cancels behaviour.
+- [ ] In `--example` and `--lpstores`, print one line before downloading, then keep the current behaviour. They have no TUI to host a dialog.
+- [ ] Tests: the dialog opens when the cache is missing, download leads to the filters dialog, exit stops the application, a failure keeps the dialog open with the reason, the filters dialog opens pre-filled, Enter with no edits starts a run, and Esc quits.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.
