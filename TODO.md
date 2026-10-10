@@ -169,6 +169,144 @@ accepted flag that says what now happens anyway.
 - [x] The `--verbose` path lines were the loose end the todo flagged, and the fix is a one-line condition rather than a move: with `mode != Mode::Tui` they print to stdout, and in the view `eve_lpstore::tui::run` already logs both roots unconditionally, so they are reported in both cases and never on the screen the view is about to take over.
 - [x] Tests: 5 added for `mode_of`, covering a bare run with and without a terminal, `--tui` with and without one, the other two modes, filters that do not change the mode, `--clear-cache` alone and beside `--lpstores`, and `--example` alone. `src/main.rs` had 3 tests before, all for `--clear-cache`, and none for argument handling.
 
+#### Phase 10: Where a mission can actually take you
+
+The details pane lists each corporation's agent systems, but a mission from an agent in one of those
+systems does not necessarily run there, so the listed security is not the security you will be flying
+in. For each listed system, list the possible destination systems with the probability of a mission
+appearing in each, grouped by rounded security rating.
+
+Scope for this iteration: **security-division missions from basic agents, excluding burners**. Measured
+against the cached agent data that is 2,929 of 9,057 agent rows, 152 of the 178 corporations, levels
+1 through 5 at 856, 861, 673, 502 and 37 rows, across 1,700 systems that host any cached agent.
+
+Scope of the model, as decided: **a destination is reachable through jump gates only.** That settles
+the earlier open question as a scoping choice rather than a discovered fact, and it carries an accepted
+limitation: if the game also routes missions over links that are not gates, those cases are outside what
+this tool models, and the numbers it shows are then incomplete rather than wrong. Say which it is in
+any text the view shows, so a user is not told a set is complete when it is defined as gate-only.
+
+Model for regular missions, as given: **a level 1 to 5 mission from a basic security agent lands
+inside the constellation the agent sits in**, and every system in that constellation is an equally
+likely destination. Probabilities are then a count of systems aggregated into rounded security bands.
+Worked example, verified against `displayed_security`: a constellation of four systems with true
+security 0.49, 0.5, 0.51 and 0.6 rounds to 0.5, 0.5, 0.5 and 0.6, so band 0.5 holds three systems and
+shows 0.75, and band 0.6 holds one and shows 0.25. That is uniform over systems, not over bands, so a
+band with three systems is three times as likely as one with a single system.
+
+Burners, which are deferred, are said to reach the current or a neighbouring constellation.
+
+The same weights apply for a second grouping by **distance from the agent system in jumps**: 0 jumps is
+the agent's own system, 1 jump the systems one gate away, and so on. Both groupings are marginals of one
+uniform distribution over the constellation's systems, so a system contributes its `1/n` to whichever
+band and whichever distance it belongs to. The distance in the details pane is unambiguous per row,
+because each listed system is itself an agent system and the counting starts there.
+
+Worked through the four-system example, which shows why the two groupings behave differently. The
+security marginal is `0.75 / 0.25` in every case, because it counts systems per band and ignores the
+graph. The distance grouping depends on the graph and on where the agent sits, and these are the
+possibilities for one constellation:
+
+| topology and agent system | 0 jumps | 1 jump | 2 jumps | 3 jumps |
+| --- | --- | --- | --- | --- |
+| chain A-B-C-D, agent at 0.49 | 0.25 | 0.25 | 0.25 | 0.25 |
+| chain A-B-C-D, agent at 0.51 | 0.25 | 0.50 | 0.25 | - |
+| star, hub 0.49 | 0.25 | 0.75 | - | - |
+| star, hub 0.60 | 0.25 | 0.75 | - | - |
+
+Two readings of the same four systems differ as much as 0.25 against 0.75 at one jump, so the distance
+table is only as good as the gate topology behind it, which the data does not have yet. The security
+table can be built today from `constellationID` plus the cached security values, the distance table
+needs the gate edges as well.
+
+
+
+What the data supports, and two gaps that are not the adjacency gap:
+
+- [ ] Constellation membership is available and thrown away. `mapSolarSystems.jsonl` carries 17 fields
+      per system including `constellationID`, `stargateIDs`, `border`, `hub` and `securityClass`, and
+      `SdeSolarSystem` keeps four of them: id, name, true security and region. Keeping
+      `constellationID` is one more field, which means an `AgentCache` version bump so an existing
+      install reads as uncached and asks before refetching, the way the system-to-region mapping did.
+- [ ] Gate edges need a table the project does not load. `stargateIDs` lists the gates in a system,
+      not the systems they lead to, so an edge list has to come from elsewhere. An earlier scan of the
+      archive filtered names on containing `system` or `region` and found no jumps file, which does
+      hold for a name like `mapSolarSystemJumps.jsonl`, but that scan could not have detected a
+      `mapStargates`-style file, since the name contains neither word. Check the listing unfiltered
+      before either claiming or ruling it out.
+- [ ] No adjacency of any kind is loaded today: `extract_agent_cache` reads seven SDE files and none
+      of them links systems.
+- [ ] Under uniform weighting, the missing space systems stop being a cosmetic gap. A constellation
+      whose real membership includes a system absent from the cached set has too few systems in its
+      denominator, so every probability shown is inflated and the bands can shift: if a four-system
+      constellation is really five counting a space system, the example above reads 0.6 and 0.2 rather
+      than 0.75 and 0.25. Constellation membership therefore has to come from a source complete enough
+      to include those systems, and the counts for a few known constellations are worth checking
+      against the game before any table is trusted. `constellationID` is not cached yet, so this
+      cannot be measured here today.
+- [ ] The systems most likely to be mission destinations are **not in the cached data at all**, which
+      is a separate gap from adjacency. `mapSolarSystems.jsonl` is cached as 8,490 systems, every one
+      resolving to the 114 regions in `regions.json`. Probing 15 names of space-only, wormhole and
+      Pochven systems found only `Tama`, a lowsec system; `Jita Space` is absent, along with `Nami`,
+      `Akkonen`, `Kourri`, `Irala`, `Otomuo` and the rest of the probe. So the example given, a dead-end
+      system reached by one gate from Jita, is exactly the class this data lacks, and no amount of gate
+      edges recovers it. Either the system set is extended from another source, or destinations are
+      limited to known space and the view says that is what it is showing.
+
+Sources named for the research on how many jumps, none of it consulted yet: the EVE University wiki at
+`https://wiki.eveuniversity.org/`, whose mission and system-security pages are the likeliest to state
+where complexes spawn and which rounding the wiki already documents; the official forums at
+`https://forums.eveonline.com/`, where long-running theory threads often carry the measurements; and
+`https://www.reddit.com/r/Eve/`, which tends to hold the practical player data and any tooling that
+already records offered missions. Weigh any finding against the other two, prefer a source that states
+when it was written, and treat a source describing non-gate routing as evidence about the game rather
+than a reason to reopen the gate-only scope without deciding to.
+
+What remains open is now one display decision plus the data gaps listed above; the earlier questions
+about what a probability means and whether the level matters were settled by the uniform-weighting
+model rather than by a dialog, so they are not re-asked:
+
+The uniform-weighting choice settles the question that was open about what a probability means, and it
+removes the reason to fold in the agent level: levels 1 to 5 share one destination set, so one table
+per listed system describes the scoped case. Two things follow from the model rather than being
+decisions, and belong to it: the share of missions that are burner missions is still level dependent,
+since only level 4 offers them, and that is deferred with burners; and the weighting is a stated
+assumption about the game, not a measurement, so the view should present it as the model it is.
+- [ ] Where it appears. Options are an overlay on its own key, lines under each system in the details
+      pane, a compact suffix on the corporation line, or a column in the groups pane. The details pane
+      is already the tallest region of the view and holds the offer breakdown, which argues against
+      adding rows there.
+- [ ] Grouping uses the same rounding the security filter already applies, so a band on screen is a
+      band a user can type. `displayed_security` returns tenths, `-0.004` rounds to zero, and
+      `--security 0.5..0.7` compares on those tenths, so grouping goes through that function rather
+      than rounding a second time. Negative levels are reachable, since nullsec is negative and the
+      filter accepts -1.0 to 1.0.
+
+Deferred to a later phase:
+
+- [ ] Burner and anomic variants. These are acquired from a level 4 basic security agent, the same
+      agent that offers the ordinary mission, so excluding them is a rule about the mission variant and
+      not about the agent: 502 such agents across 125 corporations sit in 457 systems. A system
+      hosting one has two destination sets, and a single probability per destination would mix them.
+- [ ] Burner destinations cannot be named from this data, which the probe above answers rather than
+      leaves open: the cached `mapSolarSystems` rows are known space only, so other-space systems are
+      not reachable by name, id or security band. A burner phase needs a system source that includes
+      them, and until then it can state the chance of a mission being a burner mission without naming
+      where it would go.
+- [ ] The remaining agent rows, 6,128 of them, covering non-security divisions and the research,
+      story, factional warfare, epic arc and event types.
+- [ ] Authenticated character data of any kind, and the CSV and JSON exports, neither of which has a
+      shape today for a list of destinations per system.
+- [ ] Tests that do not depend on the missing data. The four-system example is a good fixture, because
+      it pins the band rounding (0.49, 0.5 and 0.51 to 0.5, and 0.6 to 0.6) and the weights (0.75 and
+      0.25), and its security marginal is the same for every topology and every agent system, which is
+      worth asserting as an invariant: uniform weight per system makes the security grouping a count,
+      so a change that alters it while the membership did not change is a bug in the rounding or the
+      weights. Distance grouping needs a graph, so it can be tested on a hand-built chain and star with
+      the table above as the expectation. Also: zero and negative bands, and the cache-version gate for
+      a file without a new field. No live terminal check is claimed for the display, per the standing
+      note on such checks.
+
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
