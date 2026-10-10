@@ -83,6 +83,9 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub struct RunInfo {
     pub region: String,
+    /// The region prices are read from, as an id. The label above is for the header; this is what
+    /// says whether a new run moved regions.
+    pub region_id: i32,
     pub corporations: usize,
     pub filters: String,
     pub depth: usize,
@@ -91,6 +94,8 @@ pub struct RunInfo {
 
 pub struct App {
     pub region: String,
+    /// The region of the run in progress, or the one last started. Zero until a run exists.
+    pub region_id: i32,
     pub corporations: usize,
     pub filters: String,
     pub depth: usize,
@@ -133,6 +138,7 @@ impl App {
         let form = FilterForm::from_options(&applied);
         Self {
             region: String::new(),
+            region_id: 0,
             corporations: 0,
             filters,
             depth: DEFAULT_DEPTH,
@@ -226,6 +232,7 @@ impl App {
     /// Takes in what a run was resolved to, without moving the stage on or logging it.
     pub(crate) fn begin_run(&mut self, info: RunInfo) {
         self.region = info.region;
+        self.region_id = info.region_id;
         self.corporations = info.corporations;
         self.filters = info.filters;
         self.agent_filter = info.agent_filter;
@@ -644,6 +651,7 @@ mod tests {
     fn info(depth: usize) -> RunInfo {
         RunInfo {
             region: "The Forge".to_string(),
+            region_id: 10000002,
             corporations: 3,
             filters: "none".to_string(),
             depth,

@@ -1269,6 +1269,7 @@ mod tests {
     fn results_app(offers: Vec<OfferResult>, depth: usize) -> App {
         let info = RunInfo {
             region: "The Forge".to_string(),
+            region_id: 10000002,
             corporations: 1,
             filters: "none".to_string(),
             depth,

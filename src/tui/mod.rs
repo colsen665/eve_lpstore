@@ -327,18 +327,75 @@ fn log_roots(app: &mut App, paths: &Paths) {
     }
 }
 
+/// Whether applying `resolved` moves the pricing to a different region than the run in progress.
+///
+/// Compared on ids rather than the typed text, so `Domain` and `10000043` are the same region and
+/// the system field survives. There is no run to compare against before the first Enter.
+fn region_moved(has_run: bool, current: i32, resolved: &Resolved) -> bool {
+    has_run && current != resolved.region_id
+}
+
+/// Clears `Market system` when the region moved out from under it, and returns `false` if the form
+/// has to show errors instead of running.
+///
+/// A system prices from the NPC stations in it, so one left over from the previous region matches
+/// no orders there and every lookup fails. The second resolve is what makes the cleared field real:
+/// the station list comes from that result, so keeping the first would run against the old system's
+/// stations while the form showed an empty box.
+fn clear_system_on_region_move(
+    app: &mut App,
+    options: &mut LpStoreOptions,
+    resolved: &mut Resolved,
+    sdata: &StaticData,
+    has_run: bool,
+) -> bool {
+    if !region_moved(has_run, app.region_id, resolved) || resolved.system.is_none() {
+        return true;
+    }
+    options.system = None;
+    app.form.system = String::new();
+    match options.resolve(sdata) {
+        Ok(next) => {
+            *resolved = next;
+            app.push_log(LogLine {
+                text: "Cleared the market system, which belonged to the previous region"
+                    .to_string(),
+                is_error: false,
+            });
+            true
+        }
+        // Clearing a filter cannot introduce an error, so this only keeps the compiler honest.
+        Err(errors) => {
+            app.form.set_errors(errors);
+            false
+        }
+    }
+}
+
 /// Checks every field of the form. If they are all valid, a change to the depth only
 /// re-renders, and any other change replaces the current run with one using the new filters.
 /// Otherwise the errors are shown beside their fields and nothing runs.
 fn apply(app: &mut App, session: &mut Session) {
-    let options = app.form.to_options(&app.applied);
-    let resolved = match options.resolve(&session.sdata) {
+    let mut options = app.form.to_options(&app.applied);
+    let mut resolved = match options.resolve(&session.sdata) {
         Ok(resolved) => resolved,
         Err(errors) => {
             app.form.set_errors(errors);
             return;
         }
     };
+    // A system from the previous region prices against stations that region has no orders for, so
+    // the region moving clears the field.
+    let keep_going = clear_system_on_region_move(
+        app,
+        &mut options,
+        &mut resolved,
+        &session.sdata,
+        session.current.is_some(),
+    );
+    if !keep_going {
+        return;
+    }
     if is_repeat(session.current.is_some(), &options, &app.applied) {
         app.apply_depth(resolved.depth);
     } else {
@@ -412,6 +469,7 @@ fn write_export(app: &mut App, sdata: &StaticData) {
 fn run_info(resolved: &Resolved, filters: String) -> RunInfo {
     RunInfo {
         region: resolved.region_label.clone(),
+        region_id: resolved.region_id,
         corporations: resolved.corp_ids.len(),
         filters,
         depth: resolved.depth,
@@ -472,6 +530,7 @@ mod tests {
     fn prompt(path: &str) -> App {
         let info = RunInfo {
             region: "The Forge".to_string(),
+            region_id: 10000002,
             corporations: 1,
             filters: "none".to_string(),
             depth: 10,
@@ -676,6 +735,7 @@ mod tests {
         let mut app = App::new(LpStoreOptions::default());
         app.start_run(RunInfo {
             region: "The Forge".to_string(),
+            region_id: 10000002,
             corporations: 1,
             filters: "none".to_string(),
             depth: 10,
@@ -758,6 +818,155 @@ mod tests {
             !is_repeat(true, &other_region, &base),
             "a new region is a new run"
         );
+    }
+
+    /// The re-resolve goes through `resolve`, which reads the runtime's worker count for the
+    /// concurrency default, so this one needs a runtime rather than a plain test.
+    #[tokio::test]
+    async fn a_moved_region_clears_the_leftover_system_and_rebuilds_the_run() {
+        let mut app = App::new(LpStoreOptions {
+            system: Some("Jita".to_string()),
+            ..Default::default()
+        });
+        app.region_id = 10000002; // The Forge, where Jita is
+        app.form.system = "Jita".to_string();
+        let mut options = app.form.to_options(&app.applied);
+        // The stations of a system are what `resolve` finds there, so the fixture carries them the
+        // way a real resolved run does.
+        let stations: std::collections::HashSet<i64> = [60003760].into_iter().collect();
+        let mut resolved = Resolved {
+            region_id: 10000043,
+            system: Some(eve_lpstore::report::SystemSummary {
+                value: "Jita".to_string(),
+                stations: 1,
+            }),
+            locations: Some(stations.into()),
+            ..resolved_fixture()
+        };
+
+        let keep_going =
+            clear_system_on_region_move(&mut app, &mut options, &mut resolved, &sdata(), true);
+
+        assert!(keep_going, "clearing a filter cannot fail to resolve");
+        assert_eq!(options.system, None, "the run drops the old system");
+        assert_eq!(app.form.system, "", "the form shows it dropped");
+        assert!(
+            resolved.system.is_none(),
+            "the rebuilt run has no station filter"
+        );
+        assert!(resolved.locations.is_none(), "and no station list");
+        let line = app.log.back().expect("the clearing is logged");
+        assert!(
+            line.text.contains("Cleared the market system"),
+            "{}",
+            line.text
+        );
+        assert!(!line.is_error, "nothing went wrong");
+    }
+
+    #[test]
+    fn a_system_survives_when_the_region_did_not_move() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.region_id = 10000002;
+        app.form.system = "Jita".to_string();
+        let mut options = app.form.to_options(&app.applied);
+        let mut resolved = Resolved {
+            system: Some(eve_lpstore::report::SystemSummary {
+                value: "Jita".to_string(),
+                stations: 1,
+            }),
+            ..resolved_fixture()
+        };
+        let before = resolved.clone();
+
+        assert!(clear_system_on_region_move(
+            &mut app,
+            &mut options,
+            &mut resolved,
+            &sdata(),
+            true
+        ));
+        assert_eq!(
+            resolved.system.as_ref().map(|s| s.value.clone()),
+            before.system.as_ref().map(|s| s.value.clone())
+        );
+        assert_eq!(options.system.as_deref(), Some("Jita"));
+        assert_eq!(app.form.system, "Jita");
+        assert!(
+            app.log.is_empty(),
+            "nothing was cleared, so nothing is logged"
+        );
+    }
+
+    #[test]
+    fn the_first_enter_never_clears_because_there_is_no_previous_region() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.form.system = "Jita".to_string();
+        let mut options = app.form.to_options(&app.applied);
+        let mut resolved = Resolved {
+            region_id: 10000043,
+            system: Some(eve_lpstore::report::SystemSummary {
+                value: "Jita".to_string(),
+                stations: 1,
+            }),
+            ..resolved_fixture()
+        };
+
+        assert!(clear_system_on_region_move(
+            &mut app,
+            &mut options,
+            &mut resolved,
+            &sdata(),
+            false
+        ));
+        assert_eq!(
+            options.system.as_deref(),
+            Some("Jita"),
+            "kept for the first run"
+        );
+        assert!(app.log.is_empty());
+    }
+
+    /// An empty `StaticData`, which resolves a blank system to none. The clearing path only needs
+    /// `system` to be unset there, so an empty cache exercises it.
+    fn sdata() -> StaticData {
+        StaticData::default()
+    }
+
+    #[test]
+    fn a_region_change_is_judged_on_the_id_not_the_typed_name() {
+        let resolved = |region_id: i32| Resolved {
+            region_id,
+            ..resolved_fixture()
+        };
+        assert!(
+            !region_moved(false, 0, &resolved(10000043)),
+            "the first Enter has no previous region"
+        );
+        assert!(region_moved(true, 10000002, &resolved(10000043)));
+        assert!(
+            !region_moved(true, 10000043, &resolved(10000043)),
+            "the same region typed differently has not moved"
+        );
+    }
+
+    /// A `Resolved` for the tests above, with only the region id varying.
+    fn resolved_fixture() -> Resolved {
+        Resolved {
+            corp_ids: vec![1000002],
+            filter_summary: None,
+            agent_filter: AgentFilter::default(),
+            region_id: 10000002,
+            region_label: "The Forge".to_string(),
+            system: None,
+            locations: None,
+            cache_offset: Duration::from_secs(60),
+            concurrency: 2,
+            max_inflight: 4,
+            depth: 10,
+            expire: false,
+            verbose: false,
+        }
     }
 
     #[test]
