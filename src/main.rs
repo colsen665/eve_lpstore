@@ -14,14 +14,16 @@ fn print_status(s: &ClientStats) {
 }
 
 const HELP_TEXT: &str = "\
-Usage: eve_lpstore <mode> [FILTERS] [OPTIONS]
+Usage: eve_lpstore [MODE] [FILTERS] [OPTIONS]
 
 Modes:
   --example              Run the general ESI and static data example.
-  --lpstores             Calculate expenses, profit, and ISK per LP for LP store offers and show the top 10.
+  --lpstores             Calculate expenses, profit, and ISK per LP for LP store offers and show the top 10, as text on standard output.
   --tui                  Show --lpstores in a full-screen view that updates while it runs. Asks for
                          the filters first, and for the static data if it is not on disk. Remembers
-                         the filters it applies in filters.json. Implies --lpstores.
+                         the filters it applies in a file in the platform config directory.
+                         This is the default when no mode is given and standard output is a terminal;
+                         with no terminal it prints the usage line instead.
   --help                 Show this help and exit.
 
 Filters (apply to --lpstores):
@@ -36,17 +38,21 @@ Filters (apply to --lpstores):
 
 Options:
   --region <id|name>     Market region used for pricing, by ID or name. Defaults to The Forge (10000002).
-  --status               Print API call status every second while running. With --tui, the footer shows it instead.
+  --status               Print API call status every second while running. In the full-screen view, the default when no mode is given, the footer shows it instead.
   --expire               Ignore cached responses and call the API again.
   --cache-minutes <n>    Extend how long cached responses are reused, by n minutes past their Expires time. Default 0 for --example, and the number of corporations for --lpstores. Use 0 to turn it off.
   --cache-dir <path>     Where to keep ESI responses, instead of the platform cache directory. The static data does not move with it.
   --concurrency <n>      Corporation groups priced at once with --lpstores. Default 2x the tokio worker threads.
   --max-inflight <n>     Maximum ESI requests in flight at once across all groups. Default 4.
   --depth <n>            Offers printed per corporation group with --lpstores. Default 10.
-  --verbose              Print cache hits, misses, and writes, with reasons and file names. With --tui, they go to the log.
-  --clear-cache          Delete the cached ESI responses, and the static data archive if one is on disk. The four extracted static data files stay.
+  --verbose              Print cache hits, misses, and writes, with reasons and file names. In the full-screen view, the default when no mode is given, they go to the log, and so do the two lines naming the cache and data directories.
+  --clear-cache          Delete the cached ESI responses, and the static data archive if one is on disk. The four extracted static data files stay. With no other mode this stops there rather than opening the full-screen view.
 
 Examples:
+  eve_lpstore
+      Open the full-screen view over every corporation, asking for the filters first. This is the
+      same as --tui, and prints the usage line when standard output is not a terminal.
+
   eve_lpstore --example
       Run the general ESI and static data example.
 
@@ -140,12 +146,16 @@ async fn main() {
         i += 1;
     }
 
+    // Only an explicit `--tui` is checked against the terminal. A bare run reaches `mode_of`, which
+    // falls back to the usage line when there is nowhere to draw, so a pipe is not made to look like
+    // a failure it did not ask for.
     let tui = args.iter().any(|a| a == "--tui");
+    let on_a_terminal = std::io::stdout().is_terminal();
     if tui && args.iter().any(|a| a == "--example") {
         eprintln!("--tui cannot be combined with --example");
         std::process::exit(1);
     }
-    if tui && !std::io::stdout().is_terminal() {
+    if tui && !on_a_terminal {
         eprintln!("--tui needs an interactive terminal on stdout");
         std::process::exit(1);
     }
@@ -177,6 +187,8 @@ async fn main() {
         expire,
         verbose,
     };
+    let mode = mode_of(&args, clear_cache, on_a_terminal);
+
     // Every mode that runs needs both roots, including a bare --clear-cache, so the home directory
     // is settled before any of them. Refusing here rather than falling back to the working
     // directory keeps the relative-path behaviour this replaces from creeping back in.
@@ -192,48 +204,105 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if verbose {
+    // The view draws over stdout, so the paths it needs go to its log instead of the screen it is
+    // about to take over. `eve_lpstore::tui::run` reports both roots there unconditionally.
+    if verbose && mode != Mode::Tui {
         println!("Cache: {}", paths.cache.display());
         println!("Static data: {}", paths.data.display());
         warn_ignored_local_dirs();
     }
-    if args.iter().any(|a| a == "--example") {
-        let parsed = match options.parse() {
-            Ok(parsed) => parsed,
-            Err(errors) => exit_with_errors(errors),
-        };
-        if clear_cache {
+    match mode {
+        Mode::Example => {
+            let parsed = match options.parse() {
+                Ok(parsed) => parsed,
+                Err(errors) => exit_with_errors(errors),
+            };
+            if clear_cache {
+                clear_cached_files(&paths.cache, &paths.data);
+            }
+            let cache_offset =
+                std::time::Duration::from_secs(parsed.cache_minutes.unwrap_or(0) * 60);
+            if let Err(e) = run_example(
+                status,
+                expire,
+                verbose,
+                options.region.as_deref(),
+                cache_offset,
+                parsed.max_inflight,
+                &paths,
+            )
+            .await
+            {
+                eprintln!("Example failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Mode::Lpstores | Mode::Tui => {
+            let tui = mode == Mode::Tui;
+            run_lpstores(status, options, clear_cache, tui, paths).await;
+        }
+        Mode::ClearOnly => {
+            if let Err(errors) = options.parse() {
+                exit_with_errors(errors);
+            }
             clear_cached_files(&paths.cache, &paths.data);
         }
-        let cache_offset = std::time::Duration::from_secs(parsed.cache_minutes.unwrap_or(0) * 60);
-        if let Err(e) = run_example(
-            status,
-            expire,
-            verbose,
-            options.region.as_deref(),
-            cache_offset,
-            parsed.max_inflight,
-            &paths,
-        )
-        .await
-        {
-            eprintln!("Example failed: {}", e);
-            std::process::exit(1);
-        }
-    } else if tui || args.iter().any(|a| a == "--lpstores") {
-        run_lpstores(status, options, clear_cache, tui, paths).await;
-    } else {
-        if let Err(errors) = options.parse() {
-            exit_with_errors(errors);
-        }
-        if clear_cache {
-            clear_cached_files(&paths.cache, &paths.data);
-        } else {
+        Mode::Usage => {
+            if let Err(errors) = options.parse() {
+                exit_with_errors(errors);
+            }
             println!(
-                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--cache-dir <path>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <level|range>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]",
+                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--cache-dir <path>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <level|range>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]\n\
+                 With no mode, opens the --tui view on a terminal; the modes above are the ways to ask for something else.",
                 args[0]
             );
         }
+    }
+}
+
+/// What the arguments ask for, once whether stdout is a terminal is known.
+///
+/// A function rather than a test spread over `main`, because the choice decides four things at
+/// once — what runs, whether the cache is cleared and the program exits, and whether the usage line
+/// is printed — and each of those reads a different argument today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The general ESI and static data example.
+    Example,
+    /// The text report on standard output.
+    Lpstores,
+    /// The full-screen view. What no mode asks for, when there is a terminal to draw on.
+    Tui,
+    /// Only the `--clear-cache` action, then stop.
+    ClearOnly,
+    /// No mode, and nowhere to draw the view, so print how to use the program.
+    Usage,
+}
+
+/// Pick the mode. Explicit modes win in the order the arguments already test them, so
+/// `--example --lpstores` keeps meaning the example.
+///
+/// With no mode at all, `--clear-cache` stays a maintenance action that finishes when the deleting
+/// is done, and anything else opens the view. That falls back to the usage line when stdout is not a
+/// terminal, so a pipe and a CI job see help rather than a failure they did not ask for. Asking for
+/// `--tui` by name with no terminal is a different case: the program cannot do what was asked, and
+/// `main` reports that instead of quietly printing usage.
+fn mode_of(args: &[String], clear_cache: bool, on_a_terminal: bool) -> Mode {
+    if args.iter().any(|a| a == "--example") {
+        return Mode::Example;
+    }
+    if args.iter().any(|a| a == "--lpstores") {
+        return Mode::Lpstores;
+    }
+    if args.iter().any(|a| a == "--tui") {
+        return Mode::Tui;
+    }
+    if clear_cache {
+        Mode::ClearOnly
+    } else if on_a_terminal {
+        Mode::Tui
+    } else {
+        Mode::Usage
     }
 }
 
@@ -538,6 +607,59 @@ mod tests {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::time::Instant::now().hash(&mut hasher);
         (hasher.finish() % 100_000) as u32
+    }
+
+    fn args(text: &str) -> Vec<String> {
+        let mut args = vec!["eve_lpstore".to_string()];
+        args.extend(text.split_whitespace().map(str::to_string));
+        args
+    }
+
+    #[test]
+    fn a_bare_run_opens_the_view_on_a_terminal_and_usage_otherwise() {
+        assert_eq!(mode_of(&args(""), false, true), Mode::Tui);
+        assert_eq!(mode_of(&args(""), false, false), Mode::Usage);
+    }
+
+    #[test]
+    fn naming_the_view_keeps_its_own_meaning_on_either_output() {
+        // `main` reports the no-terminal case as an error, because the program cannot do what was
+        // asked. The mode function only says what was asked for, which is the same either way.
+        assert_eq!(mode_of(&args("--tui"), false, true), Mode::Tui);
+        assert_eq!(mode_of(&args("--tui"), false, false), Mode::Tui);
+    }
+
+    #[test]
+    fn the_other_two_modes_still_select_themselves() {
+        assert_eq!(mode_of(&args("--lpstores"), false, true), Mode::Lpstores);
+        assert_eq!(mode_of(&args("--example"), false, true), Mode::Example);
+        // Filters and options do not change the mode, with or without a terminal.
+        assert_eq!(
+            mode_of(&args("--lpstores --depth 5 --verbose"), true, true),
+            Mode::Lpstores
+        );
+    }
+
+    #[test]
+    fn clearing_the_cache_alone_is_its_own_mode() {
+        assert_eq!(mode_of(&args("--clear-cache"), true, true), Mode::ClearOnly);
+        assert_eq!(
+            mode_of(&args("--clear-cache"), true, false),
+            Mode::ClearOnly
+        );
+        // With a mode named, clearing is something that run does on the way past it.
+        assert_eq!(
+            mode_of(&args("--clear-cache --lpstores"), true, true),
+            Mode::Lpstores
+        );
+    }
+
+    #[test]
+    fn an_explicit_mode_wins_over_the_default() {
+        // --example and --tui together is refused in main before this is reached, so the order here
+        // only decides what a lone --example or --lpstores means.
+        assert_eq!(mode_of(&args("--example"), false, false), Mode::Example);
+        assert_eq!(mode_of(&args("--lpstores"), false, false), Mode::Lpstores);
     }
 
     #[test]
