@@ -42,7 +42,7 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] Status bar: in flight, waiting, rate limit, errors, and cache hits, misses, and writes.
 - [x] Log panel (`l`): cache lines under `--verbose`, plus fetch and pricing errors.
 - [x] Keys: arrows or j/k to move, Tab to switch panes, PgUp/PgDn to scroll, `?` for help, and `q` to quit. Ctrl-C also quits. Quitting aborts the current run.
-- [x] Show a "terminal too small" message below 80x20.
+- [x] Show a "terminal too small" message below the minimum size, then 80x20. The height is 80x24 now, raised when the Filters page grew to twelve fields; see *Filter agents by where they stand*.
 
 #### Phase 4: Filter editing
 
@@ -502,6 +502,61 @@ Deferred to a later phase:
       that no gated constellation contains a gateless member, and 52 of the 1,239 distinct Security
       agent systems (4.2%) sit in those gateless pockets, where every row the pane prints is like this
       one. Open question below: what such a row should say.
+### Filter agents by where they stand
+
+`--agent-region` and `--agent-system`, with the same pair of boxes on the Filters page directly
+below `Security`. They choose which corporations are processed by asking where the corporation's
+agents stand, which is a different question from `--region` and `--system`, where the prices are read
+from. Measured on the real archive to keep the two apart in the wording: 283 corporations are cached,
+114 regions and 8,490 systems are known, and the two pairs name the same kind of value for entirely
+separate purposes.
+
+- [x] Resolution follows the market pair exactly: a number is taken as an ID without checking it
+      exists, a name is looked up and refused when nothing answers it, and a blank field is no filter.
+      `--agent-region Blach Riss` prints `Region 'Blach Riss' not found`; `--agent-system "Jita Space"`
+      prints `Unknown --agent-system 'Jita Space'`, which is the answer ESI gives too — there is no
+      such system.
+- [x] All the conditions still have to hold for the **same agent**, as the help text has always
+      promised. A corporation with a level 4 agent in region 8 and a level 2 agent in region 7 fails
+      `--agent-region 8 --agent-level 2` even though each half matches somewhere. Tested against a
+      fixture with agents on both sides of a region border.
+- [x] The Filters page is twelve fields now, one line each, and the notes beneath them carry the
+      hints, the valid values, and every validation error. At the old 20-row minimum the notes had two
+      rows of room, and two more fields would have taken that to zero: a form that cannot show its own
+      errors. `MIN_HEIGHT` is 24, with a test that each new field's hint and a planted error are
+      visible at exactly the minimum size, so the room is not lost again silently.
+- [x] The TUI checks the agent pair the way it checks the market pair: `Agent system` is cleared when
+      the agent region moves out from under it, with a log line saying so, and a pair that disagrees
+      is refused on the system field before the run starts rather than quietly keeping nothing. The
+      command line keeps its existing behaviour of letting a mismatched pair through, which is what
+      `--region` and `--system` do today: measured, `--agent-region "Black Rise" --agent-system Jita`
+      prints `Filtered to 0 corporations ... (1 removed)`.
+- [x] Verified against the live data rather than only fixtures: `--agent-system Jita` keeps Paragon
+      and prices it; the region `Black Rise` keeps 9 corporations, and its ID `10000069` keeps the
+      same 9, so the name and the number are the same filter; `--agent-system Bayuka --agent-level 1`
+      keeps Ammatar Consulate, which is the corporation the Phase 10 destination work found in that
+      constellation; `--agent-region "Black Rise" --security 0.4..0.5` keeps 5, fewer than the 9 the
+      region alone keeps, which is the same-agent rule narrowing further.
+- [x] The remembered filters in `filters.json` carry both new values, and a filter named in the
+      header line reads `--security 0.5..0.7 --agent-region Black Rise --agent-system 4-3L53` in the
+      order the form shows them.
+- [x] Two style notes from keeping the checks at their baseline counts. The new conditions in
+      `AgentFilter::matches` are written `is_none_or`, while the four that were already there stay
+      `map_or(true, ..)`: clippy asks for the newer form, and rewriting lines this change did not
+      touch would bury the diff. The file therefore mixes the two until someone sets the older four
+      right on their own.
+- [x] `Loaded::Filters` is boxed. Adding two fields to `SavedFilters` pushed that variant past
+      clippy's `large_enum_variant` threshold beside a bare `String`, and the payload is read once at
+      start-up, so the box is cheaper than the warning or an `#[allow]`.
+- [ ] One sharp edge left as the market pair has it: a numeric region is not checked to exist, so a
+      mistyped `--agent-region 1000069` keeps nothing without saying anything. A name is checked, a
+      number is not. Making the ID form also ask the static data would be a behaviour change for
+      `--region` too, which was not asked for; noted rather than done.
+- [ ] The refusal message for a region names no flag — `Region 'Blach Riss' not found` — copied from
+      `--region`, while the system message does name its flag. In the TUI the error sits beside the
+      box it came from, so only the command line can leave a user guessing which of the two they
+      mistyped. Worth unifying, but that changes `--region`'s existing text.
+
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
