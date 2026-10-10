@@ -456,15 +456,26 @@ Deferred to a later phase:
       excluded both as destinations and as route transit: Jita (30000142), Amarr (30002187), Dodixie
       (30002659), Rens (30002510) and Hek (30002053). A candidate is eligible only if a route to it
       exists over the full gate graph with those systems removed; such a route may detour through other
-      constellations, but those transit systems do not join the candidate set. For each candidate the
-      route floor is the safest full-graph gate route under that restriction, including the origin as
-      for the regular marginal; hops count that route too. Tests pin the current/neighbor pool boundary,
-      a destination reachable only through blacklisted Jita being rejected, a permitted detour through
-      a non-destination constellation, and the Level-4/Basic/Security intersection with active filters.
+      constellations, but those transit systems do not join the destination pool. For each candidate the
+      route floor is currently the safest full-graph gate route under that restriction, including the
+      origin as for the regular marginal; hops count that route too. Tests pin the current/neighbor pool
+      boundary, a destination reachable only through blacklisted Jita being rejected, a permitted detour
+      through a non-destination constellation, and the Level-4/Basic/Security intersection with active
+      filters.
+- [ ] Investigate the difference between ESI route preferences and the in-game burner route before
+      changing the route rule. User-reported for Heorah -> Iderion: a 9-jump route via Rayeret, whose true
+      security is 0.454546 and displayed band is 0.5. ESI `Safer` with security_penalty 0 or 1 returns a
+      7-jump route through systems displaying 0.4; penalties 50, 99 and 100 return 52 jumps. Rayeret's
+      cached true security is 0.454546, ESI reports 0.45454591512680054, and Dotlan reports 0.45455, so
+      these values agree to their displayed precision; this is not evidence of a float-conversion error.
+      The current local burner route maximizes the minimum raw true-security floor, then minimizes jumps,
+      which selects the 52-jump result. ESI preferences are weighted route choices, not a hard rounded
+      security cutoff. Compare route settings and displayed-band constraints against the client before
+      altering the general algorithm; do not add a Heorah-specific exception.
 - [ ] Check the Details pane's height with both summaries for a burner-capable system. The ten-system
-      cap remains; each matching system can now add one burner line as well as its regular summary, and
-      at the 80x24 terminal size some lines may wrap. The `m` pane still enumerates regular destinations
-      only, as requested; whether it should also show burner destinations has not been decided.
+      cap remains; each matching system can now add a Burner line as well as its regular summary, and
+      at 80x24 some summaries may wrap. The `m` pane continues to enumerate regular destinations only,
+      as requested; whether it should also show burners remains undecided.
 - [ ] The remaining agent rows, 6,128 of them, covering non-security divisions and the research,
       story, factional warfare, epic arc and event types.
 - [ ] Authenticated character data of any kind, and the CSV and JSON exports, neither of which has a
