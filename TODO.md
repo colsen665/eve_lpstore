@@ -300,6 +300,45 @@ What the data supports, after one assumed gap closed and one question opened:
       A run filtered to Distribution gets "Distribution agents are outside this model: security
       missions only", with the name cut to fit the pane because the longest division name in the
       archive is 28 characters.
+- [ ] Colour the security bands in the mission destination views. As asked: `..0.0` purple,
+      `0.1..0.4` red, `0.5` yellow, `0.6..0.8` green, `0.9..1.0` cyan. Where it applies, in order: the
+      band tokens on a system's summary line in the `m` pane, and the same tokens in the details-pane
+      lines below. Open details to settle with the change: whether the hop tokens (`0J/50%`) stay
+      uncoloured, since the request names bands only; and whether purple for nullsec collides with the
+      offers table, which already uses magenta for an inverted spread — ratatui has both, so keeping
+      them distinct is possible but should be a decision rather than an accident. The rule covers the
+      negative bands the `--security` syntax already accepts, and measured rows that need it today:
+      Annancale at true security 0.0941 is band 0.1 and so red, 9-ERCP at `-0.1/100%` is purple.
+- [ ] Show each agent system's destination summary in the details pane, under its corporation, in the
+      indented form asked for:
+
+      ```
+      Corporations:
+      Material Acquisition (1000097)
+        Babirmoult (0.18) 0.1/50%, 0.2/50%  0J/50%, 1J/50%
+      Astral Mining Inc. (1000098)
+        Arraron (0.18) 0.1/50%, 0.2/50%  0J/50%, 1J/50%
+        Annancale (0.09) 0.1/50%, 0.2/50%  0J/50%, 1J/50%
+      ```
+
+      The corporation keeps its own line, then one line per agent system: name, its true security to
+      two decimals, the band groups, then the hop groups. Measured against the cache: all three system
+      names and both corporation ids are real, and the securities in the example match the archive to
+      the printed two decimals (Babirmoult 0.1788, Annancale 0.0941), so only the probabilities are
+      invented. Two things this shape implies and are not yet decided: the corp line today prints its
+      systems inline (`Name (id): Turba (0.40), Jitura (0.31)`), so this replaces that list rather than
+      adding to it, which also changes what `corp_line` means for the CLI report that shares it; and a
+      corporation can hold many security systems — measured 1 to 53 distinct Security agent systems per
+      corporation over the 158 corporations that have any, so the longest case is 53 indented lines
+      before wrapping, at a pane that shares its column with the offer breakdown and scrolls. Cap,
+      scroll or print them all is an open question.
+- [ ] This request extends where the destinations appear. The decision recorded above was "a pane of
+      its own, opened by `m`", and the file nowhere weighed the details pane and rejected it, so this
+      is an addition to that decision rather than a reversal of it. What remains to decide is whether
+      the `m` pane survives once the details pane carries the same summary strings: the pane holds the
+      per-destination lines and the two model notes, and the summary form drops all of that, so the two
+      views would say different things about the same systems. The notes in particular are the only
+      place the model labels itself, and the details-pane form as written has no room for them.
 - [ ] What should the pane say for an agent system in a gateless pocket, where the gate-only model
       counts one system out of a constellation of several? The options are to name the unreachable
       members on the row, to leave such systems out of the pane altogether, or to widen the graph to
