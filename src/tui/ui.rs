@@ -294,28 +294,38 @@ fn band_tenths(tenths: i32) -> String {
 /// systems in the agent system's constellation, which is an assumption this tool makes rather than a
 /// measurement of how missions are routed, and the band a destination lands in is the lowest
 /// security on the safest way to reach it, which is why it can sit below the destination's own.
+/// The pane's two standing lines, kept above the scrolling body so the disclaimer cannot be
+/// scrolled out of sight. Both are 74 characters or fewer, which is inside the 78 columns left by a
+/// border at the minimum supported width, so neither wraps and neither eats a row of the body.
+const DESTINATION_NOTES: [&str; 2] = [
+    "model, not measurement: level 1 stays in the agent's own constellation",
+    "bands are the lowest security on the safest gate route, not a system's own",
+];
+
 fn draw_destinations(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) -> PaneLayout {
     let block = pane_block("Mission destinations", false, app);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = destination_rows(app, sdata);
-    let height = usize::from(inner.height);
+    // The notes take the first two lines, so the scrollable body starts below them.
+    let height = usize::from(inner.height).saturating_sub(DESTINATION_NOTES.len());
     let end = rows.len().saturating_sub(app.destinations_scroll);
     let start = end.saturating_sub(height);
-    let lines: Vec<Line<'static>> = rows[start..end]
+    let mut lines: Vec<Line<'static>> = DESTINATION_NOTES
         .iter()
-        .map(|row| {
-            // System lines are indented two, destinations four; anything less is a corporation name.
-            let style = if row.starts_with("    ") {
-                Style::new().dark_gray()
-            } else if row.starts_with("  ") {
-                Style::new()
-            } else {
-                Style::new().bold()
-            };
-            Line::from(Span::styled(row.clone(), style))
-        })
+        .map(|note| Line::from(Span::styled(*note, Style::new().italic().dark_gray())))
         .collect();
+    lines.extend(rows[start..end].iter().map(|row| {
+        // System lines are indented two, destinations four; anything less is a corporation name.
+        let style = if row.starts_with("    ") {
+            Style::new().dark_gray()
+        } else if row.starts_with("  ") {
+            Style::new()
+        } else {
+            Style::new().bold()
+        };
+        Line::from(Span::styled(row.clone(), style))
+    }));
     // Sliced to the visible window already, so no `.scroll()` offset on top of that.
     frame.render_widget(Paragraph::new(lines), inner);
     PaneLayout {
@@ -1789,6 +1799,51 @@ mod tests {
         };
         let rows = system_lines(9, "Here", &spread, &|_| None);
         assert_eq!(rows[1], "    system 99 1J route 0.4");
+    }
+
+    #[test]
+    fn the_missions_notes_fit_the_narrowest_view() {
+        // The notes sit above the body and must not wrap, or they eat the rows they describe.
+        for note in DESTINATION_NOTES {
+            assert!(
+                note.len() + 2 <= usize::from(MIN_WIDTH),
+                "{} wraps at the minimum width",
+                note
+            );
+        }
+    }
+
+    #[test]
+    fn the_missions_pane_states_that_it_is_a_model() {
+        let app = missions_app();
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("model, not measurement"),
+            "the pane says the numbers are a model: {text}"
+        );
+        assert!(
+            text.contains("safest gate route"),
+            "and says what a band means"
+        );
+    }
+
+    #[test]
+    fn scrolling_keeps_the_missions_notes_on_screen() {
+        let mut app = missions_app();
+        app.destinations_scroll = 50;
+        app.destinations_rows = 60;
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("model, not measurement"),
+            "the disclaimer is not part of the scrolled body"
+        );
+    }
+
+    /// The results view with the destinations pane open.
+    fn missions_app() -> App {
+        let mut app = results_app(one_priced_offer(), 10);
+        app.overlay = Overlay::Destinations;
+        app
     }
 
     #[test]
