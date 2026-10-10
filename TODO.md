@@ -252,16 +252,43 @@ What the data supports, after one assumed gap closed and one question opened:
       `GET /universe/constellations/{id}` answers the same question for a spot check, so a few
       constellations are worth comparing against the game before any table is trusted. What is not
       settled is whether mission destinations sit inside that set at all, below.
-- [ ] Whether a destination is a solar system at all is unresolved, and the earlier claim about space
-      systems stays withdrawn. The gate data now argues against the separate-system reading. Of 8,490 systems, 5,268 have at
-      least one stargate and 3,222 have none: 2,604 in the 310xxxxx range, which is wormhole space and
-      expected to have no gates, 400 in the 320xxxxx and 340xxxxx ranges, and 217 in the 300xxxxx
-      range. No constellation mixes gated and gate-less systems, the 418 all-gate-less constellations
-      being wholly separate, so there is no pocket system sitting in Kimotoro beside Jita, which is the
-      shape a `Jita Space` destination would need. Two sources agree no such system exists: the cached
-      `mapSolarSystems` rows, and ESI's `POST /universe/ids`, which resolves the name only as a
-      character. The claim that the data "excludes space systems" stays withdrawn, since 14 of the 15
-      probed names may not be real.
+- [x] A destination **is** reached as a solar system, so counting gates between systems and grouping
+      systems by band is the right unit. Documented, not measured: EVE Info's mission overview
+      (`eveinfo.com/missions`, fetched 2026-10-10) says an Encounter mission "will always create a
+      mission space when the mission is accepted", and defines a mission space as "a region of space
+      in some solar system", with the journal bookmark naming only that solar system. The site is
+      therefore inside a system and does not change the route to it. Mining missions are described the
+      same way; Courier missions end at a station, which is also in a system.
+- [x] The reachability worry that made the separate-system reading plausible is settled the other way:
+      a constellation-bound destination set never contains a system you cannot reach by gate. Measured
+      from the archive, of 8,490 systems 5,268 have at least one stargate and 3,222 have none: 2,604 in
+      the 310xxxxx range, which is wormhole space and expected to have no gates, 400 in the 320xxxxx and
+      340xxxxx ranges, and 217 in the 300xxxxx range. No constellation mixes gated and gate-less
+      systems, the 418 all-gate-less constellations being wholly separate, so there is no pocket system
+      sitting in Kimotoro beside Jita, which is the shape a `Jita Space` destination would need. Two
+      sources agree no such system exists: the cached `mapSolarSystems` rows, and ESI's
+      `POST /universe/ids`, which resolves the name only as a character. The claim that the data
+      "excludes space systems" stays withdrawn, since 14 of the 15 probed names may not be real.
+- [ ] **The bound to one constellation is documented for level 1 only, and only for courier
+      missions.** Same EVE Info page, courier section: "Level 1 missions will keep you within the
+      agent's constellation, level 2 and level 3 will possibly send you to a neighboring constellation,
+      and level 4 courier missions will always send you to a neighboring constellation." EVE-Survival's
+      courier reference gives one-way jump ranges that agree: 0 to 5 for levels 1 and 2, 0 to 12 for
+      level 3, and 1 to 12 for level 4 couriers. So the model as built is defensible at level 1 and
+      understates reach above it, and neither source says what bounds an **Encounter** mission at levels
+      2 to 4, which is the case this tool's users most care about. Decided separately, below.
+- [ ] Level 5 carries a constraint the uniform model cannot express: the E-Uni mission page says level 5
+      missions "are exclusively located in Low Security space", so in a constellation that mixes bands a
+      0.5 system is not a possible destination for a level 5 agent at all. An archived forum thread
+      agrees from the other direction, reporting that level 5 sites in a constellation with mostly
+      highsec systems concentrate in the few lowsec ones. Both are documentation and anecdote, not
+      measurement.
+- [ ] There is no public way to measure any of this. Probed on 2026-10-10:
+      `GET /characters/{id}/missions/` and `GET /characters/{id}/missionlog/` both return 404, while
+      `GET /characters/{id}/assets/` returns 401 for the same unauthenticated request. The 401 is the
+      control: an authenticated route that exists answers 401, so these two do not exist. A destination
+      distribution could only come from a character's own mission journal inside the game client, which
+      is out of scope for a tool that holds no credentials.
 
 Two ESI endpoints are verified as useful here: `POST /route/{origin}/{destination}` with a JSON body
 carrying `preference` and `security_penalty` plus an `X-Compatibility-Date` header returns
@@ -321,6 +348,11 @@ assumption about the game, not a measurement, so the view should present it as t
       screen; that wording should be reviewed with the research below rather than guessed at now.
 Deferred to a later phase:
 
+- [x] Burners look like named places rather than a distribution, which changes what modelling them
+      would mean: the E-Uni anomic page lists each one by a fixed site name (Guristas - Worm, Sansha's
+      Nation - Succubus, Blood Raider - Cruor, Angel - Dramiel, Serpentis - Daredevil, and for the base
+      tier Wreathe Industrial, Ashimmu and others). A fixed site has one location, so a burner row
+      would be a lookup of named destinations, not a marginal over a constellation. Still deferred.
 - [ ] Burner and anomic variants. These are acquired from a level 4 basic security agent, the same
       agent that offers the ordinary mission, so excluding them is a rule about the mission variant and
       not about the agent: 502 such agents across 125 corporations sit in 457 systems. A system
@@ -363,8 +395,9 @@ Deferred to a later phase:
       and so it would prove nothing about a split.
 - [ ] No live terminal check is claimed for any of it, per the standing note on such checks. The
       pane's text is pinned by assertions on the exact rendered lines, including the collapsed
-      Sazdih case and a destination whose id is unknown, but nobody has opened it with `m` in a real
-      terminal, and the pane has never been drawn from a version 3 cache.
+      Sazdih case, a destination whose id is unknown and the notes at the narrowest supported width,
+      and the whole pane has been printed from a TestBackend at 80 columns, but nobody has opened it
+      with `m` in a real terminal and it has never been drawn from a version 3 cache.
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
