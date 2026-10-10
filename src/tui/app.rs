@@ -112,6 +112,11 @@ pub struct App {
     pub form: FilterForm,
     /// Whether the report on screen comes from an earlier run than the one in progress.
     pub stale: bool,
+    /// Whether a run that superseded the results on screen has ended and its outcome is still on
+    /// the screen. The loop drains run events before it draws, so a warm run can finish inside one
+    /// 250 ms tick and never be seen in flight; holding the summary until any key is pressed is what
+    /// makes the end of such a run visible at all.
+    pub awaiting_run_summary: bool,
     pub stage: Stage,
     pub log: VecDeque<LogLine>,
     pub report: Option<Report>,
@@ -159,6 +164,7 @@ impl App {
             applied,
             form,
             stale: false,
+            awaiting_run_summary: false,
             stage: Stage::Idle,
             log: VecDeque::new(),
             report: None,
@@ -222,6 +228,9 @@ impl App {
 
     /// Stores the finished report and logs its offer errors, as the CLI prints them.
     pub fn finish(&mut self, report: Report) {
+        // Read before `stale` is cleared below: a run that left no earlier results behind had the
+        // progress view to itself, and needs no summary over the pane it just filled.
+        let superseded = self.stale;
         for group in &report.groups {
             for error in &group.errors {
                 self.push_log(LogLine {
@@ -234,6 +243,7 @@ impl App {
             groups: report.groups.len(),
         };
         self.stale = false;
+        self.awaiting_run_summary = superseded;
         self.report = Some(report);
         self.focus = Focus::Groups;
         self.group = 0;
@@ -243,6 +253,10 @@ impl App {
 
     pub fn fail(&mut self) {
         self.stage = Stage::Failed;
+        // `stale` deliberately stays set: the results on screen are still from a superseded run. So
+        // the same flag says whether this failure had results behind it, and a failed first run is
+        // left to the progress view, which already reports it in red.
+        self.awaiting_run_summary = self.stale;
     }
 
     /// Takes in what a run was resolved to, without moving the stage on or logging it.
@@ -261,6 +275,8 @@ impl App {
     pub fn start_run(&mut self, info: RunInfo) {
         self.begin_run(info);
         self.stale = self.report.is_some();
+        // The previous run's summary, if one is still up, is not this run's news.
+        self.awaiting_run_summary = false;
         self.stage = Stage::Starting;
         self.close_form();
         self.close_export();
@@ -473,6 +489,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Action::Continue;
         }
+        // Any key acknowledges a run summary. It is not a mode and takes no key for itself: what the
+        // press goes on to do — move a selection, open the log, quit — is unchanged.
+        self.awaiting_run_summary = false;
         if self.overlay == Overlay::Filters {
             return self.on_form_key(key);
         }
@@ -1254,6 +1273,64 @@ mod tests {
         app.on_key(press(KeyCode::Char('l')));
         app.on_key(press(KeyCode::Char('f')));
         assert_eq!(app.overlay, Overlay::Filters);
+    }
+
+    #[test]
+    fn starting_a_run_shows_no_summary() {
+        // A summary belongs to the end of a run, so no start may leave one up. A re-run also has to
+        // clear the summary the previous run left behind, which is the case set by hand below.
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.awaiting_run_summary = true;
+        app.start_run(info(10));
+        assert!(!app.awaiting_run_summary, "the old outcome is stale news");
+
+        let mut fresh = App::new(LpStoreOptions::default());
+        fresh.start_run(info(10));
+        assert!(
+            !fresh.awaiting_run_summary,
+            "nothing was superseded, so there is nothing to acknowledge"
+        );
+    }
+
+    #[test]
+    fn finishing_a_re_run_leaves_the_summary_and_a_key_clears_it() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.start_run(info(10));
+        app.finish(Report { groups: vec![] });
+        assert!(app.awaiting_run_summary, "the run ended over a report");
+        app.on_key(press(KeyCode::Esc));
+        assert!(!app.awaiting_run_summary, "any key acknowledged it");
+    }
+
+    #[test]
+    fn a_stopped_re_run_summarises_and_a_stopped_first_run_does_not() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.start_run(info(10));
+        app.fail();
+        assert!(
+            app.awaiting_run_summary,
+            "stale results are still behind it"
+        );
+        let mut fresh = App::new(LpStoreOptions::default());
+        fresh.start_run(info(10));
+        fresh.fail();
+        assert!(
+            !fresh.awaiting_run_summary,
+            "the progress view already shows the failure in red"
+        );
+    }
+
+    #[test]
+    fn a_newer_run_replaces_the_summary_it_was_given() {
+        let mut app = app_with(vec![group(1, &[5.0])], 10);
+        app.start_run(info(10));
+        app.finish(Report { groups: vec![] });
+        assert!(app.awaiting_run_summary);
+        app.start_run(info(10));
+        assert!(
+            !app.awaiting_run_summary,
+            "the old run's outcome is not news about this one"
+        );
     }
 
     #[test]
