@@ -194,7 +194,10 @@ security 0.49, 0.5, 0.51 and 0.6 rounds to 0.5, 0.5, 0.5 and 0.6, so band 0.5 ho
 shows 0.75, and band 0.6 holds one and shows 0.25. That is uniform over systems, not over bands, so a
 band with three systems is three times as likely as one with a single system.
 
-Burners, which are deferred, are said to reach the current or a neighbouring constellation.
+Burner destination rule, supplied for the deferred model: a Level 4 agent whose division is Security
+and type is Basic can offer burners, whose destination may be in the agent's own constellation or any
+system in a neighbouring constellation. This is a different pool from regular missions, not a second
+variant of the same uniform draw.
 
 The same weights apply for a second grouping by **distance from the agent system in jumps**: 0 jumps is
 the agent's own system, 1 jump the systems one gate away, and so on. Both groupings are marginals of one
@@ -435,20 +438,25 @@ assumption about the game, not a measurement, so the view should present it as t
       public data can settle either, per the probe below.
 Deferred to a later phase:
 
-- [x] Burners look like named places rather than a distribution, which changes what modelling them
-      would mean: the E-Uni anomic page lists each one by a fixed site name (Guristas - Worm, Sansha's
-      Nation - Succubus, Blood Raider - Cruor, Angel - Dramiel, Serpentis - Daredevil, and for the base
-      tier Wreathe Industrial, Ashimmu and others). A fixed site has one location, so a burner row
-      would be a lookup of named destinations, not a marginal over a constellation. Still deferred.
-- [ ] Burner and anomic variants. These are acquired from a level 4 basic security agent, the same
-      agent that offers the ordinary mission, so excluding them is a rule about the mission variant and
-      not about the agent: 502 such agents across 125 corporations sit in 457 systems. A system
-      hosting one has two destination sets, and a single probability per destination would mix them.
-- [ ] Whether burner destinations can be named now hinges on the question above rather than on the
-      withdrawn probe. What is measured is that the non-known-space systems are in the set, and the
-      2,604 wormhole systems among them carry no stargate at all, so under a gate-only model they
-      cannot be a destination however they are named. If burner destinations turn out to be sites
-      rather than systems, this item goes away with the model instead of needing data.
+- [x] **Correction:** the earlier TODO claim that burners are fixed named sites with one location was
+      wrong. The E-Uni anomic page names variants (Guristas - Worm, Sansha's Nation - Succubus, the
+      Angel Dramiel, the base Wreathe Industrial, Ashimmu and others); those are mission/variant names,
+      not a single destination system. Burner sites can spawn in the agent's constellation or in a
+      neighbouring constellation, so modelling burners is a separate destination distribution, as
+      specified for this work below.
+- [ ] Implement the separate burner distribution for a listed agent system only when an agent passing
+      the active filters is Level 4, Basic type, Security division. The pool is the systems in the
+      current constellation plus any neighbouring constellation. Exclude these five standard NPC
+      trade hubs from both destination candidates and route transit: Jita (30000142), Amarr (30002187),
+      Dodixie (30002659), Rens (30002510), Hek (30002053). A candidate is eligible only if it is
+      reachable over the full stargate graph with those systems removed; the route may cross other
+      constellations, but they do not enter the destination pool. Weight eligible systems uniformly.
+      Show this as a separate distribution in the Details pane so it is not added to the regular
+      mission percentages. These are the chosen model rules, not a measured distribution of mission
+      offers or site spawns.
+- [ ] Keep an eye on the size of the Details block when both distributions are present: the cap at ten
+      agent systems remains, and each eligible system adds another distribution summary. The `m` pane
+      still shows the regular per-destination detail only unless separately extended.
 - [ ] The remaining agent rows, 6,128 of them, covering non-security divisions and the research,
       story, factional warfare, epic arc and event types.
 - [ ] Authenticated character data of any kind, and the CSV and JSON exports, neither of which has a
