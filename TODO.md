@@ -352,11 +352,10 @@ The requested shape, kept as the spec the tests are written against:
       fix. The offer breakdown's item lines go through the same helper and so had the same defect —
       inference from the shared function, not something rendered and seen. A clipped-but-aligned line was the alternative, and the pane's own
       minimum width makes the degenerate case unreachable, guarded so it stays that way.
-- [ ] What should the pane say for an agent system in a gateless pocket, where the gate-only model
-      counts one system out of a constellation of several? The options are to name the unreachable
-      members on the row, to leave such systems out of the pane altogether, or to widen the graph to
-      the archive's wormhole links, which is the only reading that makes the numbers true but rests on
-      connections that change outside downtime. Asked, not decided.
+- [ ] The gateless-pocket and split-constellation cases, with the options each one leaves open, are
+      measured and recorded in Phase 11 rather than decided here. One correction against what this
+      bullet first said: widening the graph to the archive's wormhole links is **not** an option — the
+      current SDE has no wormhole-link table at all, and ESI's router refuses pocket routes.
 - [ ] There is no public way to measure any of this. Probed on 2026-10-10:
       `GET /characters/{id}/missions/` and `GET /characters/{id}/missionlog/` both return 404, while
       `GET /characters/{id}/assets/` returns 401 for the same unauthenticated request. The 401 is the
@@ -501,7 +500,73 @@ Deferred to a later phase:
       766 all-gated and 418 all-gate-less with none mixing the two, which confirms the earlier claim
       that no gated constellation contains a gateless member, and 52 of the 1,239 distinct Security
       agent systems (4.2%) sit in those gateless pockets, where every row the pane prints is like this
-      one. Open question below: what such a row should say.
+      one. What such a row should say is left open in Phase 11.
+#### Phase 11: The systems the gate model cannot reach
+
+Phase 10 bounds destinations to the agent's constellation and counts gates between them. For some
+agent systems that produces a row that reads as a certainty about a constellation it only counted one
+system of. The two groups below are measured, and both are **left as open decisions rather than
+changed**: the levels involved are small, the fix for one group needs data that does not exist, and
+the LP stores affected are a narrow set of corporations.
+
+Measured from the version 3 cache on disk (283 corporations, 8,490 systems, 13,978 gate records) with
+constellation names and system counts read from `GET /universe/constellations/{id}` on 2026-10-10.
+Region ids resolved from the cached `regions.json`: 10000017 is **J7HZ-F**, 10000019 is **A821-A**.
+
+**Group A — 52 agent systems standing in a system with no stargate at all**, in 15 constellations, all
+of them in those two regions: 9 constellations and 29 systems in J7HZ-F, 6 and 23 in A821-A. Every one
+displays a negative band, from `-0.008` (6-23NU) to `-0.650` (N-FKXV).
+
+| constellation | region | members | agents here | the systems |
+| --- | --- | --- | --- | --- |
+| B9J-NT (20000240) | A821-A | 7 | 6 | 5V-YL6, 69A-54, 8-UWFS, BWO-UU, PQWA-L, SQVI-U |
+| I4-DK8 (20000218) | J7HZ-F | 7 | 5 | 54-VNO, 9-ERCP, IAMZ-5, KN7M-N, PBXG-A |
+| F-0CTG (20000242) | A821-A | 7 | 5 | 0IRK-R, 7BA-TK, FNS3-F, FR-RCH, IAWJ-X |
+| 3A-CND (20000224) | J7HZ-F | 8 | 5 | 0M-M64, 1C-TD6, H7OL-I, TO21-U, YBYX-1 |
+| 4I-WP1 (20000219) | J7HZ-F | 6 | 4 | 6-QXE6, FO-3PJ, N-FKXV, X7-8IG |
+| NSM-6F (20000220) | J7HZ-F | 8 | 4 | 6-NCE7, BKK4-H, CZ-CED, L-TPN0 |
+| W1-F3U (20000237) | A821-A | 6 | 4 | 7-8XK0, 90G-OA, G-N6MC, P3UD-M |
+| O-BSIB (20000236) | A821-A | 6 | 3 | 6-HFD6, 9-BUSQ, II-1B3 |
+| 826-A5 (20000238) | A821-A | 8 | 3 | B-Y06L, CLDT-L, Z-KPAR |
+| F-8DMX (20000221) | J7HZ-F | 6 | 3 | 3-XORH, 6-23NU, W6H6-K |
+| 2RX9-6 (20000223) | J7HZ-F | 6 | 3 | 8-ULAA, H-EDXD, KF1-DU |
+| 1-Z95W (20000213) | J7HZ-F | 6 | 2 | 1SR-HT, SQ-2XA |
+| UN2H-D (20000241) | A821-A | 6 | 2 | T-C5A0, T-YWDD |
+| D-YMGR (20000222) | J7HZ-F | 6 | 2 | I9D-0D, LH-J8H |
+| WSC-AL (20000216) | J7HZ-F | 6 | 1 | PQA-9K |
+
+The corporations are a short list: **Jovian Directorate, Jove Navy and Shapeset** hold most of the 52,
+with **Prosper, X-Sense, Genolution and Impro** in the J7HZ-F pockets. So the affected LP stores are
+Jove-associated and a handful of nullsec ones, not the empire running most users do.
+
+**Group B — 14 agent systems in gated constellations that are not one gate component.** These systems
+have stargates; the constellation just falls into two pieces, and the other piece is reachable only by
+leaving it, which the model forbids.
+
+| constellation | region | members | the two components (`*` hosts a Security agent) |
+| --- | --- | --- | --- |
+| 20000354 | Molden Heath | 5 | Fegomenko, Osvetur, Mimiror, Unertek\* \| Ennur\* |
+| 20000367 | Heimatar | 8 | Hulm, Ameinaka, Malukker \| Osoggur\*, Abudban\*, Trytedald\*, Odatrik\*, Rens\* |
+| 20000388 | Sinq Laison | 6 | Ardene, Boillair, Ney\*, Fasse \| Gratesier, Schoorasana\* |
+| 20000410 | The Citadel | 5 | Yria\*, Oshaima\*, Hysera\*, Oisio\* \| Venilen\* |
+
+Two consequences worth keeping straight. **Group B is fixable with the data already on disk**, because
+a gate route exists — it just crosses a constellation border, so hop counts and route floors would have
+to be allowed to leave. **Group A is not fixable at all from public data**: the current SDE carries no
+wormhole-link table, `mapStargates.jsonl` being the only edge list, and `GET /route/{origin}/{dest}`
+answers `No route found` for a pocket pair (`30001484` to `30001480`, same constellation) while the
+control pair still returns a 10-system route. The live hole topology is not static data.
+
+- [ ] Group A rows: what should a pocket system's row say? Options are naming the members the gate
+      graph cannot reach (`0J/100%  6 of 7 systems unreachable by gate`), suppressing such rows and
+      counting them once at the top of the pane, or leaving the row as it is. Deferred by choice.
+- [ ] Group B: allow routes to leave the constellation while keeping destinations inside it. This is a
+      semantics change to hop counts, not just a label, and it would need measuring across all 1,239
+      agent systems before being trusted. Deferred by choice.
+- [ ] Whether a mission site inside a pocket constellation is even reachable from the agent's own
+      system without a wormhole is **not measured here**, and neither group's numbers should be read as
+      saying anything about it. The cache says only which systems have gates.
+
 ### Filter agents by where they stand
 
 `--agent-region` and `--agent-system`, with the same pair of boxes on the Filters page directly
