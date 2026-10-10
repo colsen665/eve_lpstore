@@ -5,6 +5,11 @@
 When work has an unresolved question, present it as a dialog of options rather than choosing
 silently or writing around it in the summary. If several are open, ask them together in one dialog.
 
+When asked to implement something, ask the questions first, then carry the implementation through to
+the end. Once the questions are answered, continue and do not stop to ask again. If an answer turns
+out not to apply, or a fresh obstacle appears, note it in the report of the finished work rather
+than pausing to ask, unless the obstacle genuinely prevents the work.
+
 ## Language
 
 Keep the writing objective and verifiable.
