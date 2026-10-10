@@ -291,6 +291,61 @@ pub struct AgentRow {
     pub system_id: i32,
 }
 
+/// Where a mission from an agent in one system can land, under the model this project assumes:
+/// every system in the agent's constellation is an equally likely destination.
+///
+/// Both groupings are marginals of that one uniform distribution. The band grouping counts systems
+/// per displayed security band and so does not depend on the graph at all; the hop grouping counts
+/// systems per gate distance and so changes with the shape of the constellation and with which
+/// member holds the agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DestinationSpread {
+    /// The constellation the counting stays inside.
+    pub constellation_id: i32,
+    /// Its member systems reachable from the agent system, which is the denominator for every
+    /// probability here.
+    pub systems: usize,
+    /// Bands by the security flown through on the route, in tenths, with their probability. The
+    /// lowest security on the route decides the band, and the route starts at the agent system, so
+    /// no destination can sit above the agent system's own band.
+    pub bands: Vec<(i32, f64)>,
+    /// The same destinations grouped by the security of the system itself, kept beside `bands` so a
+    /// collapsed route grouping can still be read: `bands` says how far you must fly down, `own_bands`
+    /// says what is there.
+    pub own_bands: Vec<(i32, f64)>,
+    /// Gates on the route flown, with the probability of landing that far out, in hop order.
+    pub hops: Vec<(usize, f64)>,
+    /// Every destination as (system, hops, route band, own band), in id order.
+    pub destinations: Vec<(i32, usize, i32, i32)>,
+}
+
+impl DestinationSpread {
+    /// The share of destinations in one band or at one hop distance, as `count / systems`.
+    fn share(count: usize, systems: usize) -> f64 {
+        count as f64 / systems as f64
+    }
+}
+
+/// A route's standing: (security floor, gates flown, systems crossed), judged highest floor first,
+/// then fewest gates, then the smaller system sequence so the choice does not depend on hash order.
+type Route = (f64, usize, Vec<i32>);
+
+/// Ranking for two candidate routes to the same destination.
+fn better_route(candidate: &Route, current: &Route) -> bool {
+    let (cf, ch, cp) = candidate;
+    let (bf, bh, bp) = current;
+    if *cf > *bf + f64::EPSILON {
+        return true;
+    }
+    if *cf < *bf - f64::EPSILON {
+        return false;
+    }
+    if *ch != *bh {
+        return *ch < *bh;
+    }
+    cp < bp
+}
+
 /// The agent data cached from the SDE.
 #[derive(Debug, Serialize, Deserialize)]
 struct AgentCache {
@@ -373,6 +428,8 @@ pub struct StaticData {
     divisions: Vec<(i32, String)>,
     agent_types: Vec<(i32, String)>,
     systems: HashMap<i32, (String, f64, i32, i32)>,
+    /// Member systems of each constellation, sorted so iteration is stable across runs.
+    constellation_members: HashMap<i32, Vec<i32>>,
     /// Solar systems reachable through one stargate, keyed by the system you start in. Built once
     /// at load so a hop count is a map lookup rather than a scan of the gate list.
     neighbours: HashMap<i32, Vec<i32>>,
@@ -461,6 +518,11 @@ impl StaticData {
     }
 
     /// Get all known solar system names.
+    /// The name of a solar system, or `None` when the id is unknown.
+    pub fn system_name(&self, system_id: i32) -> Option<&String> {
+        self.systems.get(&system_id).map(|(name, _, _, _)| name)
+    }
+
     pub fn system_names(&self) -> impl Iterator<Item = &String> {
         self.systems.values().map(|(name, _, _, _)| name)
     }
@@ -489,9 +551,147 @@ impl StaticData {
         self.neighbours.get(&system_id).map_or(&[], Vec::as_slice)
     }
 
+    /// Each constellation's member systems, from the (system, constellation) pairs the archive
+    /// lists. Sorted because the destination lists and band groups are shown to the user and must
+    /// not depend on hash order.
+    fn constellation_index(pairs: &[(i32, i32)]) -> HashMap<i32, Vec<i32>> {
+        let mut seen: HashMap<i32, std::collections::HashSet<i32>> = HashMap::new();
+        for (system, constellation) in pairs {
+            seen.entry(*constellation).or_default().insert(*system);
+        }
+        seen.into_iter()
+            .map(|(constellation, list)| {
+                let mut list: Vec<i32> = list.into_iter().collect();
+                list.sort_unstable();
+                (constellation, list)
+            })
+            .collect()
+    }
+
+    /// The systems in a constellation, in id order. Empty for an unknown constellation.
+    pub fn constellation_members(&self, constellation_id: i32) -> &[i32] {
+        self.constellation_members
+            .get(&constellation_id)
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// The constellation a solar system is in, or `None` when the system is not known.
     pub fn constellation_of_system(&self, system_id: i32) -> Option<i32> {
         self.systems.get(&system_id).map(|(_, _, _, c)| *c)
+    }
+
+    /// Where a mission from an agent in `agent_system` can land, or `None` when that system is not
+    /// known.
+    ///
+    /// Destinations are the other systems in the constellation, which is the model this project
+    /// assumes rather than a measurement. For each one the route chosen is the one that keeps the
+    /// highest possible security floor, staying inside the constellation, because that is what a
+    /// pilot flying there would pick; among those, the fewest gates, then the smaller system order
+    /// for a stable answer. The floor includes the agent system itself, so a route can never be
+    /// safer than where it starts, and every band here is at or below the agent system's own.
+    ///
+    /// A member with no path inside the constellation is left out of the counts rather than guessed
+    /// at, so `systems` is what was counted and the probabilities sum to one.
+    pub fn mission_spread(&self, agent_system: i32) -> Option<DestinationSpread> {
+        let constellation_id = self.constellation_of_system(agent_system)?;
+        let members = self.constellation_members(constellation_id).to_vec();
+        if members.is_empty() {
+            return None;
+        }
+        let inside: std::collections::HashSet<i32> = members.iter().copied().collect();
+        let start = self.mission_security(agent_system)?;
+
+        // Widest-path relaxation on the security floor, which is monotone along a path, so the
+        // loop settles in at most one pass per improvement. Constellations are single-digit
+        // systems, so the rescan costs nothing.
+        let mut score: std::collections::HashMap<i32, Route> =
+            std::collections::HashMap::from([(agent_system, (start, 0, vec![agent_system]))]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let settled: Vec<(i32, Route)> = score
+                .iter()
+                .map(|(system, best)| (*system, best.clone()))
+                .collect();
+            for (system, (floor, hops, path)) in settled {
+                for next in self.gate_neighbours(system) {
+                    if !inside.contains(next) {
+                        continue;
+                    }
+                    let Some(seat) = self.mission_security(*next) else {
+                        continue;
+                    };
+                    let candidate = (floor.min(seat), hops + 1, {
+                        let mut extended = path.clone();
+                        extended.push(*next);
+                        extended
+                    });
+                    let improve = match score.get(next) {
+                        None => true,
+                        Some(current) => better_route(&candidate, current),
+                    };
+                    if improve {
+                        score.insert(*next, candidate);
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        let mut destinations = Vec::new();
+        for system in &members {
+            let Some((floor, hops, _)) = score.get(system) else {
+                continue;
+            };
+            let route_band = displayed_security(*floor);
+            let own_band = self.security_band(*system)?;
+            destinations.push((*system, *hops, route_band, own_band));
+        }
+        destinations.sort_unstable_by_key(|(system, _, _, _)| *system);
+
+        let systems = destinations.len();
+        let mut bands: std::collections::BTreeMap<i32, usize> = Default::default();
+        let mut own_bands: std::collections::BTreeMap<i32, usize> = Default::default();
+        let mut hop_counts: std::collections::BTreeMap<usize, usize> = Default::default();
+        for (_, hops, route_band, own_band) in &destinations {
+            *bands.entry(*route_band).or_default() += 1;
+            *own_bands.entry(*own_band).or_default() += 1;
+            *hop_counts.entry(*hops).or_default() += 1;
+        }
+        let tally = |counts: std::collections::BTreeMap<i32, usize>| {
+            counts
+                .into_iter()
+                .map(|(band, count)| (band, DestinationSpread::share(count, systems)))
+                .collect::<Vec<_>>()
+        };
+
+        Some(DestinationSpread {
+            constellation_id,
+            systems,
+            bands: tally(bands),
+            own_bands: tally(own_bands),
+            hops: hop_counts
+                .into_iter()
+                .map(|(distance, count)| (distance, DestinationSpread::share(count, systems)))
+                .collect(),
+            destinations,
+        })
+    }
+
+    /// The true security of a system, which is what a route's floor is measured in before it is
+    /// rounded to a band.
+    fn mission_security(&self, system_id: i32) -> Option<f64> {
+        self.systems
+            .get(&system_id)
+            .map(|(_, true_sec, _, _)| *true_sec)
+    }
+
+    /// The displayed security band of a system in tenths, the same value `SecurityFilter` compares
+    /// on, so a band shown here is a band a user can write in `--security`.
+    pub fn security_band(&self, system_id: i32) -> Option<i32> {
+        self.systems
+            .get(&system_id)
+            .map(|(_, true_sec, _, _)| displayed_security(*true_sec))
     }
 
     /// The region a solar system is in, or `None` when the system is not known.
@@ -544,19 +744,43 @@ impl StaticData {
     }
 
     /// Names of the systems where the corporation's agents matching the filter are, in data order.
-    pub fn corporation_systems(&self, corporation_id: i32, filter: &AgentFilter) -> Vec<(String, f64)> {
-        let mut names: Vec<(String, f64)> = Vec::new();
-        for row in self.corporation_agents.get(&corporation_id).into_iter().flatten() {
+    pub fn corporation_systems(
+        &self,
+        corporation_id: i32,
+        filter: &AgentFilter,
+    ) -> Vec<(String, f64)> {
+        self.agent_systems(corporation_id, filter)
+            .into_iter()
+            .map(|(_, name, true_sec)| (name, true_sec))
+            .collect()
+    }
+
+    /// The same systems with their ids, which is what a destination table needs: the name and
+    /// security alone cannot be looked up in the constellation or gate maps. Deduplicated by name,
+    /// as `corporation_systems` is, so a corporation with several agents in one system lists it
+    /// once.
+    pub fn agent_systems(
+        &self,
+        corporation_id: i32,
+        filter: &AgentFilter,
+    ) -> Vec<(i32, String, f64)> {
+        let mut found: Vec<(i32, String, f64)> = Vec::new();
+        for row in self
+            .corporation_agents
+            .get(&corporation_id)
+            .into_iter()
+            .flatten()
+        {
             if !filter.matches(row) {
                 continue;
             }
             if let Some((name, true_sec, _, _)) = self.systems.get(&row.system_id) {
-                if !names.iter().any(|(existing, _)| existing == name) {
-                    names.push((name.clone(), *true_sec));
+                if !found.iter().any(|(_, existing, _)| existing == name) {
+                    found.push((row.system_id, name.clone(), *true_sec));
                 }
             }
         }
-        names
+        found
     }
 
     /// The solar system ID for a system name or ID, with names matched case-insensitively.
@@ -999,6 +1223,15 @@ impl StaticData {
         let security_text = std::fs::read_to_string(security_path).map_err(EsiError::Io)?;
         let agents: AgentCache =
             serde_json::from_str(&security_text).map_err(EsiError::Deserialize)?;
+        // Derived from `agents.systems` and `agents.gates`, which the struct below then moves.
+        let constellation_members = Self::constellation_index(
+            &agents
+                .systems
+                .iter()
+                .map(|(id, _, _, _, constellation)| (*id, *constellation))
+                .collect::<Vec<_>>(),
+        );
+        let neighbours = Self::neighbour_map(&agents.gates);
 
         Ok(Self {
             regions,
@@ -1019,7 +1252,8 @@ impl StaticData {
                     (id, (name, true_sec, region_id, constellation_id))
                 })
                 .collect(),
-            neighbours: Self::neighbour_map(&agents.gates),
+            neighbours,
+            constellation_members,
         })
     }
 }
@@ -1191,6 +1425,222 @@ mod tests {
         (30000145, 30000142),
         (30000145, 30000143),
     ];
+
+    /// A hand-built static data with one constellation of four systems at the true security values
+    /// from the worked example, with the gates as the caller describes them.
+    /// One row of a test fixture: id, name, true security, region and constellation.
+    type FixtureRow = (i32, (&'static str, f64, i32, i32));
+
+    /// A `StaticData` for tests: the given systems and the given gate pairs, each recorded both
+    /// ways as the archive does.
+    fn fixture(rows: &[FixtureRow], gates: &[(i32, i32)]) -> StaticData {
+        let directed: Vec<(i32, i32)> = gates
+            .iter()
+            .flat_map(|(a, b)| [(*a, *b), (*b, *a)])
+            .collect();
+        let systems: HashMap<i32, (String, f64, i32, i32)> = rows
+            .iter()
+            .map(|(id, (name, true_sec, region, constellation))| {
+                (*id, (name.to_string(), *true_sec, *region, *constellation))
+            })
+            .collect();
+        let pairs: Vec<(i32, i32)> = systems.iter().map(|(id, (_, _, _, c))| (*id, *c)).collect();
+        StaticData {
+            constellation_members: StaticData::constellation_index(&pairs),
+            neighbours: StaticData::neighbour_map(&directed),
+            systems,
+            ..Default::default()
+        }
+    }
+
+    /// The worked example: four systems in one constellation whose true security rounds to three at
+    /// 0.5 and one at 0.6.
+    const FOUR_SYSTEMS: [FixtureRow; 4] = [
+        (1, ("A", 0.49, 7, 100)),
+        (2, ("B", 0.50, 7, 100)),
+        (3, ("C", 0.51, 7, 100)),
+        (4, ("D", 0.60, 7, 100)),
+    ];
+
+    fn four_system_constellation(edges: &[(i32, i32)]) -> StaticData {
+        fixture(&FOUR_SYSTEMS, edges)
+    }
+
+    /// Sazdih, a real lowsec constellation measured from ESI on 2026-10-10: six systems, five
+    /// rounding to 0.4 and one to 0.5. Three of them host agents in this tool's own data, which is
+    /// the case the feature exists for, and the agent here is Bayuka. Security is kept to four
+    /// decimals, which is finer than the tenths the bands round to, so the values stay readable
+    /// without moving any system into a different band.
+    const SAZDIH: [FixtureRow; 6] = [
+        (30000038, ("Dooz", 0.4237, 10000003, 20000006)),
+        (30000039, ("Bayuka", 0.4007, 10000003, 20000006)),
+        (30000040, ("Uzistoon", 0.3906, 10000003, 20000006)),
+        (30000041, ("Bairshir", 0.3641, 10000003, 20000006)),
+        (30000042, ("Moh", 0.4728, 10000003, 20000006)),
+        (30000043, ("Sari", 0.3793, 10000003, 20000006)),
+    ];
+
+    const SAZDIH_GATES: [(i32, i32); 7] = [
+        (30000038, 30000039),
+        (30000038, 30000040),
+        (30000038, 30000043),
+        (30000039, 30000040),
+        (30000039, 30000041),
+        (30000040, 30000043),
+        (30000041, 30000042),
+    ];
+
+    #[test]
+    fn a_real_lowsec_constellation_splits_into_two_bands() {
+        let data = fixture(&SAZDIH, &SAZDIH_GATES);
+        let spread = data.mission_spread(30000039).expect("Bayuka");
+        assert_eq!(spread.constellation_id, 20000006);
+        assert_eq!(spread.systems, 6);
+        assert_eq!(
+            spread.bands,
+            vec![(4, 1.0)],
+            "Bayuka is the lowest on every route out"
+        );
+        assert_eq!(
+            spread.own_bands,
+            vec![(4, 5.0 / 6.0), (5, 1.0 / 6.0)],
+            "five systems round to 0.4, Moh alone to 0.5"
+        );
+        assert_eq!(
+            spread.hops,
+            vec![(0, 1.0 / 6.0), (1, 3.0 / 6.0), (2, 2.0 / 6.0)],
+            "from Bayuka: one system each side, none three hops out"
+        );
+        assert_eq!(
+            spread
+                .destinations
+                .iter()
+                .map(|(_, _, _, own)| *own)
+                .sum::<i32>(),
+            4 * 5 + 5,
+            "own bands are in tenths: five at 0.4 and Moh at 0.5"
+        );
+    }
+
+    #[test]
+    fn route_bands_follow_the_lowest_security_flown() {
+        // The worked example's four systems split 3/1 across bands 0.5 and 0.6 by their own
+        // security, but every route starts at A, whose 0.49 is the lowest of the four, so the route
+        // grouping puts everything in 0.5. `own_bands` keeps the split visible beside it.
+        let chain = four_system_constellation(&[(1, 2), (2, 3), (3, 4)]);
+        let star = four_system_constellation(&[(1, 2), (1, 3), (1, 4)]);
+        for data in [&chain, &star] {
+            let spread = data.mission_spread(1).expect("agent system is known");
+            assert_eq!(spread.systems, 4);
+            assert_eq!(
+                spread.bands,
+                vec![(5, 1.0)],
+                "the start is the lowest system, so no route can be safer than it"
+            );
+            assert_eq!(
+                spread.own_bands,
+                vec![(5, 0.75), (6, 0.25)],
+                "by their own security, three systems are 0.5 and one is 0.6"
+            );
+            assert!(
+                spread.bands.iter().map(|(_, p)| p).sum::<f64>() > 0.999,
+                "probabilities must sum to one"
+            );
+        }
+    }
+
+    #[test]
+    fn a_higher_system_reached_through_a_lower_one_counts_as_lower() {
+        // Start at D, the 0.6 system: it is the lowest on its own routes only until a path crosses
+        // C at 0.51, so D's neighbours inherit the floor of whatever the route must fly.
+        let chain = four_system_constellation(&[(1, 2), (2, 3), (3, 4)]);
+        let spread = chain.mission_spread(4).unwrap();
+        assert_eq!(
+            spread.destinations,
+            vec![(1, 3, 5, 5), (2, 2, 5, 5), (3, 1, 5, 5), (4, 0, 6, 6)],
+            "(id, hops, route band, own band): only D itself stays in band 0.6"
+        );
+        assert_eq!(spread.bands, vec![(5, 0.75), (6, 0.25)]);
+    }
+
+    #[test]
+    fn a_hop_group_follows_the_shape_of_the_constellation() {
+        let chain = four_system_constellation(&[(1, 2), (2, 3), (3, 4)]);
+        let star = four_system_constellation(&[(1, 2), (1, 3), (1, 4)]);
+        assert_eq!(
+            chain.mission_spread(1).unwrap().hops,
+            vec![(0, 0.25), (1, 0.25), (2, 0.25), (3, 0.25)],
+            "a line of four spreads over four distances"
+        );
+        assert_eq!(
+            star.mission_spread(1).unwrap().hops,
+            vec![(0, 0.25), (1, 0.75)],
+            "a hub reaches everything in one jump"
+        );
+        assert_eq!(
+            chain.mission_spread(3).unwrap().hops,
+            vec![(0, 0.25), (1, 0.5), (2, 0.25)],
+            "agent in system C: two neighbours, one two hops out"
+        );
+    }
+
+    #[test]
+    fn the_safest_route_is_preferred_and_the_shortest_only_breaks_ties() {
+        // D sits behind C at 0.51 on the direct way, and behind B at 0.50 the other way. The floor
+        // of the direct route is the start's 0.49 either way here, so the shorter route wins; raise
+        // the start to 0.52 and the route through B, whose lowest is 0.50, beats the one through C
+        // at 0.51 only when it is also no longer.
+        let raised: [FixtureRow; 4] = [
+            (1, ("A", 0.56, 7, 100)),
+            (2, ("B", 0.55, 7, 100)),
+            (3, ("C", 0.50, 7, 100)),
+            (4, ("D", 0.60, 7, 100)),
+        ];
+        // A -> B -> D keeps a floor of 0.55; A -> C -> D only reaches 0.50.
+        let data = fixture(&raised, &[(1, 2), (2, 4), (1, 3), (3, 4)]);
+        let spread = data.mission_spread(1).unwrap();
+        let to_d = spread
+            .destinations
+            .iter()
+            .find(|(id, ..)| *id == 4)
+            .expect("D");
+        assert_eq!(
+            to_d.2, 6,
+            "floor 0.55 through B rounds to band 0.6, not 0.5 through C"
+        );
+        assert_eq!(to_d.1, 2, "both ways are two gates, so hops are unchanged");
+    }
+
+    #[test]
+    fn destinations_carry_band_and_distance_together() {
+        let star = four_system_constellation(&[(1, 2), (1, 3), (1, 4)]);
+        let spread = star.mission_spread(1).unwrap();
+        assert_eq!(
+            spread.destinations,
+            vec![(1, 0, 5, 5), (2, 1, 5, 5), (3, 1, 5, 5), (4, 1, 5, 6)],
+            "(id, hops, route band, own band) in id order"
+        );
+    }
+
+    #[test]
+    fn an_unknown_agent_system_produces_no_spread() {
+        let star = four_system_constellation(&[(1, 2), (1, 3), (1, 4)]);
+        assert_eq!(star.mission_spread(99), None);
+    }
+
+    #[test]
+    fn a_member_reachable_only_by_leaving_is_left_out_rather_than_guessed() {
+        // System 4 hangs off the constellation through nothing: it cannot be reached while staying
+        // inside, so it is dropped and the denominator follows the systems actually counted.
+        let data = four_system_constellation(&[(1, 2), (2, 3)]);
+        let spread = data.mission_spread(1).unwrap();
+        assert_eq!(spread.systems, 3, "system 4 is not counted");
+        assert_eq!(
+            spread.own_bands,
+            vec![(5, 1.0)],
+            "the 0.6 band is gone with the unreachable system"
+        );
+    }
 
     #[test]
     fn hop_counts_from_jita_match_the_measured_constellation() {

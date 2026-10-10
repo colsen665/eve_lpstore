@@ -203,9 +203,12 @@ band and whichever distance it belongs to. The distance in the details pane is u
 because each listed system is itself an agent system and the counting starts there.
 
 Worked through the four-system example, which shows why the two groupings behave differently. The
-security marginal is `0.75 / 0.25` in every case, because it counts systems per band and ignores the
-graph. The distance grouping depends on the graph and on where the agent sits, and these are the
-possibilities for one constellation:
+marginal **by the systems' own security** is `0.75 / 0.25` in every case, because it counts systems per
+band and ignores the graph. The grouping `bands` reports is by the security flown on the route, and
+the graph does affect that: a route starts at the agent system, so when the start is the lowest of the
+four the whole example groups as `1.00` at the start's band, and it splits only from a start that is
+not the lowest. The distance grouping depends on the graph and on where the agent sits too, and these
+are the possibilities for one constellation:
 
 | topology and agent system | 0 jumps | 1 jump | 2 jumps | 3 jumps |
 | --- | --- | --- | --- | --- |
@@ -292,12 +295,30 @@ assumption about the game, not a measurement, so the view should present it as t
       pane, a compact suffix on the corporation line, or a column in the groups pane. The details pane
       is already the tallest region of the view and holds the offer breakdown, which argues against
       adding rows there.
-- [ ] Grouping uses the same rounding the security filter already applies, so a band on screen is a
-      band a user can type. `displayed_security` returns tenths, `-0.004` rounds to zero, and
-      `--security 0.5..0.7` compares on those tenths, so grouping goes through that function rather
-      than rounding a second time. Negative levels are reachable, since nullsec is negative and the
-      filter accepts -1.0 to 1.0.
-
+- [x] Grouping uses the same rounding the security filter already applies, so a band on screen is a
+      band a user can type: `security_band` returns tenths through `displayed_security` rather than
+      rounding a second time, and the negative and zero cases the filter accepts are reachable here
+      too.
+- [x] The model itself exists as `StaticData::mission_spread(agent_system)`, returning a
+      `DestinationSpread` with the band grouping, the hop grouping and the per-destination detail.
+      For each destination the route is the one that keeps the highest security floor while staying
+      inside the constellation, since that is what a pilot flying there would pick, with fewest gates
+      and then the smaller system order as tie-breaks so the answer does not depend on hash order.
+      The band a destination lands in is the lowest security on that route, **including the agent
+      system itself**, so a destination can sit below its own band and never above the band it starts
+      in. Hop counts are the gates on that same route. A member unreachable inside the constellation
+      is dropped from the count rather than guessed at, so `systems` is what was counted and the
+      probabilities sum to one. Unknown agent systems and empty constellations give `None`.
+- [x] Because that rule collapses the grouping whenever the agent system is among the constellation's
+      lowest, the spread also carries `own_bands`, the same destinations grouped by their own
+      security, and `destinations` carries both bands per destination so that a display can show the
+      difference rather than only the collapsed one.
+      Sazdih from Bayuka is that case: `0.4/100%` as the grouping and `own 0.5` on Moh.
+- [ ] What the model assumes without evidence: that destinations stay inside the constellation, that
+      every system in it is equally likely, and that the agent's own system carries the same weight as
+      a neighbour. That is a stated model rather than a measurement of how missions are routed, and
+      whatever displays it will have to say so; the wording waits on the research below rather than
+      being guessed at now.
 Deferred to a later phase:
 
 - [ ] Burner and anomic variants. These are acquired from a level 4 basic security agent, the same
@@ -318,12 +339,32 @@ Deferred to a later phase:
       measured Kimotoro graph at 0, 1, 2 and 3 jumps for 1, 4, 1 and 1 systems, the region and
       constellation accessors answering `None` rather than guessing, and the cache-version gate for both
       a missing version key and the version 2 shape.
-- [ ] Tests still owed: the band grouping itself, which has rounding tests from the security filter but
-      no grouping that consumes them, and the invariant that the security marginal is the same for
-      every topology and every agent system, since uniform weight per system makes that grouping a
-      count — a change that moves it while membership did not is a bug in the rounding or the weights, and the four-system worked example as the fixture that exercises a
-      split band, since real Kimotoro is degenerate at 0.9 for all seven systems. No live terminal check
-      is claimed for the display, per the standing note on such checks.
+- [x] Tests for the grouping: the worked four-system example, three systems at 0.5 and one at 0.6,
+      groups 0.75 and 0.25 by own security under both a chain and a star, and 100% in the start's own
+      band by route, because the start is the lowest of the four and every route begins there. The
+      hop grouping still differs between those two shapes, and again when the agent sits further in,
+      so the two groupings are tested against the topology separately. Where the safest way and the
+      shortest way disagree the test pins the safest: two routes of equal length, one holding a floor
+      of 0.55 through B and one 0.50 through C, and the destination is grouped at 0.6. Destinations
+      carry id, hops, route band and own band together; an unknown agent system gives `None`; a member
+      reachable only by leaving the constellation is dropped and the denominator follows.
+- [x] The earlier invariant that uniform weight makes the band grouping independent of the graph holds
+      for `own_bands` only, not for the route grouping: a route is a property of the gate graph as
+      well as of membership, which is what the safest-versus-shortest test above exercises. Stated
+      here because the bullet it replaces claimed it for both groupings.
+- [x] A real constellation is in the fixtures as well: Sazdih, six systems measured from ESI on
+      2026-10-10, five rounding to 0.4 and Moh alone to 0.5, giving 1/6, 3/6 and 2/6 by hops from
+      Bayuka, 5/6 and 1/6 by own band, and a single 0.4/100% by route band because Bayuka itself is
+      the lowest security on every way out. Three of its systems host agents in this tool's own data,
+      so it is a case the feature will meet rather than an invented one. Security is stored to four
+      decimals, finer than the tenths bands round to, which keeps fixture lines readable without
+      moving any system between bands. Kimotoro stays as the fixture for the hop counts measured
+      against ESI; it is not exercised as a band case, since all seven of its systems share one band
+      and so it would prove nothing about a split.
+- [ ] No live terminal check is claimed for any of it, per the standing note on such checks, and none
+      is possible yet: the grouping and the routing are pinned by tests against the four-system
+      example and against Sazdih measured from ESI, but there is no display until the option above is
+      taken.
 ### Security range syntax
 
 `--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
