@@ -152,6 +152,35 @@ Store the ESI response cache and the static data in the platform's standard loca
 - [ ] Print the resolved cache and data directories under `--verbose`, and into the TUI log, so the move is visible rather than silent. Printing to stdout unconditionally would scroll away before the TUI takes the terminal.
 - [ ] Tests: the resolved roots are absolute and independent of the working directory, cache and data are not the same directory, `--cache-dir` overrides the cache root and not the data root, `--clear-cache` removes `*.json` and `.*.tmp` while leaving the directory and the static data, and the existing `esi` cache test still passes, since it already sets its own directory.
 
+### Security range syntax
+
+`--security` reads `<op><level>`, where the operator is `+`, `-`, or `=` and the level follows. The
+first character is therefore an operator and not a sign, so `--security -0.5` means *at most 0.5*
+even though security is negative in nullsec. A range wants two bounds and the dash is already taken.
+
+New syntax, where each bound is a security level from -1.0 to 1.0:
+
+| Written | Means |
+| --- | --- |
+| `0.5` | exactly 0.5 |
+| `0.5..0.7` | at least 0.5 and at most 0.7, both bounds included |
+| `0.5..` | at least 0.5, the old `+0.5` |
+| `..0.5` | at most 0.5, the old `-0.5` |
+| `-0.9..-0.5` | a range below zero, which the `..` separator makes unambiguous |
+
+- [ ] Rewrite `SecurityFilter::parse` for the table above. Split on `..` rather than on a single character, so a leading `-` stays a sign. No existing form is accepted: `+0.5`, `-0.5`, and `=0.5` are errors, and each says what to write instead, because `-0.5` would otherwise parse as a number and quietly change meaning from *at most 0.5* to *exactly −0.5*.
+- [ ] Keep both ends of a closed range inclusive, and the single bound of an open range inclusive too, so `0.5..` matches what `+0.5` matches today.
+- [ ] Send each bound through `displayed_security`, as a single level already is, so `0.45..0.65` becomes `0.5..0.7` rather than being rejected.
+- [ ] Reject a lower bound above the upper one, naming both, instead of swapping them or letting the filter match nothing.
+- [ ] Decide the shape while parsing is being rewritten. `SecurityFilter` is `AtLeast`, `AtMost`, `Exactly`, and the first two cover an open range, so an inclusive closed range needs either a fourth variant or a pair of bounds with an empty side meaning unbounded. Only `parse` and `matches` read the variants, and both are in `src/static_data/mod.rs`, so either shape is local. A pair of bounds has to keep deriving `Copy`, because `AgentFilter` holds `Option<SecurityFilter>` and derives `Copy` itself.
+- [ ] Reject `..` on its own, which bounds nothing, and a value with an empty or non-numeric side.
+- [ ] Write the first tests for `parse`. It has none today, which is how the sign-versus-operator clash could go unnoticed this long. Cover every row of the table, both reversed and empty forms, levels outside -1.0 to 1.0, and each rejected old spelling naming its replacement.
+- [ ] `src/static_data/mod.rs` — the enum doc comment above `SecurityFilter` names `+0.5`, `-0.5`, and `=0.5` as the examples, and `parse`'s own comment says `<op><level>`. Both go with the operators, including the two error strings, `expected an operator (+, -, or =) and a level` and `the operator must be +, -, or =`.
+- [ ] `src/main.rs` — `--security <op><level>` in the filter list, the sentence describing `+x`, `-x`, and `=x`, and the `<op><level>` in the usage line built at `main.rs:205`. Keep the `https://wiki.eveuniversity.org/System_security` link, since rounding still applies, and add an example range to the Examples block.
+- [ ] `src/tui/ui.rs` — the `Security` hint reads `+0.5 at least, -0.5 at most, =0.5 exactly. Blank for any.`. It needs the new forms inside one line of the 36-column detail width at the minimum terminal size, so the rest goes on the second line that `hint` already splits for the market fields.
+- [ ] `src/tui/form.rs`, `src/tui/mod.rs`, and `src/saved_filters.rs` each use `"+0.5"` as a sample security value. They only carry the string around, so none fails to compile, but they should read as valid examples of the new syntax.
+- [ ] Consequence of rejecting the old forms, worth saying out loud: a `filters.json` written by Phase 7.1 can hold `"security": "+0.5"`, and on the next session Enter now fails validation on that field with the replacement suggested inline. The saved value is not silently reinterpreted, and the run does not start on a filter the user did not choose.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.
