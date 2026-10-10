@@ -102,6 +102,23 @@ impl FilterForm {
         }
     }
 
+    /// The form as the startup dialog shows it: region and depth carry the values the run would
+    /// use when they are not set, so the user sees what is about to happen instead of two blank
+    /// fields standing for invisible defaults. Every other field stays empty, because for those
+    /// an empty field is the default, meaning all corporations or any security status, and
+    /// writing one out would suggest a filter is in force when none is.
+    pub fn from_options_with_defaults(
+        options: &LpStoreOptions,
+        region: &str,
+        depth: usize,
+    ) -> Self {
+        Self {
+            region: options.region.clone().unwrap_or_else(|| region.to_string()),
+            depth: options.depth.clone().unwrap_or_else(|| depth.to_string()),
+            ..Self::from_options(options)
+        }
+    }
+
     /// The options the form describes. Blank fields are unset. The options the form does not
     /// show come from `base`.
     pub fn to_options(&self, base: &LpStoreOptions) -> LpStoreOptions {
@@ -344,6 +361,58 @@ mod tests {
         assert!(form.error_for(FormField::Corporations).is_some());
         form.type_char('x');
         assert_eq!(form.error_for(FormField::Corporations), None);
+    }
+
+    #[test]
+    fn defaults_fill_region_and_depth_only() {
+        let options = LpStoreOptions {
+            faction: Some("caldari".to_string()),
+            ..Default::default()
+        };
+        let form = FilterForm::from_options_with_defaults(&options, "The Forge", 10);
+        assert_eq!(form.region, "The Forge");
+        assert_eq!(form.depth, "10");
+        // The filters keep their meaning of "no filter", so an empty field is not a value.
+        assert_eq!(form.corporations, "");
+        assert_eq!(form.security, "");
+        assert_eq!(form.agent_level, "");
+        assert_eq!(form.division, "");
+        assert_eq!(form.agent_type, "");
+        assert_eq!(form.system, "");
+        assert_eq!(
+            form.faction, "caldari",
+            "a filter the command line set is still shown"
+        );
+    }
+
+    #[test]
+    fn a_value_from_the_command_line_beats_the_default() {
+        let options = LpStoreOptions {
+            region: Some("Domain".to_string()),
+            depth: Some("25".to_string()),
+            ..Default::default()
+        };
+        let form = FilterForm::from_options_with_defaults(&options, "The Forge", 10);
+        assert_eq!(form.region, "Domain");
+        assert_eq!(form.depth, "25");
+    }
+
+    #[test]
+    fn the_prefilled_defaults_round_trip_back_to_options() {
+        // Pre-filling must not invent a filter: the form has to give back options whose only
+        // additions over the command line are the two defaults it was handed.
+        let blank = LpStoreOptions::default();
+        let form = FilterForm::from_options_with_defaults(&blank, "The Forge", 10);
+        let applied = form.to_options(&blank);
+        assert_eq!(applied.lpstore, None);
+        assert_eq!(applied.security, None);
+        assert_eq!(applied.agent_level, None);
+        assert_eq!(applied.agent_division, None);
+        assert_eq!(applied.agent_type, None);
+        assert_eq!(applied.faction, None);
+        assert_eq!(applied.system, None);
+        assert_eq!(applied.region.as_deref(), Some("The Forge"));
+        assert_eq!(applied.depth.as_deref(), Some("10"));
     }
 
     #[test]

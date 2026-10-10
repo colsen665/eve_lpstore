@@ -268,6 +268,19 @@ pub struct StaticData {
 }
 
 impl StaticData {
+    /// Whether every file [`load`](Self::load) reads from disk is there. It says nothing about
+    /// whether they parse, so a `true` answer can still fail to load.
+    ///
+    /// `load` downloads on its own when this is `false`, which is a several hundred megabyte fetch
+    /// of the whole static data archive. Callers that want to ask before spending that, rather than
+    /// finding out silently, check this first.
+    pub fn is_cached() -> bool {
+        Self::regions_cache_path().exists()
+            && Self::corporations_cache_path().exists()
+            && Self::types_cache_path().exists()
+            && Self::security_cache_path().exists()
+    }
+
     /// Load static data from local cache.
     ///
     /// If `force_download` is `true`, the cache is re-downloaded from the SDE
@@ -279,12 +292,7 @@ impl StaticData {
         let types_path = Self::types_cache_path();
         let security_path = Self::security_cache_path();
 
-        if force_download
-            || !regions_path.exists()
-            || !corporations_path.exists()
-            || !types_path.exists()
-            || !security_path.exists()
-        {
+        if force_download || !Self::is_cached() {
             Self::download_and_cache(&regions_path, &corporations_path, &types_path, &security_path)
                 .await?;
         }

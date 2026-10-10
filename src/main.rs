@@ -18,7 +18,9 @@ Usage: eve_lpstore <mode> [FILTERS] [OPTIONS]
 Modes:
   --example              Run the general ESI and static data example.
   --lpstores             Calculate expenses, profit, and ISK per LP for LP store offers and show the top 10.
-  --tui                  Show --lpstores in a full-screen view that updates while it runs. Implies --lpstores.
+  --tui                  Show --lpstores in a full-screen view that updates while it runs. Asks for
+                         the filters first, and for the static data if it is not on disk. Implies
+                         --lpstores.
   --help                 Show this help and exit.
 
 Filters (apply to --lpstores):
@@ -65,7 +67,8 @@ Examples:
       Allow up to 8 ESI requests in flight at once.
 
   eve_lpstore --tui
-      Watch every corporation price in a full-screen view. Press ? for the keys and q to quit.
+      Ask for the filters, then watch every corporation price in a full-screen view. Enter starts
+      the run, and ? shows the keys once it is going.
 
   eve_lpstore --tui --lpstore \"Caldari Navy\" --region Domain --depth 20
       Open that view for one corporation in Domain. The filters pre-fill the form that f opens.
@@ -220,6 +223,19 @@ fn clear_cache_dir() {
     }
 }
 
+/// Says what is about to happen before the static data archive is fetched. Loading it pulls the
+/// whole SDE download, which takes long enough that a silent terminal looks hung.
+fn announce_static_data_download() {
+    if StaticData::is_cached() {
+        return;
+    }
+    let where_ = StaticData::regions_cache_path()
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| "the data directory".to_string());
+    println!("Static data not found, downloading it to {}...", where_);
+}
+
 async fn run_example(
     status: bool,
     expire: bool,
@@ -229,6 +245,7 @@ async fn run_example(
     max_inflight: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Load static data (only downloads if cache is missing or forced)
+    announce_static_data_download();
     let sdata = match StaticData::load(false).await {
         Ok(data) => {
             println!(
@@ -333,6 +350,19 @@ async fn run_example(
 }
 
 async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool, tui: bool) {
+    if tui {
+        if clear_cache {
+            clear_cache_dir();
+        }
+        // The view asks about the static data itself, and resolves the filters when they are
+        // applied, so nothing is loaded or fetched before it can say so on screen.
+        if let Err(e) = tui::run(options).await {
+            eprintln!("TUI failed: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+    announce_static_data_download();
     let sdata = match StaticData::load(false).await {
         Ok(data) => data,
         Err(e) => {
@@ -346,13 +376,6 @@ async fn run_lpstores(status: bool, options: LpStoreOptions, clear_cache: bool, 
     };
     if clear_cache {
         clear_cache_dir();
-    }
-    if tui {
-        if let Err(e) = tui::run(Arc::new(sdata), options, resolved).await {
-            eprintln!("TUI failed: {}", e);
-            std::process::exit(1);
-        }
-        return;
     }
     output::print_resolution(&resolved);
 

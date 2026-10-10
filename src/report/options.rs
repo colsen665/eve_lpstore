@@ -6,9 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
-const DEFAULT_REGION_ID: i32 = 10000002;
+/// The region prices come from when `--region` is not given.
+pub const DEFAULT_REGION_ID: i32 = 10000002;
 const DEFAULT_MAX_INFLIGHT: usize = 4;
-const DEFAULT_DEPTH: usize = 10;
+/// The offers printed per corporation group when `--depth` is not given.
+pub const DEFAULT_DEPTH: usize = 10;
 
 /// An option, identified by its command line flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2,11 +2,12 @@
 //! new state comes out. Nothing here touches the terminal, so these rules can be tested
 //! directly.
 
+use super::filter_summary;
 use super::form::FilterForm;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eve_lpstore::OfferResult;
 use eve_lpstore::export::ExportRequest;
-use eve_lpstore::report::{Event, Group, LpStoreOptions, Report};
+use eve_lpstore::report::{DEFAULT_DEPTH, Event, Group, LpStoreOptions, Report};
 use eve_lpstore::static_data::AgentFilter;
 use std::collections::VecDeque;
 
@@ -15,10 +16,20 @@ const PAGE: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// No run has been started. The startup filters dialog shows this until Enter is pressed.
+    Idle,
     Starting,
-    Fetching { done: usize, total: usize },
-    Pricing { done: usize, total: usize },
-    Finished { groups: usize },
+    Fetching {
+        done: usize,
+        total: usize,
+    },
+    Pricing {
+        done: usize,
+        total: usize,
+    },
+    Finished {
+        groups: usize,
+    },
     Failed,
 }
 
@@ -53,6 +64,8 @@ pub enum Overlay {
     Filters,
     Donate,
     Export,
+    /// Asking whether to download the static data, shown when it is not on disk.
+    StaticData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +75,8 @@ pub enum Action {
     Apply,
     /// Write the report on screen to the file the export prompt names.
     Export,
+    /// Download the static data archive after the user chose it in the dialog.
+    Download,
 }
 
 /// What a run was started with, as the header and the detail pane show it.
@@ -100,21 +115,29 @@ pub struct App {
     pub export_path: String,
     /// Why the last export attempt was refused, shown beside the prompt.
     pub export_error: Option<String>,
+    /// Whether the static data archive is being fetched right now.
+    pub downloading: bool,
+    /// Why the last static data download failed, shown in its dialog.
+    pub download_error: Option<String>,
 }
 
 impl App {
-    pub fn new(info: RunInfo, applied: LpStoreOptions) -> Self {
+    /// An app that has not started a run yet. The region and corporation counts are unknown until
+    /// the filters are applied, so the header shows what the command line asked for and nothing
+    /// more.
+    pub fn new(applied: LpStoreOptions) -> Self {
+        let filters = filter_summary(&applied);
         let form = FilterForm::from_options(&applied);
         Self {
-            region: info.region,
-            corporations: info.corporations,
-            filters: info.filters,
-            depth: info.depth,
-            agent_filter: info.agent_filter,
+            region: String::new(),
+            corporations: 0,
+            filters,
+            depth: DEFAULT_DEPTH,
+            agent_filter: AgentFilter::default(),
             applied,
             form,
             stale: false,
-            stage: Stage::Starting,
+            stage: Stage::Idle,
             log: VecDeque::new(),
             report: None,
             focus: Focus::Groups,
@@ -127,6 +150,8 @@ impl App {
             overlay: Overlay::None,
             export_path: String::new(),
             export_error: None,
+            downloading: false,
+            download_error: None,
         }
     }
 
@@ -189,14 +214,19 @@ impl App {
         self.stage = Stage::Failed;
     }
 
-    /// Switches the view to a new run. Earlier results stay on screen, marked stale, until
-    /// this run finishes.
-    pub fn start_run(&mut self, info: RunInfo) {
+    /// Takes in what a run was resolved to, without moving the stage on or logging it.
+    pub(crate) fn begin_run(&mut self, info: RunInfo) {
         self.region = info.region;
         self.corporations = info.corporations;
         self.filters = info.filters;
         self.agent_filter = info.agent_filter;
         self.apply_depth(info.depth);
+    }
+
+    /// Switches the view to a new run. Earlier results stay on screen, marked stale, until
+    /// this run finishes.
+    pub fn start_run(&mut self, info: RunInfo) {
+        self.begin_run(info);
         self.stale = self.report.is_some();
         self.stage = Stage::Starting;
         self.close_form();
@@ -216,10 +246,7 @@ impl App {
         if let Some(report) = &mut self.report {
             report.sort_by_depth(depth);
             if let Some(selected) = selected
-                && let Some(index) = report
-                    .groups
-                    .iter()
-                    .position(|g| g.corp_ids == selected)
+                && let Some(index) = report.groups.iter().position(|g| g.corp_ids == selected)
             {
                 self.group = index;
             }
@@ -241,6 +268,48 @@ impl App {
         if self.overlay == Overlay::Filters {
             self.overlay = Overlay::None;
         }
+    }
+
+    /// Opens the filters dialog with `form` already filled in, which is how the region and depth
+    /// defaults get pre-filled without living in the options the run was asked for.
+    pub fn show_filters(&mut self, form: FilterForm) {
+        self.form = form;
+        self.overlay = Overlay::Filters;
+    }
+
+    /// Asks whether to fetch the static data. Reached when the files are not on disk, or when they
+    /// are and did not parse, in which case `reason` says so and a download replaces them.
+    pub fn open_static_data(&mut self, reason: Option<String>) {
+        self.download_error = reason;
+        self.downloading = false;
+        self.overlay = Overlay::StaticData;
+    }
+
+    /// The user chose to download. The fetch itself belongs to the caller, which owns the runtime.
+    pub fn start_download(&mut self) {
+        self.downloading = true;
+        self.download_error = None;
+    }
+
+    /// The fetch came back with data, so the filters dialog can be opened over it.
+    pub fn download_finished(&mut self, form: FilterForm) {
+        self.downloading = false;
+        self.download_error = None;
+        self.push_log(LogLine {
+            text: "Downloaded the static data".to_string(),
+            is_error: false,
+        });
+        self.show_filters(form);
+    }
+
+    /// The fetch failed. The dialog stays open so it can be tried again, with the reason beside it.
+    pub fn download_failed(&mut self, reason: String) {
+        self.downloading = false;
+        self.push_log(LogLine {
+            text: format!("Static data download failed: {}", reason),
+            is_error: true,
+        });
+        self.download_error = Some(reason);
     }
 
     /// Opens the export prompt with a name built from the region, so Enter on its own writes
@@ -309,6 +378,7 @@ impl App {
 
     pub fn stage_text(&self) -> String {
         match self.stage {
+            Stage::Idle => "Not started".to_string(),
             Stage::Starting => "Starting...".to_string(),
             Stage::Fetching { done, total } => {
                 format!("Fetching loyalty offers: {} / {} corporations", done, total)
@@ -322,7 +392,7 @@ impl App {
     /// The (done, total) of the fetch gauge and of the pricing gauge.
     pub fn gauges(&self) -> ((usize, usize), (usize, usize)) {
         match self.stage {
-            Stage::Starting | Stage::Failed => ((0, 0), (0, 0)),
+            Stage::Idle | Stage::Starting | Stage::Failed => ((0, 0), (0, 0)),
             Stage::Fetching { done, total } => ((done, total), (0, 0)),
             Stage::Pricing { done, total } => {
                 ((self.corporations, self.corporations), (done, total))
@@ -371,6 +441,9 @@ impl App {
         if is_quit(&key) {
             return Action::Quit;
         }
+        if self.overlay == Overlay::StaticData {
+            return self.on_static_data_key(key);
+        }
         if self.overlay == Overlay::Donate {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('d')) {
                 self.overlay = Overlay::None;
@@ -409,7 +482,15 @@ impl App {
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
-            KeyCode::Esc => self.close_form(),
+            KeyCode::Esc => {
+                // The form the view opens on is the only thing between the user and a run, so
+                // cancelling it has nowhere to go back to and stops instead. Once a run has been
+                // started, Esc returns to the results it is showing.
+                if self.stage == Stage::Idle {
+                    return Action::Quit;
+                }
+                self.close_form();
+            }
             KeyCode::Enter => return Action::Apply,
             KeyCode::Tab | KeyCode::Down => self.form.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.form.previous_field(),
@@ -419,6 +500,20 @@ impl App {
             _ => {}
         }
         Action::Continue
+    }
+
+    /// The static data dialog. While the fetch is running every key is ignored, since there is
+    /// nothing to interrupt but the process. Before it, Enter or `d` downloads and Esc or `x`
+    /// stops the application. `q` and Ctrl+C quit through the usual rule.
+    fn on_static_data_key(&mut self, key: KeyEvent) -> Action {
+        if self.downloading {
+            return Action::Continue;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('d') => Action::Download,
+            KeyCode::Esc | KeyCode::Char('x') => Action::Quit,
+            _ => Action::Continue,
+        }
     }
 
     /// While the export prompt is open, keys go to it, so `q` types a letter. Only Ctrl+C quits.
@@ -548,7 +643,10 @@ mod tests {
     }
 
     fn new_app(depth: usize) -> App {
-        App::new(info(depth), LpStoreOptions::default())
+        let mut app = App::new(LpStoreOptions::default());
+        app.begin_run(info(depth));
+        app.stage = Stage::Starting;
+        app
     }
 
     fn offer(isk_per_lp: f64) -> OfferResult {
@@ -918,6 +1016,119 @@ mod tests {
         app.open_export();
         app.start_run(info(10));
         assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn the_static_data_dialog_offers_download_or_exit() {
+        let mut app = new_app(10);
+        app.open_static_data(None);
+        assert_eq!(app.overlay, Overlay::StaticData);
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Download);
+        app.open_static_data(None);
+        assert_eq!(app.on_key(press(KeyCode::Char('d'))), Action::Download);
+        app.open_static_data(None);
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Quit);
+        app.open_static_data(None);
+        assert_eq!(app.on_key(press(KeyCode::Char('x'))), Action::Quit);
+    }
+
+    #[test]
+    fn q_still_quits_from_the_static_data_dialog() {
+        let mut app = new_app(10);
+        app.open_static_data(None);
+        assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    #[test]
+    fn keys_do_nothing_while_the_static_data_downloads() {
+        let mut app = new_app(10);
+        app.open_static_data(None);
+        app.start_download();
+        assert!(app.downloading);
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
+        assert_eq!(app.on_key(press(KeyCode::Char('d'))), Action::Continue);
+        assert_eq!(app.overlay, Overlay::StaticData, "the dialog stays up");
+    }
+
+    #[test]
+    fn a_finished_download_opens_the_filters_dialog() {
+        let mut app = new_app(10);
+        app.open_static_data(None);
+        app.start_download();
+        let form = FilterForm::from_options(&LpStoreOptions::default());
+        app.download_finished(form);
+        assert_eq!(app.overlay, Overlay::Filters, "the filters come next");
+        assert!(!app.downloading);
+        assert_eq!(app.download_error, None);
+        let line = app.log.back().expect("the download is reported");
+        assert!(!line.is_error);
+        assert!(line.text.contains("Downloaded the static data"));
+    }
+
+    #[test]
+    fn a_failed_download_keeps_the_dialog_open_with_the_reason() {
+        let mut app = new_app(10);
+        app.open_static_data(None);
+        app.start_download();
+        app.download_failed("connection refused".to_string());
+        assert_eq!(
+            app.overlay,
+            Overlay::StaticData,
+            "the dialog stays up so it can be retried"
+        );
+        assert!(!app.downloading);
+        assert_eq!(app.download_error.as_deref(), Some("connection refused"));
+        let line = app.log.back().expect("the failure is logged");
+        assert!(line.is_error);
+        assert!(line.text.contains("connection refused"));
+        assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Download);
+    }
+
+    #[test]
+    fn unreadable_static_data_is_shown_with_the_reason_it_cannot_be_used() {
+        let mut app = new_app(10);
+        app.open_static_data(Some("data/regions.json is not valid JSON".to_string()));
+        assert_eq!(app.overlay, Overlay::StaticData);
+        assert_eq!(
+            app.download_error.as_deref(),
+            Some("data/regions.json is not valid JSON")
+        );
+    }
+
+    #[test]
+    fn the_view_starts_idle_with_only_what_the_command_line_asked_for() {
+        let options = LpStoreOptions {
+            faction: Some("caldari".to_string()),
+            ..Default::default()
+        };
+        let app = App::new(options);
+        assert_eq!(app.stage, Stage::Idle);
+        assert!(app.report.is_none());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.filters, "--faction caldari");
+        assert_eq!(app.region, "", "the region is not known until a run starts");
+        assert_eq!(app.corporations, 0);
+    }
+
+    #[test]
+    fn escape_from_the_startup_filters_dialog_quits() {
+        // Nothing has been fetched yet, so there is no view to go back to.
+        let options = LpStoreOptions::default();
+        let mut app = App::new(options);
+        let form = FilterForm::from_options(&LpStoreOptions::default());
+        app.show_filters(form);
+        assert_eq!(app.stage, Stage::Idle);
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Quit);
+    }
+
+    #[test]
+    fn escape_from_the_filters_dialog_after_a_run_cancels_it() {
+        let mut app = new_app(10);
+        app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(app.overlay, Overlay::Filters);
+        assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
+        assert_eq!(app.overlay, Overlay::None, "the results stay on screen");
     }
 
     #[test]

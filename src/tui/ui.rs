@@ -79,10 +79,16 @@ pub fn draw(
     } else {
         "corporations"
     };
-    let mut summary = format!(
-        "{} | {} {} | Filters: {}",
-        app.region, app.corporations, corporations, app.filters
-    );
+    // Before the first run there is no region and no corporation count to report, so the header
+    // says that instead of leading with an empty field and a zero.
+    let mut summary = if app.stage == Stage::Idle {
+        format!("Not started | Filters: {}", app.filters)
+    } else {
+        format!(
+            "{} | {} {} | Filters: {}",
+            app.region, app.corporations, corporations, app.filters
+        )
+    };
     if app.stale {
         summary = format!("{} | {}", app.stage_text(), summary);
     }
@@ -117,8 +123,57 @@ pub fn draw(
     if app.overlay == Overlay::Export {
         draw_export(frame, area, app);
     }
-    draw_footer(frame, footer, stats, app.overlay);
+    if app.overlay == Overlay::StaticData {
+        draw_static_data(frame, area, app);
+    }
+    draw_footer(frame, footer, stats, app);
     layout
+}
+
+/// Where the static data files live, taken from one of them rather than written out again, so this
+/// keeps saying the right thing when their location changes.
+fn static_data_dir() -> String {
+    StaticData::regions_cache_path()
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| "the data directory".to_string())
+}
+
+/// The static data dialog, shown when the files are not on disk, or are and cannot be read.
+/// Downloading fetches the whole EVE Online archive, so the view asks before spending the time on
+/// it instead of finding out on a terminal that has gone quiet.
+fn draw_static_data(frame: &mut Frame, area: Rect, app: &App) {
+    let width = 64usize;
+    let inner = width - 2;
+    let mut lines = Vec::new();
+    if app.downloading {
+        lines.push(Line::from("Downloading the EVE Online static data…"));
+    } else {
+        lines.push(Line::from(
+            "The EVE Online static data is needed to price loyalty offers.",
+        ));
+    }
+    if let Some(reason) = &app.download_error {
+        lines.push(Line::from(truncate(reason, inner)).red());
+    }
+    lines.push(Line::from(
+        truncate(&format!("It is stored in {}.", static_data_dir()), inner).dark_gray(),
+    ));
+    let keys = if app.downloading {
+        "Ctrl+C quits"
+    } else {
+        "Enter or d downloads it  Esc exits"
+    };
+    lines.push(Line::from(truncate(keys, inner)).dark_gray());
+    let popup = area.centered(
+        Constraint::Length(width as u16),
+        Constraint::Length(lines.len() as u16 + 2),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Static data ")),
+        popup,
+    );
 }
 
 /// The export prompt: where the view on screen would be written, and why the last attempt was
@@ -153,35 +208,44 @@ fn draw_export(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, app: &App) {
-    let [stage, fetch, pricing, log] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    // Before a run starts there is nothing to gauge, so the two bars that would read "waiting" are
+    // left out and the log gets their space.
+    let idle = app.stage == Stage::Idle;
+    let (stage_area, log_area) = if idle {
+        let [stage, log] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        (stage, log)
+    } else {
+        let [stage, fetch, pricing, log] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
+        .areas(area);
+        let ((fetch_done, fetch_total), (price_done, price_total)) = app.gauges();
+        gauge(
+            frame,
+            fetch,
+            "Fetching loyalty offers",
+            fetch_done,
+            fetch_total,
+        );
+        gauge(frame, pricing, "Pricing groups", price_done, price_total);
+        (stage, log)
+    };
     let style = if app.stage == Stage::Failed {
         Style::new().red()
     } else {
         Style::new()
     };
-    frame.render_widget(Paragraph::new(app.stage_text()).style(style), stage);
+    frame.render_widget(Paragraph::new(app.stage_text()).style(style), stage_area);
 
-    let ((fetch_done, fetch_total), (price_done, price_total)) = app.gauges();
-    gauge(
-        frame,
-        fetch,
-        "Fetching loyalty offers",
-        fetch_done,
-        fetch_total,
-    );
-    gauge(frame, pricing, "Pricing groups", price_done, price_total);
-
-    let height = usize::from(log.height.saturating_sub(2));
+    let height = usize::from(log_area.height.saturating_sub(2));
     let lines = log_lines(&app.log, height, 0);
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Recent log (l for all) ")),
-        log,
+        log_area,
     );
 }
 
@@ -935,12 +999,20 @@ fn qr_lines(grid: &[Vec<bool>]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, overlay: Overlay) {
+fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, app: &App) {
+    let overlay = app.overlay;
     let keys = match overlay {
         Overlay::Filters => {
             "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
         }
         Overlay::Export => "Enter write  Esc cancel  Ctrl+U clear  Ctrl+C quit",
+        Overlay::StaticData => {
+            if app.downloading {
+                "Downloading...  Ctrl+C quits"
+            } else {
+                "Enter or d download  Esc exit"
+            }
+        }
         _ => "Tab panes  Up/Down move  f filters  e export  d donate  l log  ? help  q quit",
     };
     let lines = vec![
@@ -964,6 +1036,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, overlay: Over
 mod tests {
     use super::*;
     use crate::tui::app::RunInfo;
+    use crate::tui::form::FilterForm;
     use eve_lpstore::ExpenseBreakdown;
     use eve_lpstore::esi::loyalty::LoyaltyOffer;
     use eve_lpstore::report::{LpStoreOptions, Report};
@@ -1167,7 +1240,8 @@ mod tests {
             depth,
             agent_filter: AgentFilter::default(),
         };
-        let mut app = App::new(info, LpStoreOptions::default());
+        let mut app = App::new(LpStoreOptions::default());
+        app.begin_run(info);
         app.finish(Report {
             groups: vec![Group {
                 corp_ids: vec![1000002],
@@ -1304,6 +1378,97 @@ mod tests {
         assert!(
             text.contains("lpstores-the-forge.csv"),
             "the name is still there to correct"
+        );
+    }
+
+    #[test]
+    fn the_static_data_dialog_offers_the_download_and_says_where_it_goes() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.open_static_data(None);
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("Static data"), "the popup is titled");
+        assert!(
+            text.contains("Enter or d downloads it"),
+            "the keys are on the dialog itself: {}",
+            text
+        );
+        assert!(
+            text.contains("stored in data"),
+            "it says where the files would go"
+        );
+        assert!(
+            text.contains("Enter or d download"),
+            "the footer switches to the dialog's keys"
+        );
+        assert!(
+            !text.contains("f filters"),
+            "the view keys are hidden while it is open"
+        );
+    }
+
+    #[test]
+    fn the_static_data_dialog_shows_the_reason_when_the_files_cannot_be_read() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.open_static_data(Some("data/regions.json is not valid JSON".to_string()));
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("data/regions.json is not valid JSON"));
+        assert!(
+            text.contains("Enter or d downloads it"),
+            "retry is still offered"
+        );
+    }
+
+    #[test]
+    fn the_static_data_dialog_changes_while_it_downloads() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.open_static_data(None);
+        app.start_download();
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("Downloading the EVE Online static data"),
+            "the dialog says something is happening"
+        );
+        assert!(
+            !text.contains("Enter or d download"),
+            "the download keys are gone once it started"
+        );
+        assert!(text.contains("Ctrl+C quits"), "the way out is still shown");
+    }
+
+    #[test]
+    fn the_idle_view_says_nothing_has_started_behind_the_startup_dialog() {
+        let mut app = App::new(LpStoreOptions::default());
+        app.open_static_data(None);
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("Not started"), "the header is honest");
+        assert!(
+            !text.contains("0 corporations"),
+            "no corporation count is claimed before a run"
+        );
+        assert!(
+            !text.contains("waiting"),
+            "the gauges are left out rather than reading waiting before anything has started"
+        );
+        assert!(
+            !text.contains("avg ISK/LP"),
+            "no results are claimed before a run"
+        );
+    }
+
+    #[test]
+    fn the_startup_filters_dialog_shows_the_prefilled_defaults() {
+        let mut app = App::new(LpStoreOptions::default());
+        let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        app.show_filters(form);
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains("The Forge"), "the region default is visible");
+        assert!(
+            text.contains("Corporations"),
+            "the filter fields are there and empty"
+        );
+        assert!(
+            text.contains("Enter apply"),
+            "the footer shows the form's keys"
         );
     }
 
