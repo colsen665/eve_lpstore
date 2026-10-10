@@ -137,6 +137,10 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
     if app.overlay == Overlay::StaticData {
         draw_static_data(frame, area, app);
     }
+    // Last, so any overlay the user asked for wins; the run's own popup is not something they opened.
+    if app.overlay == Overlay::None && (app.awaiting_run_summary || in_flight_run(app)) {
+        draw_run_progress(frame, area, app);
+    }
     draw_footer(frame, footer, stats, app);
     layout
 }
@@ -180,6 +184,69 @@ fn draw_static_data(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(lines).block(Block::bordered().title(" Static data ")),
         popup,
     );
+}
+
+/// Whether a run is in flight over the results already on screen. `stale` says a report exists and a
+/// newer run replaced it; the stage says that run has not finished.
+fn in_flight_run(app: &App) -> bool {
+    app.stale
+        && matches!(
+            app.stage,
+            Stage::Starting | Stage::Fetching { .. } | Stage::Pricing { .. }
+        )
+}
+
+/// The progress of a run that superseded the results on screen, shown over them. Before any results
+/// exist the same numbers are drawn inline by `draw_progress`; once they do, `draw_results` takes the
+/// body and those bars become unreachable, which left a re-run showing nothing but a header line and
+/// a `(stale)` suffix on three pane titles.
+///
+/// The popup takes no key. It is a drawing decision, not a mode: the groups, offers and details panes
+/// behind it still answer to Tab and the arrows, and any key at all acknowledges the end-of-run
+/// summary, which is what `App::awaiting_run_summary` is for.
+fn draw_run_progress(frame: &mut Frame, area: Rect, app: &App) {
+    const WIDTH: u16 = 64;
+    let summary = app.awaiting_run_summary;
+    // Eight inner rows for the stage line and the two bars, plus one for the key line only when there
+    // is something to acknowledge, plus the border.
+    let popup = area.centered(
+        Constraint::Length(WIDTH),
+        Constraint::Length(if summary { 10 } else { 9 }),
+    );
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered().title(" Run ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [stage, fetch, pricing, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(if summary { 1 } else { 0 }),
+    ])
+    .areas(inner);
+
+    let stage_style = if app.stage == Stage::Failed {
+        Style::new().red()
+    } else {
+        Style::new()
+    };
+    frame.render_widget(
+        Paragraph::new(truncate(&app.stage_text(), usize::from(WIDTH) - 2)).style(stage_style),
+        stage,
+    );
+    let ((fetch_done, fetch_total), (price_done, price_total)) = app.gauges();
+    gauge(
+        frame,
+        fetch,
+        "Fetching loyalty offers",
+        fetch_done,
+        fetch_total,
+    );
+    gauge(frame, pricing, "Pricing groups", price_done, price_total);
+    if summary {
+        frame.render_widget(Paragraph::new("any key closes this").dark_gray(), keys);
+    }
 }
 
 /// The export prompt: where the view on screen would be written, and why the last attempt was
@@ -2368,6 +2435,135 @@ mod tests {
             let shown = suggestions(&app, &StaticData::default()).expect("a name field suggests");
             assert_eq!(shown, "No matches", "{field:?} on empty data: {shown}");
         }
+    }
+
+    /// A key press, for the handful of tests that need to press a key.
+    fn press(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    /// Results on screen, then a second run started over them: the state a re-applied filter leaves.
+    fn rerun_app(done: usize, total: usize) -> App {
+        let mut app = results_app(one_priced_offer(), 10);
+        app.start_run(RunInfo {
+            region: "The Forge".to_string(),
+            region_id: 10000002,
+            agent_region_id: None,
+            corporations: 12,
+            filters: "--security 0.4..0.5".to_string(),
+            depth: 10,
+            agent_filter: AgentFilter::default(),
+        });
+        app.on_event(
+            &eve_lpstore::report::Event::FetchProgress { done, total },
+            None,
+        );
+        app
+    }
+
+    #[test]
+    fn a_re_run_shows_the_progress_popup_over_the_results() {
+        let app = rerun_app(3, 12);
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains(" Run "), "the popup is titled: {text}");
+        assert!(
+            text.contains("Fetching loyalty offers: 3 / 12 corporations"),
+            "the stage line is in it: {text}"
+        );
+        assert!(
+            text.contains("Pricing groups") && text.contains("waiting"),
+            "both bars show, the idle one reading waiting: {text}"
+        );
+    }
+
+    #[test]
+    fn the_first_run_keeps_its_bars_inline() {
+        // No results behind it, so there is nothing to cover and the progress view is already the
+        // whole screen. The popup is only for a run that superseded something.
+        let mut app = App::new(LpStoreOptions::default());
+        app.begin_run(RunInfo {
+            region: "The Forge".to_string(),
+            region_id: 10000002,
+            agent_region_id: None,
+            corporations: 3,
+            filters: "none".to_string(),
+            depth: 10,
+            agent_filter: AgentFilter::default(),
+        });
+        app.on_event(
+            &eve_lpstore::report::Event::FetchProgress { done: 1, total: 3 },
+            None,
+        );
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("Fetching loyalty offers: 1 / 3 corporations"),
+            "the inline bar still reports progress: {text}"
+        );
+        assert!(!text.contains(" Run "), "and no popup covers anything");
+    }
+
+    #[test]
+    fn the_end_of_a_re_run_waits_for_a_key() {
+        let mut app = rerun_app(12, 12);
+        app.finish(Report {
+            groups: vec![Group {
+                corp_ids: vec![1000002],
+                offer_count: 1,
+                results: one_priced_offer(),
+                errors: Vec::new(),
+            }],
+        });
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("Finished: 1 groups priced") && text.contains("any key closes this"),
+            "the summary is shown, and says how it goes away: {text}"
+        );
+        // The same state at the smallest size the view accepts. The summary popup is ten rows, so a
+        // screen this short is where it would be cut first, and the key line is its last row.
+        let small = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+        assert!(
+            small.contains("any key closes this"),
+            "the summary fits {}x{}: {small}",
+            MIN_WIDTH,
+            MIN_HEIGHT
+        );
+        app.on_key(press(crossterm::event::KeyCode::Esc));
+        let text = view_text(&app, 120, 40);
+        assert!(
+            !text.contains("any key closes this"),
+            "one key was enough: {text}"
+        );
+        assert!(
+            text.contains("Corporations"),
+            "the fresh results are now the view"
+        );
+    }
+
+    #[test]
+    fn an_open_overlay_wins_over_the_progress_popup() {
+        let mut app = rerun_app(3, 12);
+        app.overlay = Overlay::Log;
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains(" Log ("),
+            "the log the user asked for is showing"
+        );
+        assert!(
+            !text.contains(" Run "),
+            "the popup does not stack over it: {text}"
+        );
+    }
+
+    #[test]
+    fn a_stopped_re_run_reports_itself_in_the_popup() {
+        let mut app = rerun_app(3, 12);
+        app.fail();
+        let text = view_text(&app, 120, 40);
+        assert!(
+            text.contains("The run stopped unexpectedly"),
+            "the failure is on the popup: {text}"
+        );
+        assert!(text.contains("any key closes this"), "and it waits");
     }
 
     #[test]

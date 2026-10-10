@@ -571,6 +571,37 @@ control pair still returns a 10-system route. The live hole topology is not stat
       system without a wormhole is **not measured here**, and neither group's numbers should be read as
       saying anything about it. The cache says only which systems have gates.
 
+### A progress popup while a re-run is in flight
+
+Applying new filters starts a second run while the first run's results are still on screen. Until now
+the only sign of it was the header line prefixed with the stage text and `(stale)` on each pane title,
+because the two progress bars live in `draw_progress`, which `draw` reaches only when no report exists.
+
+- [x] Trigger is `App::stale` with the stage still in flight — any run over existing results, not only
+      one started from the filters dialog. No new flag for the trigger: `stale` already means "a run
+      superseded the report on screen", set in `start_run` and cleared in `finish`.
+- [x] `App::awaiting_run_summary` holds the end of a run on screen until any key is pressed, because
+      the loop drains run events before it draws and ticks every 250 ms, so a warm run can finish
+      inside one drain and never be drawn mid-flight. Set in `finish` and `fail` only when a report
+      was superseded, cleared by `start_run` and by any key press.
+- [x] Purely visual: the popup takes no key and is not an `Overlay` variant, so Tab, the arrows, `l`,
+      `m`, `e` and `q` all behave exactly as before, and the press that acknowledges a summary does
+      whatever it was already going to do. A new `Overlay` variant would have had to be considered by
+      every existing overlay-conditional branch, which is where the risk was.
+- [x] Other overlays win: the popup draws only when `app.overlay == Overlay::None`, so the log, help,
+      donate, export and the dialogs cover it and closing them brings it back.
+- [x] Shows both bars, from `app.gauges()` through the existing `gauge()`, so the idle one reads
+      `waiting` as it does inline; the stage line, red on a stopped run; and one key line, present
+      only for the summary, since that is the only state where a key changes anything. Nothing else
+      goes in it — the filters and the ESI counts are already in the header and footer, which stay
+      visible behind a centred popup.
+- [x] `fail()` still leaves `stale` set, so a stopped re-run keeps its panes titled `(stale)`. Kept
+      deliberately: the results on screen are from a superseded run. It does mean the popup can be
+      acknowledged while the titles still claim staleness, which is the honest reading.
+- [ ] Pre-existing wording, made more visible by this change, left unfixed: `stage_text()` prints
+      "Finished: 1 groups priced". It appears in the header and the progress view too, so correcting
+      the singular is a separate change with its own tests, not part of adding a popup.
+
 ### Filter agents by where they stand
 
 `--agent-region` and `--agent-system`, with the same pair of boxes on the Filters page directly
