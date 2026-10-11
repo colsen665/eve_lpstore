@@ -713,6 +713,40 @@ New syntax, where each bound is a security level from -1.0 to 1.0:
 - [x] `src/tui/form.rs`, `src/tui/mod.rs`, and `src/saved_filters.rs` used `"+0.5"` as a sample value, now `"0.5..0.7"`, and the filter summary assertion moved with it.
 - [x] Consequence of rejecting the old forms: a `filters.json` written by Phase 7.1 can hold `"security": "+0.5"`, and on the next session Enter fails validation on that field with the replacement named. The saved value is not silently reinterpreted, and the run does not start on a filter the user did not choose. Shown through `set_errors`, whose inline display is covered by `a_validation_failure_replaces_the_note`; not seen in a real terminal.
 
+### Refactoring from the 2026-10-12 review
+
+A read-through of the whole codebase, in five pieces, each its own commit: the ESI pagination fix,
+cheap cleanups, one table for the filter fields, the static data module, and the TUI state and
+render code. Behaviour changes are the ones listed under each piece; everything else is meant to
+leave the program doing what it did.
+
+#### ESI pagination
+
+- [x] A cached page 1 of a multi-page response came back as the only page. `fetch_single_page`
+      answered every cache hit with a page count of 1, and `fetch_all_pages` followed each page's
+      own count, so the walk stopped after page 1 with pages 2 onward cached beside it. Shown
+      before the fix with page 1 and page 2 both cached: `get` returned `[1]`. Affected `--example`,
+      which reads every order in a region and every type id, and any type with more than 1,000
+      orders in the priced region; the cache on this machine held no multi-page entries, so no
+      `--lpstores` run here is known to have been cut short.
+- [x] Cache files now hold `{"pages": n, "body": ...}`, and the page count comes from page 1 alone,
+      cached or not. A file without the wrapper, which is every file written before this, reads as
+      one page, as it always did, so nothing is refetched on upgrade; an old multi-page entry would
+      stay cut short until it expires. File names did not change, so `--clear-cache` and the
+      sibling lookup are unaffected. The page loop is a `for` over `2..=pages` with a `with_page`
+      helper, replacing the query rebuild that found and incremented the `page` parameter.
+- [x] A cache write that fails no longer fails the request. `write_cache` returning an error, from
+      an Expires header that is not a date or a full disk, used to turn a response already in hand
+      into an error through `?`. `store` now logs `[CACHE WRITE FAILED] <path>: <reason>` to the
+      log sink, unconditionally rather than only under `--verbose`, and the body is returned.
+- [x] Checked live against ESI: `universe/types` fetched 53,288 ids over 54 pages into an empty
+      cache, then a second client read the same 53,288 from 54 cache hits with no requests.
+- [x] Tests: 6 added, covering every page read back from cache, a file without the wrapper reading
+      as one page, a written page keeping its count, an object body not mistaken for the wrapper,
+      the `page` parameter replaced rather than repeated, and a failed write being logged. The
+      first fails on the old loop: mutated to stop after page 1, it returns `[1]` against
+      `[1, 2, 3]`.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

@@ -7,8 +7,10 @@ pub mod universe;
 
 use error::{EsiError, SharedError};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -318,58 +320,20 @@ impl EsiClient {
         Ok(url)
     }
 
-    /// Fetch all pages of a paginated endpoint, aggregating results.
+    /// Fetch every page of a paginated endpoint and join the results.
+    ///
+    /// The page count comes from the first page alone, cached or not. Following each page's own
+    /// count let a cached page, which used to report itself as the only one, end the walk early.
     async fn fetch_all_pages<T: DeserializeOwned>(&self, url: &url::Url) -> Result<T, EsiError> {
-        let mut all_results: Vec<serde_json::Value> = Vec::new();
-        let mut current_url = url.clone();
-
-        loop {
-            let (body, pages) = self.fetch_single_page(&current_url).await?;
-
-            // If the response is an array, accumulate; otherwise return directly
-            if let Some(arr) = body.as_array() {
-                all_results.extend(arr.iter().cloned());
-            } else {
-                return serde_json::from_value(body).map_err(EsiError::Deserialize);
-            }
-
-            // Check if there are more pages
-            match pages {
-                Some(1) | None => break,
-                Some(_) => {
-                    // Increment the page parameter directly on the URL
-                    let next_page = current_url
-                        .query_pairs()
-                        .position(|(k, _)| k == "page")
-                        .map(|pos| {
-                            let page: u32 = current_url
-                                .query_pairs()
-                                .nth(pos)
-                                .and_then(|(_, v)| v.parse().ok())
-                                .unwrap_or(1);
-                            page + 1
-                        })
-                        .unwrap_or(2);
-
-                    {
-                        let pairs: Vec<(String, String)> = current_url
-                            .query_pairs()
-                            .filter(|(k, _)| k != "page")
-                            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                            .collect();
-                        let mut qp = current_url.query_pairs_mut();
-                        qp.clear();
-                        for (k, v) in pairs {
-                            qp.append_pair(&k, &v);
-                        }
-                        qp.append_pair("page", &next_page.to_string());
-                    }
-                }
-            }
+        let (body, pages) = self.fetch_single_page(url).await?;
+        let serde_json::Value::Array(mut items) = body else {
+            return Ok(serde_json::from_value(body)?);
+        };
+        for page in 2..=pages.unwrap_or(1) {
+            let (body, _) = self.fetch_single_page(&with_page(url, page)).await?;
+            items.extend(serde_json::from_value::<Vec<serde_json::Value>>(body)?);
         }
-
-        serde_json::from_value(serde_json::Value::Array(all_results))
-            .map_err(EsiError::Deserialize)
+        Ok(serde_json::from_value(serde_json::Value::Array(items))?)
     }
 
     /// Fetch a single page. Checks the cache first, then shares one in-flight request per URL.
@@ -379,7 +343,7 @@ impl EsiClient {
     ) -> Result<(serde_json::Value, Option<u32>), EsiError> {
         if let Some(cached) = self.check_cache(url).await {
             self.stats.lock().unwrap().cache_hits += 1;
-            return Ok((cached, Some(1)));
+            return Ok(cached);
         }
         self.stats.lock().unwrap().cache_misses += 1;
 
@@ -412,9 +376,7 @@ impl EsiClient {
 
     /// Perform the HTTP request for one page, tracking in-flight and error stats.
     async fn request_page(&self, url: &url::Url) -> PageResult {
-        let mut attempt = 0u32;
-
-        let result = self.fetch_single_page_inner(url, &mut attempt).await;
+        let result = self.fetch_single_page_inner(url).await;
 
         // Update stats
         {
@@ -453,8 +415,8 @@ impl EsiClient {
         Some((entry_type, entry_id))
     }
 
-    /// Check if a valid cache entry exists for the given URL.
-    async fn check_cache(&self, url: &url::Url) -> Option<serde_json::Value> {
+    /// Check if a valid cache entry exists for the given URL, and return its body and page count.
+    async fn check_cache(&self, url: &url::Url) -> Option<(serde_json::Value, Option<u32>)> {
         let cache_dir = match &self.config.cache_dir {
             Some(dir) => dir,
             None => {
@@ -527,7 +489,7 @@ impl EsiClient {
                         continue;
                     }
                 };
-                if let Some(value) = serde_json::from_str(&content).ok() {
+                if let Ok(value) = serde_json::from_str(&content) {
                     if self.config.verbose {
                         let remaining = effective_expiry - now;
                         let expiry_dt = chrono::DateTime::from_timestamp(effective_expiry as i64, 0)
@@ -540,7 +502,7 @@ impl EsiClient {
                             remaining
                         ));
                     }
-                    return Some(value);
+                    return Some(unwrap_cached(value));
                 } else {
                     found_corrupt = true;
                 }
@@ -570,11 +532,27 @@ impl EsiClient {
         None
     }
 
-    /// Write a successful response to cache.
+    /// Caches a response that has already arrived. A write that fails is logged rather than
+    /// returned: the body is in hand, so a cache that cannot take it costs the next run a fetch
+    /// instead of costing this one the result.
+    async fn store(
+        &self,
+        url: &url::Url,
+        body: &serde_json::Value,
+        pages: Option<u32>,
+        expires_header: Option<&str>,
+    ) {
+        if let Err(error) = self.write_cache(url, body, pages, expires_header).await {
+            self.verbose_log(format!("[CACHE WRITE FAILED] {}: {}", url.path(), error));
+        }
+    }
+
+    /// Write a successful response to the cache, with the page count it arrived with.
     async fn write_cache(
         &self,
         url: &url::Url,
         body: &serde_json::Value,
+        pages: Option<u32>,
         expires_header: Option<&str>,
     ) -> Result<(), EsiError> {
         let cache_dir = match &self.config.cache_dir {
@@ -591,15 +569,14 @@ impl EsiClient {
         let expiry = match expires_header {
             Some(header) => {
                 // Parse HTTP date format (RFC 1123 / RFC 2822)
-                let dt = chrono::DateTime::parse_from_rfc2822(header)
-                    .map_err(|e| EsiError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                let dt = chrono::DateTime::parse_from_rfc2822(header).map_err(io::Error::other)?;
                 dt.timestamp() as u64
             }
             None => {
                 // Default: cache for 1 hour if no Expires header
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_err(|e| EsiError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?
+                    .map_err(io::Error::other)?
                     .as_secs()
                     + 3600
             }
@@ -614,7 +591,7 @@ impl EsiClient {
         let filepath = std::path::Path::new(cache_dir).join(&filename);
         let temp_path = std::path::Path::new(cache_dir)
             .join(format!(".{}.{}.tmp", filename, std::process::id()));
-        let content = serde_json::to_string(body).map_err(EsiError::Deserialize)?;
+        let content = serde_json::to_string(&CachedPageRef { pages, body })?;
         tokio::fs::write(&temp_path, content).await.map_err(EsiError::Io)?;
         tokio::fs::rename(&temp_path, &filepath).await.map_err(EsiError::Io)?;
         self.stats.lock().unwrap().cache_writes += 1;
@@ -644,8 +621,8 @@ impl EsiClient {
     async fn fetch_single_page_inner(
         &self,
         url: &url::Url,
-        attempt: &mut u32,
     ) -> Result<(serde_json::Value, Option<u32>), EsiError> {
+        let mut attempt = 0u32;
         loop {
             let mut headers = HeaderMap::new();
             headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -716,22 +693,20 @@ impl EsiClient {
                 drop(in_flight);
                 drop(permit);
 
-                // Write to cache
-                self.write_cache(url, &body, expires.as_deref()).await?;
-
+                self.store(url, &body, pages, expires.as_deref()).await;
                 return Ok((body, pages));
             }
 
             // Retryable: 420 (error limit) or 5xx
             if status.as_u16() == 420 || status.is_server_error() {
-                if *attempt >= retry::MAX_RETRIES {
+                if attempt >= retry::MAX_RETRIES {
                     return Err(EsiError::Throttle);
                 }
                 drop(in_flight);
                 drop(permit);
-                let delay = retry::backoff_delay(*attempt);
+                let delay = retry::backoff_delay(attempt);
                 tokio::time::sleep(delay).await;
-                *attempt += 1;
+                attempt += 1;
                 continue;
             }
 
@@ -748,7 +723,47 @@ impl EsiClient {
             });
         }
     }
+}
 
+/// `url` asking for `page`, with any page it already named replaced.
+fn with_page(url: &url::Url, page: u32) -> url::Url {
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "page")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let mut paged = url.clone();
+    paged
+        .query_pairs_mut()
+        .clear()
+        .extend_pairs(pairs)
+        .append_pair("page", &page.to_string());
+    paged
+}
+
+/// A cache file as it is written: the body, and the `X-Pages` count the response carried.
+#[derive(Serialize)]
+struct CachedPageRef<'a> {
+    pages: Option<u32>,
+    body: &'a serde_json::Value,
+}
+
+/// Splits a cache file into its body and page count. A file written before the count was stored
+/// holds the bare body, and reads as one page, which is how every cached page used to read.
+fn unwrap_cached(value: serde_json::Value) -> (serde_json::Value, Option<u32>) {
+    match value {
+        serde_json::Value::Object(mut file)
+            if file.len() == 2 && file.contains_key("pages") && file.contains_key("body") =>
+        {
+            let pages = file
+                .get("pages")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|pages| u32::try_from(pages).ok());
+            let body = file.remove("body").unwrap_or_default();
+            (body, pages)
+        }
+        legacy => (legacy, Some(1)),
+    }
 }
 
 #[cfg(test)]
@@ -783,7 +798,132 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(client.check_cache(&url).await, Some(serde_json::json!([1])));
+        assert_eq!(
+            client.check_cache(&url).await,
+            Some((serde_json::json!([1]), Some(1)))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn in_an_hour() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600
+    }
+
+    /// A client that reads `dir` and has no server to reach, so a test that should be answered
+    /// from the cache fails rather than quietly fetching.
+    fn offline_client(dir: &std::path::Path) -> EsiClient {
+        EsiClient::builder()
+            .base_url("http://127.0.0.1:9")
+            .cache_dir(dir.to_path_buf())
+            .build()
+    }
+
+    const ORDERS: &str = "markets_10000002_orders_datasource_tranquility_language_en";
+
+    #[tokio::test]
+    async fn a_cached_multi_page_response_returns_every_page() {
+        // Page one used to come back from the cache as the only page, so the walk stopped there
+        // with pages two onward cached beside it.
+        let dir = scratch_dir("every_page");
+        let expiry = in_an_hour();
+        for (page, name) in [
+            (1, format!("{ORDERS}_{expiry}.json")),
+            (2, format!("{ORDERS}_page_2_{expiry}.json")),
+            (3, format!("{ORDERS}_page_3_{expiry}.json")),
+        ] {
+            let body = format!(r#"{{"pages":3,"body":[{page}]}}"#);
+            std::fs::write(dir.join(name), body).unwrap();
+        }
+
+        let orders: Vec<i32> = offline_client(&dir)
+            .get("markets/10000002/orders/", &[])
+            .await
+            .expect("every page is cached");
+        assert_eq!(orders, [1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_cache_file_without_a_page_count_reads_as_one_page() {
+        // Files written before the count was stored hold the bare body, so they keep reading the
+        // way they always did rather than forcing a refetch.
+        let dir = scratch_dir("legacy_page");
+        let expiry = in_an_hour();
+        std::fs::write(dir.join(format!("{ORDERS}_{expiry}.json")), "[1]").unwrap();
+        std::fs::write(dir.join(format!("{ORDERS}_page_2_{expiry}.json")), "[2]").unwrap();
+
+        let orders: Vec<i32> = offline_client(&dir)
+            .get("markets/10000002/orders/", &[])
+            .await
+            .expect("page one is cached");
+        assert_eq!(orders, [1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_written_page_keeps_its_page_count() {
+        let dir = scratch_dir("written_count");
+        let client = offline_client(&dir);
+        let url = client.build_url("markets/10000002/orders/", &[]).unwrap();
+        let body = serde_json::json!([{"order_id": 1}]);
+        client
+            .write_cache(&url, &body, Some(7), None)
+            .await
+            .unwrap();
+        assert_eq!(client.check_cache(&url).await, Some((body, Some(7))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_object_body_is_not_mistaken_for_a_page_count() {
+        // A response that is an object, such as a type's details, is cached inside the same
+        // wrapper, and only the wrapper's two fields are unwrapped.
+        let dir = scratch_dir("object_body");
+        let client = offline_client(&dir);
+        let url = client.build_url("universe/types/34/", &[]).unwrap();
+        let body = serde_json::json!({"pages": 1, "body": "x", "type_id": 34});
+        client.write_cache(&url, &body, None, None).await.unwrap();
+        assert_eq!(client.check_cache(&url).await, Some((body, None)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_page_parameter_is_replaced_not_repeated() {
+        let url = url::Url::parse("https://esi.evetech.net/x/?datasource=t&page=2").unwrap();
+        assert_eq!(
+            with_page(&url, 3).as_str(),
+            "https://esi.evetech.net/x/?datasource=t&page=3"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_cache_write_is_logged_rather_than_returned() {
+        // An Expires header that is not a date fails the write. `store` is what the fetch path
+        // calls with a body already in hand, and it has no error to hand back.
+        let dir = scratch_dir("write_failure");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let client = EsiClient::builder()
+            .base_url("http://127.0.0.1:9")
+            .cache_dir(dir.clone())
+            .log(move |line| sink.lock().unwrap().push(line))
+            .build();
+        let url = client.build_url("markets/10000002/orders/", &[]).unwrap();
+        client
+            .store(&url, &serde_json::json!([1]), Some(1), Some("not a date"))
+            .await;
+        assert_eq!(client.check_cache(&url).await, None, "nothing was written");
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("[CACHE WRITE FAILED] /markets/10000002/orders/:"),
+            "{}",
+            lines[0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
