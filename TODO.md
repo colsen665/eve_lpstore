@@ -838,6 +838,55 @@ leave the program doing what it did.
       old serializer's, so a binary from before this change wrote it, and a test run left its
       timestamp unchanged; inferred to be a session of the view outside this work.
 
+#### The static data module
+
+- [x] `src/static_data/mod.rs` was one 2,351-line file. It is now `mod.rs` (the struct, `SystemInfo`,
+      and the name and id lookups), `security.rs` (displayed security and `SecurityFilter`),
+      `agents.rs` (`AgentRow`, `AgentFilter`, and the agent queries), `routes.rs` (the gate graph,
+      `DestinationSpread`, and both mission spreads), `sde.rs` (the archive's record shapes and
+      extraction), `cache.rs` (the four files, `is_cached`, `load`, and reading them back),
+      `error.rs`, and a test-only `fixtures.rs` for the fixtures more than one test module uses.
+      Each test moved beside what it tests. The move was done by cutting the file at item
+      boundaries, and a line-for-line comparison of before and after shows only visibility,
+      imports, and module headers changed. Phases above that name `src/static_data/mod.rs` for
+      something now in a submodule were right when written.
+- [x] `StaticDataError` replaces `EsiError` as what `StaticData::load` returns. Archive errors
+      were wrapped as I/O errors and JSON write errors were reported as "Deserialization error",
+      none naming a file. Each case now names the file it is about: `mapRegions.jsonl in the
+      static data archive, line 3: ...`, or the cache file's path. This is the text `main` prints
+      after `Failed to load static data:` and the static data dialog shows as the reason.
+- [x] The archive is opened once rather than eleven times, and one `records::<T>(file)` replaces
+      the eight copies of the read-split-parse loop and the three extractors that did it their
+      own way. Those three found their files by substring, `region` and `corporation`, which
+      depended on archive order; they are now looked up by exact name, `mapRegions.jsonl` and
+      `npcCorporations.jsonl`. The archive's central directory, read with a range request, lists
+      `npcCorporations.jsonl` first and `mapRegions.jsonl` as the first file containing `region`,
+      so the same files are read. `zip.by_index(i).unwrap()`, which panicked on a damaged archive,
+      is gone with the substring search. The four `{ en }` name records are one `SdeName`.
+- [x] Systems are a named `SystemInfo { name, true_sec, region_id, constellation_id }` instead of
+      a 4-tuple taken apart by position. The cache file keeps its tuple rows, so its version stays
+      at 3 and nothing is downloaded again.
+- [x] Fifteen items that were `pub` with no use outside the module, and `files`, are private or
+      `pub(super)`. `agent_systems` got its own doc comment, which had been sitting above
+      `security_division_id`. Clippy's 16 warnings in the module are fixed, which leaves one in the
+      crate, `large_enum_variant` on the TUI's `Opening`.
+- [x] Checked end to end: the binary from before the review and this one each downloaded the
+      archive into a temporary `HOME`. `regions.json`, `corporations.json`, and `types.json` came
+      out byte-identical. The agent file has the same size and the same contents, but its
+      `corporations` and `stations` lists are in a different order; both are collected from a
+      `HashMap`, so their order varies between runs of either binary (inferred from the
+      `RandomState` hashing, not shown with a second download). The `--lpstores` output of the
+      two runs matched.
+- [x] Tests: 4 added, for a failing line named by number, a missing archive file named, the
+      English name read beside another language, and a damaged cache file named by path. The
+      last reads through `load_from_disk` rather than `load`, so a regression in `is_cached`
+      cannot turn it into a download.
+- [ ] Not done here, and noted by the review: the burner route search copies each route's full
+      path at every step and then discards it (about 14 ms per agent system, 25 ms at worst, in
+      the review's release-build measurement), and the agent file is read three times at start-up.
+      The two `HashMap`-ordered lists could be sorted before writing so the file is the same bytes
+      on every download.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.
