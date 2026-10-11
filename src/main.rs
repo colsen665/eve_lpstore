@@ -2,7 +2,7 @@ mod output;
 mod tui;
 
 use eve_lpstore::esi::ClientStats;
-use eve_lpstore::report::{self, LpStoreOptions, OptionError};
+use eve_lpstore::report::{self, Field, LpStoreOptions, OptionError};
 use eve_lpstore::{EsiClient, Paths, StaticData};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -27,7 +27,7 @@ Modes:
   --help                 Show this help and exit.
 
 Filters (apply to --lpstores):
-  --lpstore <list>       Corporations to process, as a comma-separated list of IDs or names. Without it, all corporations are processed.
+  --lpstore <id|name,...> Corporations to process, as a comma-separated list of IDs or names. Without it, all corporations are processed.
   --security <level|range> Keep corporations with an agent in a system whose rounded security is the level, or inside the range. Write 0.5 for exactly, 0.5..0.7 for a range with both bounds included, 0.5.. for at least, and ..0.7 for at most. A level can be negative, so the old -0.5 no longer means at most. Rounding: https://wiki.eveuniversity.org/System_security
   --agent-level <n>      Keep corporations with an agent of level n (1 to 5).
   --agent-division <name>  Keep corporations with an agent in this division, e.g. security or distribution.
@@ -107,48 +107,14 @@ async fn main() {
         return;
     }
 
-    const FLAGS: &[&str] = &[
-        "--example",
-        "--lpstores",
-        "--tui",
-        "--status",
-        "--expire",
-        "--verbose",
-        "--clear-cache",
-        "--help",
-    ];
-    const VALUE_FLAGS: &[&str] = &[
-        "--lpstore",
-        "--region",
-        "--cache-minutes",
-        "--concurrency",
-        "--max-inflight",
-        "--security",
-        "--agent-level",
-        "--agent-division",
-        "--agent-type",
-        "--agent-region",
-        "--agent-system",
-        "--faction",
-        "--depth",
-        "--system",
-        "--cache-dir",
-    ];
-
-    let mut i = 1;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        if VALUE_FLAGS.contains(&arg) {
-            i += 2;
-            continue;
-        }
-        if !FLAGS.contains(&arg) {
-            eprintln!("Unknown argument '{}'", arg);
+    let options = match parse_options(&args[1..]) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("{}", message);
             eprintln!("Run {} --help to see the available arguments", args[0]);
             std::process::exit(1);
         }
-        i += 1;
-    }
+    };
 
     // Only an explicit `--tui` is checked against the terminal. A bare run reaches `mode_of`, which
     // falls back to the usage line when there is nowhere to draw, so a pipe is not made to look like
@@ -164,35 +130,11 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let value = |flag: &str| -> Option<String> {
-        args.iter()
-            .position(|a| a == flag)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
+    // `parse_options` refuses a value that starts with `--`, so every argument equal to one of these
+    // flags is that flag and not some option's value.
     let status = args.iter().any(|a| a == "--status");
-    let expire = args.iter().any(|a| a == "--expire");
     let clear_cache = args.iter().any(|a| a == "--clear-cache");
-    let verbose = args.iter().any(|a| a == "--verbose");
-    let options = LpStoreOptions {
-        lpstore: value("--lpstore"),
-        region: value("--region"),
-        security: value("--security"),
-        agent_level: value("--agent-level"),
-        agent_division: value("--agent-division"),
-        agent_type: value("--agent-type"),
-        agent_region: value("--agent-region"),
-        agent_system: value("--agent-system"),
-        faction: value("--faction"),
-        system: value("--system"),
-        cache_minutes: value("--cache-minutes"),
-        concurrency: value("--concurrency"),
-        max_inflight: value("--max-inflight"),
-        depth: value("--depth"),
-        cache_dir: value("--cache-dir"),
-        expire,
-        verbose,
-    };
+    let (expire, verbose) = (options.expire, options.verbose);
     let mode = mode_of(&args, clear_cache, on_a_terminal);
 
     // Every mode that runs needs both roots, including a bare --clear-cache, so the home directory
@@ -257,13 +199,67 @@ async fn main() {
             if let Err(errors) = options.parse() {
                 exit_with_errors(errors);
             }
-            println!(
-                "Usage: {} [--example|--lpstores|--tui] [--status] [--expire] [--cache-minutes <n>] [--cache-dir <path>] [--concurrency <n>] [--max-inflight <n>] [--depth <n>] [--system <name|id>] [--security <level|range>] [--agent-level <n>] [--agent-division <name>] [--agent-type <name>] [--faction <name>] [--verbose] [--clear-cache] [--lpstore <id|name,...>] [--region <id|name>]\n\
-                 With no mode, opens the --tui view on a terminal; the modes above are the ways to ask for something else.",
-                args[0]
-            );
+            println!("{}", usage_line(&args[0]));
         }
     }
+}
+
+/// The arguments that take no value. Every one that does is a row of `report::Field`.
+const FLAGS: &[&str] = &[
+    "--example",
+    "--lpstores",
+    "--tui",
+    "--status",
+    "--expire",
+    "--verbose",
+    "--clear-cache",
+    "--help",
+];
+
+/// Reads the arguments after the program name into options, and refuses one it does not know.
+///
+/// A value flag needs its value: one at the end, or followed by an argument starting with `--`, is
+/// refused rather than read as unset. A value with a single leading dash is still a value, since
+/// `--security -0.5` is how a negative level is written. Given twice, the first value wins.
+fn parse_options(args: &[String]) -> Result<LpStoreOptions, String> {
+    let mut options = LpStoreOptions::default();
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if let Some(field) = Field::from_flag(arg) {
+            let value = match rest.next() {
+                Some(value) if !value.starts_with("--") => value,
+                _ => return Err(format!("{} needs a value", arg)),
+            };
+            options
+                .value_mut(field)
+                .get_or_insert_with(|| value.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--expire" => options.expire = true,
+            "--verbose" => options.verbose = true,
+            flag if FLAGS.contains(&flag) => {}
+            _ => return Err(format!("Unknown argument '{}'", arg)),
+        }
+    }
+    Ok(options)
+}
+
+/// What a run with no mode and no terminal prints: every flag, then what a bare run does instead.
+fn usage_line(program: &str) -> String {
+    let mut usage = format!(
+        "Usage: {program} [--example|--lpstores|--tui] [--status] [--expire] [--verbose] \
+         [--clear-cache]"
+    );
+    for field in Field::ALL {
+        let spec = field.spec();
+        usage.push_str(&format!(" [{} {}]", spec.flag, spec.value_name));
+    }
+    usage.push_str(
+        "\nWith no mode, opens the --tui view on a terminal; the modes above are the ways to ask \
+         for something else.",
+    );
+    usage
 }
 
 /// What the arguments ask for, once whether stdout is a terminal is known.
@@ -619,31 +615,65 @@ mod tests {
 
     #[test]
     fn every_option_is_documented_and_read() {
-        // Two ways a flag can be added and not work: missing from the help, or missing from the list
-        // of flags that take a value, which makes the argument count as unknown. Both are checked
-        // against the field list itself, so a new option cannot slip past.
-        for field in [
-            report::Field::Lpstore,
-            report::Field::Region,
-            report::Field::Security,
-            report::Field::AgentLevel,
-            report::Field::AgentDivision,
-            report::Field::AgentType,
-            report::Field::Faction,
-            report::Field::AgentRegion,
-            report::Field::AgentSystem,
-            report::Field::System,
-            report::Field::CacheMinutes,
-            report::Field::Concurrency,
-            report::Field::MaxInflight,
-            report::Field::Depth,
-        ] {
+        // Three ways a flag can be added and not work: missing from the help, missing from the
+        // usage line, or not reaching its option. All three are checked against the option table,
+        // so a new option cannot slip past. The help and the usage line also have to agree on how
+        // the value is written.
+        let usage = usage_line("eve_lpstore");
+        for field in Field::ALL {
+            let spec = field.spec();
+            let written = format!("{} {}", spec.flag, spec.value_name);
+            assert!(HELP_TEXT.contains(&written), "{written} is not in the help");
             assert!(
-                HELP_TEXT.contains(field.flag()),
-                "{} is not in the help text",
-                field.flag()
+                usage.contains(&format!("[{written}]")),
+                "{written} is not in the usage line"
+            );
+            let options = parse_options(&args(&format!("{} value", spec.flag))[1..])
+                .unwrap_or_else(|error| panic!("{}: {error}", spec.flag));
+            assert_eq!(
+                options.value(field).as_deref(),
+                Some("value"),
+                "{}",
+                spec.flag
             );
         }
+    }
+
+    #[test]
+    fn a_value_flag_without_its_value_is_refused() {
+        for text in ["--depth", "--depth --tui", "--lpstore --region Domain"] {
+            let error = parse_options(&args(text)[1..]).expect_err(text);
+            assert!(error.ends_with(" needs a value"), "{text}: {error}");
+        }
+        assert_eq!(
+            parse_options(&args("--lpstores --depth")[1..]),
+            Err("--depth needs a value".to_string())
+        );
+    }
+
+    #[test]
+    fn a_value_with_one_leading_dash_is_still_a_value() {
+        let options = parse_options(&args("--security -0.5..-0.1")[1..]).unwrap();
+        assert_eq!(options.security.as_deref(), Some("-0.5..-0.1"));
+    }
+
+    #[test]
+    fn an_unknown_argument_is_named() {
+        assert_eq!(
+            parse_options(&args("--lpstores --colour")[1..]),
+            Err("Unknown argument '--colour'".to_string())
+        );
+    }
+
+    #[test]
+    fn the_first_of_two_values_wins_and_the_switches_are_read() {
+        let options =
+            parse_options(&args("--region Domain --expire --region Heimatar --verbose")[1..])
+                .unwrap();
+        assert_eq!(options.region.as_deref(), Some("Domain"));
+        assert!(options.expire && options.verbose);
+        let options = parse_options(&args("--tui --status --clear-cache")[1..]).unwrap();
+        assert_eq!(options, LpStoreOptions::default());
     }
 
     #[test]

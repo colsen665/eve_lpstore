@@ -10,8 +10,11 @@
 //! remembering it would refetch every offer on every later run, and the command-line-only fields
 //! are not shown by the form, so there is nothing to remember about them.
 
-use crate::report::LpStoreOptions;
-use serde::{Deserialize, Serialize};
+use crate::report::{Field, LpStoreOptions};
+use serde::de::Error as _;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -24,27 +27,25 @@ pub fn path(config: &Path) -> PathBuf {
 
 /// The filters a run was applied with, as they are written to disk.
 ///
-/// This is its own struct rather than `LpStoreOptions` with serde on it, so a field the form does
-/// not carry cannot be persisted by accident. `#[serde(default)]` lets a file written by a future
-/// version, or edited by hand and missing a field, still load.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SavedFilters {
-    pub lpstore: Option<String>,
-    pub region: Option<String>,
-    pub security: Option<String>,
-    pub agent_level: Option<String>,
-    pub agent_division: Option<String>,
-    pub agent_type: Option<String>,
-    pub agent_region: Option<String>,
-    pub agent_system: Option<String>,
-    pub faction: Option<String>,
-    pub system: Option<String>,
-    pub depth: Option<String>,
-    pub cache_minutes: Option<String>,
+/// Holds only the options [`Field::in_form`] names, so an option the form does not carry cannot be
+/// persisted by accident. The file is an object keyed by each option's [`key`](crate::report::FieldSpec::key),
+/// with `null` for an option that was not set. A key the file lacks reads as not set, so a file
+/// written by an older version, or edited by hand, still loads, and a key it does not know is
+/// ignored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedFilters(LpStoreOptions);
+
+/// The options the file keeps, in the order it writes them.
+fn kept() -> impl Iterator<Item = Field> {
+    Field::ALL.into_iter().filter(|field| field.in_form())
 }
 
 impl SavedFilters {
+    /// The remembered value of `field`, or `None` when it was not set or is not one the file keeps.
+    pub fn value(&self, field: Field) -> &Option<String> {
+        self.0.value(field)
+    }
+
     /// The options a run starts from: `cli` for every field the command line set, these values for
     /// the rest. Fields that are `None` in both stay `None`, which is what makes clearing a field in
     /// the form and applying it the way to forget a filter.
@@ -54,46 +55,58 @@ impl SavedFilters {
     /// empty value the command line gave keeps its current meaning, because this must not change
     /// how the flags behave.
     pub fn overlay(&self, cli: &LpStoreOptions) -> LpStoreOptions {
-        let pick = |from_cli: &Option<String>, from_file: &Option<String>| match from_cli {
-            Some(value) => Some(value.clone()),
-            None => from_file.clone().filter(|value| !value.trim().is_empty()),
-        };
-        LpStoreOptions {
-            lpstore: pick(&cli.lpstore, &self.lpstore),
-            region: pick(&cli.region, &self.region),
-            security: pick(&cli.security, &self.security),
-            agent_level: pick(&cli.agent_level, &self.agent_level),
-            agent_division: pick(&cli.agent_division, &self.agent_division),
-            agent_type: pick(&cli.agent_type, &self.agent_type),
-            agent_region: pick(&cli.agent_region, &self.agent_region),
-            agent_system: pick(&cli.agent_system, &self.agent_system),
-            faction: pick(&cli.faction, &self.faction),
-            system: pick(&cli.system, &self.system),
-            depth: pick(&cli.depth, &self.depth),
-            cache_minutes: pick(&cli.cache_minutes, &self.cache_minutes),
-            // concurrency, max_inflight, cache_dir, expire, and verbose are command line only, so
-            // they come from `cli` and there is no saved value that could override them.
-            ..cli.clone()
+        // The options the file does not keep, and expire and verbose, come from `cli` untouched.
+        let mut options = cli.clone();
+        for field in kept() {
+            let value = options.value_mut(field);
+            if value.is_none() {
+                *value = self
+                    .value(field)
+                    .clone()
+                    .filter(|saved| !saved.trim().is_empty());
+            }
         }
+        options
     }
 }
 
 impl From<&LpStoreOptions> for SavedFilters {
     fn from(options: &LpStoreOptions) -> Self {
-        Self {
-            lpstore: options.lpstore.clone(),
-            region: options.region.clone(),
-            security: options.security.clone(),
-            agent_level: options.agent_level.clone(),
-            agent_division: options.agent_division.clone(),
-            agent_type: options.agent_type.clone(),
-            agent_region: options.agent_region.clone(),
-            agent_system: options.agent_system.clone(),
-            faction: options.faction.clone(),
-            system: options.system.clone(),
-            depth: options.depth.clone(),
-            cache_minutes: options.cache_minutes.clone(),
+        let mut saved = LpStoreOptions::default();
+        for field in kept() {
+            *saved.value_mut(field) = options.value(field).clone();
         }
+        Self(saved)
+    }
+}
+
+impl Serialize for SavedFilters {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut file = serializer.serialize_map(None)?;
+        for field in kept() {
+            file.serialize_entry(field.spec().key, self.value(field))?;
+        }
+        file.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SavedFilters {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut file = HashMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        let mut saved = LpStoreOptions::default();
+        for field in kept() {
+            let key = field.spec().key;
+            *saved.value_mut(field) = match file.remove(key) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(value)) => Some(value),
+                Some(other) => {
+                    return Err(D::Error::custom(format!(
+                        "{key} is {other}, where a string or null was expected"
+                    )));
+                }
+            };
+        }
+        Ok(Self(saved))
     }
 }
 
@@ -172,7 +185,7 @@ mod tests {
     use super::*;
 
     fn all_fields() -> SavedFilters {
-        SavedFilters {
+        SavedFilters::from(&LpStoreOptions {
             lpstore: Some("1000002".to_string()),
             region: Some("Domain".to_string()),
             security: Some("0.5..0.7".to_string()),
@@ -185,7 +198,17 @@ mod tests {
             system: Some("Jita".to_string()),
             depth: Some("25".to_string()),
             cache_minutes: Some("90".to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Saved filters holding only the given values.
+    fn saved(values: &[(Field, &str)]) -> SavedFilters {
+        let mut options = LpStoreOptions::default();
+        for (field, value) in values {
+            *options.value_mut(*field) = Some(value.to_string());
         }
+        SavedFilters::from(&options)
     }
 
     #[test]
@@ -209,12 +232,51 @@ mod tests {
                 loaded.reason().unwrap_or("other")
             );
         };
-        assert_eq!(filters.lpstore.as_deref(), Some("Caldari Navy"));
-        assert_eq!(filters.region.as_deref(), Some("The Forge"));
-        assert_eq!(filters.depth.as_deref(), Some("5"));
-        assert_eq!(filters.cache_minutes.as_deref(), Some("17"));
-        assert_eq!(filters.faction, None, "an unset field stays unset");
+        assert_eq!(
+            filters.value(Field::Lpstore).as_deref(),
+            Some("Caldari Navy")
+        );
+        assert_eq!(filters.value(Field::Region).as_deref(), Some("The Forge"));
+        assert_eq!(filters.value(Field::Depth).as_deref(), Some("5"));
+        assert_eq!(filters.value(Field::CacheMinutes).as_deref(), Some("17"));
+        assert_eq!(
+            *filters.value(Field::Faction),
+            None,
+            "an unset field stays unset"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_written_before_the_option_table_still_loads_every_field() {
+        // The shape the derived serializer wrote, field for field, in its order. The keys are the
+        // table's `key`s, so nothing a user saved is lost to the change.
+        let text = r#"{
+  "lpstore": "1000002",
+  "region": "Domain",
+  "security": "0.5..0.7",
+  "agent_level": "4",
+  "agent_division": "security",
+  "agent_type": "research",
+  "agent_region": "Black Rise",
+  "agent_system": "4-3L53",
+  "faction": "caldari",
+  "system": "Jita",
+  "depth": "25",
+  "cache_minutes": "90"
+}"#;
+        let filters: SavedFilters = serde_json::from_str(text).unwrap();
+        assert_eq!(filters, all_fields());
+    }
+
+    #[test]
+    fn every_kept_option_is_written_with_null_for_unset() {
+        let text = serde_json::to_string(&saved(&[(Field::Region, "Domain")])).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let file = file.as_object().unwrap();
+        assert_eq!(file.len(), kept().count());
+        assert_eq!(file["region"], "Domain");
+        assert!(file["lpstore"].is_null());
     }
 
     #[test]
@@ -228,7 +290,14 @@ mod tests {
     fn a_damaged_file_is_reported_with_a_reason() {
         let dir = std::env::temp_dir().join(format!("eve_lpstore_damaged_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for text in ["", "{ not json", "{\"depth\": 10}", "\"a string\"", "42"] {
+        for text in [
+            "",
+            "{ not json",
+            "{\"depth\": 10}",
+            "\"a string\"",
+            "42",
+            "[]",
+        ] {
             let file = dir.join("filters.json");
             std::fs::write(&file, text).unwrap();
             let loaded = load_from(&file);
@@ -239,12 +308,22 @@ mod tests {
     }
 
     #[test]
-    fn a_json_array_loads_as_no_remembered_filters() {
-        // The derived deserializer accepts the sequence form, so an empty array is every field
-        // absent rather than a damaged file. That is the same run the file being missing would
-        // give, so there is nothing worth reporting.
-        let filters: SavedFilters = serde_json::from_str("[]").unwrap();
-        assert_eq!(filters, SavedFilters::default());
+    fn a_json_array_is_not_read_by_position() {
+        // The derived deserializer accepted the sequence form, so `["a", "b"]` set the first two
+        // fields in declaration order. The file is an object; anything else is damaged.
+        let error = serde_json::from_str::<SavedFilters>(r#"["Caldari Navy", "Domain"]"#);
+        assert!(error.is_err());
+    }
+
+    #[test]
+    fn a_wrongly_typed_value_names_its_key() {
+        let error = serde_json::from_str::<SavedFilters>(r#"{"depth": 10}"#).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("depth is 10, where a string or null"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -255,11 +334,18 @@ mod tests {
             cache_minutes: Some("90".to_string()),
             concurrency: Some("8".to_string()),
             max_inflight: Some("6".to_string()),
+            cache_dir: Some("/tmp/elsewhere".to_string()),
             region: Some("Domain".to_string()),
             ..Default::default()
         };
         let text = serde_json::to_string_pretty(&SavedFilters::from(&options)).unwrap();
-        for name in ["expire", "verbose", "concurrency", "max_inflight"] {
+        for name in [
+            "expire",
+            "verbose",
+            "concurrency",
+            "max_inflight",
+            "cache_dir",
+        ] {
             assert!(!text.contains(name), "{} reached the file: {}", name, text);
         }
         assert!(
@@ -320,6 +406,7 @@ mod tests {
             cache_minutes: Some("90".to_string()),
             concurrency: Some("8".to_string()),
             max_inflight: Some("6".to_string()),
+            cache_dir: Some("/tmp/elsewhere".to_string()),
             ..Default::default()
         };
         let merged = Loaded::Filters(Box::new(all_fields())).merge(cli);
@@ -331,16 +418,16 @@ mod tests {
         assert_eq!(merged.cache_minutes.as_deref(), Some("90"));
         assert_eq!(merged.concurrency.as_deref(), Some("8"));
         assert_eq!(merged.max_inflight.as_deref(), Some("6"));
+        assert_eq!(merged.cache_dir.as_deref(), Some("/tmp/elsewhere"));
     }
 
     #[test]
     fn a_saved_blank_does_not_become_a_filter_that_matches_nothing() {
-        let filters = SavedFilters {
-            lpstore: Some("   ".to_string()),
-            region: Some("".to_string()),
-            faction: Some("caldari".to_string()),
-            ..Default::default()
-        };
+        let filters = saved(&[
+            (Field::Lpstore, "   "),
+            (Field::Region, ""),
+            (Field::Faction, "caldari"),
+        ]);
         let merged = filters.overlay(&LpStoreOptions::default());
         assert_eq!(merged.lpstore, None, "whitespace is absent");
         assert_eq!(merged.region, None);
@@ -355,11 +442,7 @@ mod tests {
             region: Some(String::new()),
             ..Default::default()
         };
-        let filters = SavedFilters {
-            region: Some("Domain".to_string()),
-            ..Default::default()
-        };
-        let merged = filters.overlay(&cli);
+        let merged = saved(&[(Field::Region, "Domain")]).overlay(&cli);
         assert_eq!(merged.region.as_deref(), Some(""));
     }
 
@@ -377,16 +460,24 @@ mod tests {
     fn a_field_missing_from_the_file_loads_as_absent() {
         // A file from an older version, or one edited by hand, must still load.
         let filters: SavedFilters = serde_json::from_str("{\"region\": \"Domain\"}").unwrap();
-        assert_eq!(filters.region.as_deref(), Some("Domain"));
-        assert_eq!(filters.lpstore, None);
-        assert_eq!(filters.depth, None);
+        assert_eq!(filters.value(Field::Region).as_deref(), Some("Domain"));
+        assert_eq!(*filters.value(Field::Lpstore), None);
+        assert_eq!(*filters.value(Field::Depth), None);
     }
 
     #[test]
     fn an_unknown_field_in_the_file_does_not_stop_it_loading() {
         let filters: SavedFilters =
-            serde_json::from_str("{\"region\": \"Domain\", \"warp_speed\": \"fast\"}").unwrap();
-        assert_eq!(filters.region.as_deref(), Some("Domain"));
+            serde_json::from_str("{\"region\": \"Domain\", \"warp_speed\": 5}").unwrap();
+        assert_eq!(filters.value(Field::Region).as_deref(), Some("Domain"));
+    }
+
+    #[test]
+    fn a_command_line_only_key_in_the_file_is_ignored() {
+        // Hand-editing `concurrency` into the file must not make it a remembered setting.
+        let filters: SavedFilters = serde_json::from_str("{\"concurrency\": \"8\"}").unwrap();
+        assert_eq!(*filters.value(Field::Concurrency), None);
+        assert_eq!(filters, SavedFilters::default());
     }
 
     #[test]

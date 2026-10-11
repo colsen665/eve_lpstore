@@ -693,6 +693,7 @@ mod tests {
     use crossterm::event::KeyEventState;
     use eve_lpstore::OfferError;
     use eve_lpstore::esi::error::EsiError;
+    use eve_lpstore::report::Field;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -910,7 +911,7 @@ mod tests {
         app.on_key(press(KeyCode::Char('f')));
         assert_eq!(app.overlay, Overlay::Filters);
         assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Continue);
-        assert_eq!(app.form.corporations, "q");
+        assert_eq!(app.form.value(Field::Lpstore), "q");
         assert_eq!(app.on_key(ctrl('c')), Action::Quit);
     }
 
@@ -945,7 +946,7 @@ mod tests {
         let mut app = new_app(10);
         app.on_key(press(KeyCode::Char('f')));
         app.on_key(press(KeyCode::Char('d')));
-        assert_eq!(app.form.corporations, "d");
+        assert_eq!(app.form.value(Field::Lpstore), "d");
     }
 
     #[test]
@@ -1235,7 +1236,7 @@ mod tests {
         assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
         assert_eq!(app.overlay, Overlay::None);
         app.on_key(press(KeyCode::Char('f')));
-        assert_eq!(app.form.corporations, "");
+        assert_eq!(app.form.value(Field::Lpstore), "");
     }
 
     #[test]

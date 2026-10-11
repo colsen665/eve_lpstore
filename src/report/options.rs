@@ -12,8 +12,13 @@ const DEFAULT_MAX_INFLIGHT: usize = 4;
 /// The offers printed per corporation group when `--depth` is not given.
 pub const DEFAULT_DEPTH: usize = 10;
 
-/// An option, identified by its command line flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An option that takes a value, identified by its command line flag.
+///
+/// Everything about one option is in its row of [`Field::spec`]: the flag, how its value is
+/// written, its label in the view's form, its key in `filters.json`, and where it lives in
+/// [`LpStoreOptions`]. The command line parser, the usage line, the remembered filters, and the form
+/// all read that table, so a new option is a new variant and a new row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Field {
     Lpstore,
     Region,
@@ -31,26 +36,186 @@ pub enum Field {
     Concurrency,
     MaxInflight,
     Depth,
+    CacheDir,
+}
+
+/// One row of the option table. See [`Field::spec`].
+pub struct FieldSpec {
+    pub flag: &'static str,
+    /// How the value is written, as the usage line and the help show it.
+    pub value_name: &'static str,
+    /// The label in the view's filter form, or `None` for an option only the command line sets.
+    /// The form's fields are also exactly the ones `filters.json` remembers.
+    pub form_label: Option<&'static str>,
+    /// The option's name in `filters.json`, which is also its field in [`LpStoreOptions`].
+    pub key: &'static str,
+    get: fn(&LpStoreOptions) -> &Option<String>,
+    get_mut: fn(&mut LpStoreOptions) -> &mut Option<String>,
 }
 
 impl Field {
-    pub fn flag(self) -> &'static str {
+    /// Every option, in the order the view's form shows them, then the ones only the command line
+    /// sets. The form, the filter summary, and the usage line follow this order.
+    pub const ALL: [Field; 15] = [
+        Field::Lpstore,
+        Field::Security,
+        Field::AgentRegion,
+        Field::AgentSystem,
+        Field::AgentLevel,
+        Field::AgentDivision,
+        Field::AgentType,
+        Field::Faction,
+        Field::Region,
+        Field::System,
+        Field::Depth,
+        Field::CacheMinutes,
+        Field::Concurrency,
+        Field::MaxInflight,
+        Field::CacheDir,
+    ];
+
+    pub fn spec(self) -> FieldSpec {
         match self {
-            Field::Lpstore => "--lpstore",
-            Field::Region => "--region",
-            Field::Security => "--security",
-            Field::AgentLevel => "--agent-level",
-            Field::AgentDivision => "--agent-division",
-            Field::AgentType => "--agent-type",
-            Field::AgentRegion => "--agent-region",
-            Field::AgentSystem => "--agent-system",
-            Field::Faction => "--faction",
-            Field::System => "--system",
-            Field::CacheMinutes => "--cache-minutes",
-            Field::Concurrency => "--concurrency",
-            Field::MaxInflight => "--max-inflight",
-            Field::Depth => "--depth",
+            Field::Lpstore => FieldSpec {
+                flag: "--lpstore",
+                value_name: "<id|name,...>",
+                form_label: Some("Corporations"),
+                key: "lpstore",
+                get: |options| &options.lpstore,
+                get_mut: |options| &mut options.lpstore,
+            },
+            Field::Security => FieldSpec {
+                flag: "--security",
+                value_name: "<level|range>",
+                form_label: Some("Security"),
+                key: "security",
+                get: |options| &options.security,
+                get_mut: |options| &mut options.security,
+            },
+            // Named for the agents they filter, standing beside the market pair further down, which
+            // is named for the prices it moves.
+            Field::AgentRegion => FieldSpec {
+                flag: "--agent-region",
+                value_name: "<id|name>",
+                form_label: Some("Agent region"),
+                key: "agent_region",
+                get: |options| &options.agent_region,
+                get_mut: |options| &mut options.agent_region,
+            },
+            Field::AgentSystem => FieldSpec {
+                flag: "--agent-system",
+                value_name: "<id|name>",
+                form_label: Some("Agent system"),
+                key: "agent_system",
+                get: |options| &options.agent_system,
+                get_mut: |options| &mut options.agent_system,
+            },
+            Field::AgentLevel => FieldSpec {
+                flag: "--agent-level",
+                value_name: "<n>",
+                form_label: Some("Agent level"),
+                key: "agent_level",
+                get: |options| &options.agent_level,
+                get_mut: |options| &mut options.agent_level,
+            },
+            Field::AgentDivision => FieldSpec {
+                flag: "--agent-division",
+                value_name: "<name>",
+                form_label: Some("Division"),
+                key: "agent_division",
+                get: |options| &options.agent_division,
+                get_mut: |options| &mut options.agent_division,
+            },
+            Field::AgentType => FieldSpec {
+                flag: "--agent-type",
+                value_name: "<name>",
+                form_label: Some("Agent type"),
+                key: "agent_type",
+                get: |options| &options.agent_type,
+                get_mut: |options| &mut options.agent_type,
+            },
+            Field::Faction => FieldSpec {
+                flag: "--faction",
+                value_name: "<name>",
+                form_label: Some("Faction"),
+                key: "faction",
+                get: |options| &options.faction,
+                get_mut: |options| &mut options.faction,
+            },
+            // Named for what they filter, since a bare "Region" next to agent filters reads like
+            // another corporation attribute. Only the first word is capitalised, as in "Agent level"
+            // and "Expire cache". The command line keeps --region and --system.
+            Field::Region => FieldSpec {
+                flag: "--region",
+                value_name: "<id|name>",
+                form_label: Some("Market region"),
+                key: "region",
+                get: |options| &options.region,
+                get_mut: |options| &mut options.region,
+            },
+            Field::System => FieldSpec {
+                flag: "--system",
+                value_name: "<name|id>",
+                form_label: Some("Market system"),
+                key: "system",
+                get: |options| &options.system,
+                get_mut: |options| &mut options.system,
+            },
+            Field::Depth => FieldSpec {
+                flag: "--depth",
+                value_name: "<n>",
+                form_label: Some("Depth"),
+                key: "depth",
+                get: |options| &options.depth,
+                get_mut: |options| &mut options.depth,
+            },
+            Field::CacheMinutes => FieldSpec {
+                flag: "--cache-minutes",
+                value_name: "<n>",
+                form_label: Some("Cache minutes"),
+                key: "cache_minutes",
+                get: |options| &options.cache_minutes,
+                get_mut: |options| &mut options.cache_minutes,
+            },
+            Field::Concurrency => FieldSpec {
+                flag: "--concurrency",
+                value_name: "<n>",
+                form_label: None,
+                key: "concurrency",
+                get: |options| &options.concurrency,
+                get_mut: |options| &mut options.concurrency,
+            },
+            Field::MaxInflight => FieldSpec {
+                flag: "--max-inflight",
+                value_name: "<n>",
+                form_label: None,
+                key: "max_inflight",
+                get: |options| &options.max_inflight,
+                get_mut: |options| &mut options.max_inflight,
+            },
+            Field::CacheDir => FieldSpec {
+                flag: "--cache-dir",
+                value_name: "<path>",
+                form_label: None,
+                key: "cache_dir",
+                get: |options| &options.cache_dir,
+                get_mut: |options| &mut options.cache_dir,
+            },
         }
+    }
+
+    pub fn flag(self) -> &'static str {
+        self.spec().flag
+    }
+
+    /// The option `flag` names, if it names one.
+    pub fn from_flag(flag: &str) -> Option<Field> {
+        Field::ALL.into_iter().find(|field| field.flag() == flag)
+    }
+
+    /// Whether the view's form shows this option, which is also whether `filters.json` keeps it.
+    pub fn in_form(self) -> bool {
+        self.spec().form_label.is_some()
     }
 }
 
@@ -163,6 +328,15 @@ pub struct SystemSummary {
 }
 
 impl LpStoreOptions {
+    /// The value of `field` as typed, or `None` when it was not given.
+    pub fn value(&self, field: Field) -> &Option<String> {
+        (field.spec().get)(self)
+    }
+
+    pub fn value_mut(&mut self, field: Field) -> &mut Option<String> {
+        (field.spec().get_mut)(self)
+    }
+
     /// Checks the values that don't need static data.
     pub fn parse(&self) -> Result<Parsed, Vec<OptionError>> {
         let mut errors = Vec::new();
@@ -578,6 +752,49 @@ mod tests {
         // the box that caused it.
         assert_eq!(Field::AgentRegion.flag(), "--agent-region");
         assert_eq!(Field::AgentSystem.flag(), "--agent-system");
+    }
+
+    #[test]
+    fn every_text_option_is_reached_through_exactly_one_field() {
+        // The literal names every field of the struct, with no `..Default::default()`, so a new
+        // option does not compile here until it is listed. Giving each one a distinct value and
+        // reading them back through `Field::ALL` then finds an option the table has no row for, a
+        // row missing from `ALL`, and two rows pointing at one field.
+        let typed = LpStoreOptions {
+            lpstore: Some("lpstore".to_string()),
+            region: Some("region".to_string()),
+            security: Some("security".to_string()),
+            agent_level: Some("agent_level".to_string()),
+            agent_division: Some("agent_division".to_string()),
+            agent_type: Some("agent_type".to_string()),
+            agent_region: Some("agent_region".to_string()),
+            faction: Some("faction".to_string()),
+            agent_system: Some("agent_system".to_string()),
+            system: Some("system".to_string()),
+            cache_minutes: Some("cache_minutes".to_string()),
+            concurrency: Some("concurrency".to_string()),
+            max_inflight: Some("max_inflight".to_string()),
+            depth: Some("depth".to_string()),
+            cache_dir: Some("cache_dir".to_string()),
+            expire: false,
+            verbose: false,
+        };
+        let mut rebuilt = LpStoreOptions::default();
+        for field in Field::ALL {
+            let value = typed.value(field).clone();
+            assert_eq!(value.as_deref(), Some(field.spec().key), "{field:?}");
+            assert!(rebuilt.value(field).is_none(), "{field:?} is listed twice");
+            *rebuilt.value_mut(field) = value;
+        }
+        assert_eq!(rebuilt, typed);
+    }
+
+    #[test]
+    fn every_flag_names_its_own_field() {
+        for field in Field::ALL {
+            assert_eq!(Field::from_flag(field.flag()), Some(field));
+        }
+        assert_eq!(Field::from_flag("--tui"), None);
     }
 
     // `resolve` asks the runtime for its worker count, so these run inside one.

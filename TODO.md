@@ -105,7 +105,7 @@ CLI output stays the same, except that it prints every filter error, and lists c
 - [x] `remember` takes its path as an argument, the way `write_export` does, so the write is covered by unit tests without a terminal and without touching the project directory. A failed save is only a log line: the run is already going.
 - [x] HELP_TEXT says the view remembers, and a second `--tui` example shows the per-field precedence, which is the part a reader would otherwise guess wrong.
 - [x] Tests: 25 added, covering the round trip, a missing file, five kinds of damaged file, the fields that are never written, per-field precedence, the command-line-only settings surviving a merge, blank handling on both sides, the reset by clearing, a file with a missing field and one with an extra field, `set_note` and its replacement by a validation failure, the note rendering on the startup form, and a remembered run being written and read back.
-- [x] One behaviour that is not a bug: a file containing `[]` loads as every field absent rather than being rejected, because serde's derived deserializer accepts the sequence form. That is the same run the file being absent would give, so there is nothing to report.
+- [x] One behaviour that is not a bug: a file containing `[]` loads as every field absent rather than being rejected, because serde's derived deserializer accepts the sequence form. That is the same run the file being absent would give, so there is nothing to report. **Superseded** by the option table in the 2026-10-12 refactoring: the sequence form also read `["a", "b"]` positionally into the first two fields, and the file is now read as an object only, so any array is reported as unusable.
 
 #### Phase 7.2: Name the market fields for what they filter
 
@@ -788,6 +788,55 @@ leave the program doing what it did.
       build with every lookup a cache hit. Each lookup reads the whole cache directory, 3,734
       files at the time, which is the likely cost but was not profiled. Indexing the directory
       once per client was offered with the ESI piece and not chosen.
+
+#### One table for the options that take a value
+
+- [x] `report::Field` is the table. Each variant has one row in `Field::spec`: the flag, how its
+      value is written, its label in the form, its key in `filters.json`, and the accessors into
+      `LpStoreOptions`. `Field::ALL` lists them in the form's order, then the command-line-only
+      ones, and `CacheDir` joined as the fifteenth, since `--cache-dir` takes a value like the rest.
+      `LpStoreOptions::value` and `value_mut` read and write through the row.
+- [x] What reads the table rather than a list of its own: argument parsing in `main.rs`
+      (`parse_options`, replacing `VALUE_FLAGS` and the fifteen `value(...)` calls), the usage line
+      (`usage_line`), `SavedFilters` (`From`, `overlay`, and its serde), the form (`FormField`
+      became `Text(Field)` or `Expire`, and `FilterForm` keeps its text in an `LpStoreOptions`),
+      the form's labels, the mapping of an option error to its box, and `filter_summary`.
+- [x] Adding an option was about 27 edits in 6 files, 8 of which compiled when forgotten. Now it is
+      the variant, its row, its `ALL` entry, the struct field, and its meaning in `resolve`, plus a
+      help line and a form hint. The compiler forces the row, the hint, and the struct literal in
+      `every_text_option_is_reached_through_exactly_one_field`; that test then finds an entry
+      missing from `ALL` or two rows sharing a field, and `every_option_is_documented_and_read`
+      finds a flag missing from the help or the usage line or not reaching its option. The two
+      that still default quietly are deliberate: a new option is not a name field for
+      suggestions, and is included in the filter summary.
+- [x] Behaviour change, as chosen: a value flag at the end, or followed by an argument starting
+      with `--`, is refused with `<flag> needs a value`. It used to be read as unset, so
+      `eve_lpstore --depth` ran with the default depth, and `--lpstore --tui` took `--tui` as the
+      corporation list while also opening the view. A value with one leading dash is still a
+      value, so `--security -0.5` reaches the security check, which refuses it as before. Given
+      twice, the first value still wins. Checked with the binary for `--depth`, `--lpstore --tui`,
+      and `--security -0.5`; first-wins is checked by a unit test only.
+- [x] The usage line gained `--agent-region` and `--agent-system`, which it had been missing, and
+      now lists the switches first and the value flags in the form's order. The help's
+      `--lpstore <list>` reads `--lpstore <id|name,...>`, as the usage line already had it, because
+      the test now requires the two to agree.
+- [x] `filters.json` keeps its keys, and a file written before this loads every field, checked on
+      a literal copy of the old shape and on the file in `~/.config/eve_lpstore`. Two differences:
+      keys are written in the form's order, and any JSON array is now reported as unusable rather
+      than read by position. A value of the wrong type names its key: `depth is 10, where a string
+      or null was expected`. A command-line-only key typed into the file is ignored.
+- [x] Checked by output: `--lpstores` over all 283 corporations, and again with
+      `--security 0.5..0.7 --agent-level 4 --agent-division security --faction caldari --depth 5`,
+      printed the same lines as the binary from before the review, apart from timings.
+- [x] Tests: 11 added and the rest moved to the table's names, covering the table against the
+      struct, every flag naming its field, every option in the help, the usage line, and the
+      parser, the missing-value refusals, the one-dash value, an unknown argument, first-wins,
+      the old file shape, the written shape, an array, a wrongly typed value, a command-line-only
+      key, and the form carrying only its own fields.
+- [x] Observed while checking: `~/.config/eve_lpstore/filters.json` was rewritten at 01:09:50
+      during this piece, with `security` going from `0.5..0.6` to `0.6`. Its key order is the
+      old serializer's, so a binary from before this change wrote it, and a test run left its
+      timestamp unchanged; inferred to be a session of the view outside this work.
 
 ## Done
 

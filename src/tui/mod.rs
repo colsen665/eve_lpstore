@@ -13,7 +13,7 @@ use eve_lpstore::StaticData;
 use eve_lpstore::esi::EsiClient;
 use eve_lpstore::export;
 use eve_lpstore::paths::Paths;
-use eve_lpstore::report::{self, LpStoreOptions, Report, Resolved, RunEvent};
+use eve_lpstore::report::{self, Field, LpStoreOptions, Report, Resolved, RunEvent};
 use eve_lpstore::saved_filters;
 use ratatui::DefaultTerminal;
 use std::io;
@@ -354,7 +354,7 @@ fn clear_system_on_region_move(
         return true;
     }
     options.system = None;
-    app.form.system = String::new();
+    app.form.set_value(Field::System, "");
     match options.resolve(sdata) {
         Ok(next) => {
             *resolved = next;
@@ -431,7 +431,7 @@ fn clear_agent_system_on_region_move(
         return true;
     }
     options.agent_system = None;
-    app.form.agent_system = String::new();
+    app.form.set_value(Field::AgentSystem, "");
     match options.resolve(sdata) {
         Ok(next) => {
             *resolved = next;
@@ -468,7 +468,7 @@ fn agent_system_outside_region(
             .agent_system
             .as_ref()
             .and_then(|found| sdata.region_of_system(found.id)),
-        eve_lpstore::report::Field::AgentSystem,
+        Field::AgentSystem,
     )
 }
 
@@ -507,7 +507,7 @@ fn apply(app: &mut App, session: &mut Session) {
             .system
             .as_ref()
             .and_then(|system| session.sdata.region_of_system(system.system_id)),
-        eve_lpstore::report::Field::System,
+        Field::System,
     ) {
         app.form.set_errors(vec![error]);
         return;
@@ -626,22 +626,18 @@ fn is_repeat(has_run: bool, options: &LpStoreOptions, applied: &LpStoreOptions) 
     has_run && same_run(options, applied)
 }
 
-/// The filters the run was started with, written the way they are on the command line.
+/// The filters the run was started with, written the way they are on the command line, in the
+/// form's order. The market region has its own place in the header, and depth and the cache
+/// minutes change no corporation or price, so those three are left out.
 fn filter_summary(options: &LpStoreOptions) -> String {
-    let filters = [
-        ("--lpstore", &options.lpstore),
-        ("--security", &options.security),
-        ("--agent-region", &options.agent_region),
-        ("--agent-system", &options.agent_system),
-        ("--agent-level", &options.agent_level),
-        ("--agent-division", &options.agent_division),
-        ("--agent-type", &options.agent_type),
-        ("--faction", &options.faction),
-        ("--system", &options.system),
-    ];
-    let set: Vec<String> = filters
-        .iter()
-        .filter_map(|(flag, value)| value.as_ref().map(|value| format!("{} {}", flag, value)))
+    let set: Vec<String> = Field::ALL
+        .into_iter()
+        .filter(|field| field.in_form())
+        .filter(|field| !matches!(field, Field::Region | Field::Depth | Field::CacheMinutes))
+        .filter_map(|field| {
+            let value = options.value(field).as_ref()?;
+            Some(format!("{} {}", field.flag(), value))
+        })
         .collect();
     if set.is_empty() {
         "none".to_string()
@@ -787,10 +783,10 @@ mod tests {
             10000002,
             "The Forge (10000002)",
             Some(10000014),
-            eve_lpstore::report::Field::AgentSystem,
+            Field::AgentSystem,
         )
         .expect("a mismatch is reported");
-        assert_eq!(error.field, eve_lpstore::report::Field::AgentSystem);
+        assert_eq!(error.field, Field::AgentSystem);
         assert!(
             error.message.contains("'4-3L53' is not in The Forge"),
             "{}",
@@ -802,7 +798,7 @@ mod tests {
                 10000014,
                 "Black Rise (10000014)",
                 Some(10000014),
-                eve_lpstore::report::Field::AgentSystem
+                Field::AgentSystem
             )
             .is_none(),
             "a pair that agrees is not a mistake"
@@ -930,8 +926,8 @@ mod tests {
         let saved_filters::Loaded::Filters(filters) = &loaded else {
             panic!("expected the run to be remembered");
         };
-        assert_eq!(filters.faction.as_deref(), Some("caldari"));
-        assert_eq!(filters.region.as_deref(), Some("Domain"));
+        assert_eq!(filters.value(Field::Faction).as_deref(), Some("caldari"));
+        assert_eq!(filters.value(Field::Region).as_deref(), Some("Domain"));
         assert!(app.log.back().is_none(), "a save that worked says nothing");
         std::fs::remove_file(&file).unwrap();
     }
@@ -984,16 +980,20 @@ mod tests {
             region: Some("Sinq Laison".to_string()),
             ..Default::default()
         };
-        let remembered = saved_filters::SavedFilters {
+        let remembered = saved_filters::SavedFilters::from(&LpStoreOptions {
             lpstore: Some("Caldari Navy".to_string()),
             depth: Some("20".to_string()),
             ..Default::default()
-        };
+        });
         let mut app = App::new(remembered.overlay(&cli));
         let form = startup_form(&app, &StaticData::default());
-        assert_eq!(form.region, "Sinq Laison", "the flag wins");
-        assert_eq!(form.corporations, "Caldari Navy", "the file fills the rest");
-        assert_eq!(form.depth, "20");
+        assert_eq!(form.value(Field::Region), "Sinq Laison", "the flag wins");
+        assert_eq!(
+            form.value(Field::Lpstore),
+            "Caldari Navy",
+            "the file fills the rest"
+        );
+        assert_eq!(form.value(Field::Depth), "20");
         assert_eq!(
             app.filters, "--lpstore Caldari Navy",
             "the remembered filter shows in the header"
@@ -1057,10 +1057,10 @@ mod tests {
             10000043,
             "Domain (10000043)",
             Some(10000002),
-            eve_lpstore::report::Field::System,
+            Field::System,
         )
         .expect("a mismatch is reported");
-        assert_eq!(error.field, eve_lpstore::report::Field::System);
+        assert_eq!(error.field, Field::System);
         assert!(
             error.message.contains("'Jita' is not in Domain"),
             "{}",
@@ -1086,21 +1086,12 @@ mod tests {
                 10000002,
                 "The Forge",
                 Some(10000002),
-                eve_lpstore::report::Field::System,
+                Field::System,
             )
             .is_none(),
             "the same region is not a mismatch"
         );
-        assert!(
-            system_outside_region(
-                None,
-                10000002,
-                "The Forge",
-                None,
-                eve_lpstore::report::Field::System
-            )
-            .is_none()
-        );
+        assert!(system_outside_region(None, 10000002, "The Forge", None, Field::System).is_none());
     }
 
     #[test]
@@ -1118,7 +1109,7 @@ mod tests {
                 10000043,
                 "Domain",
                 None,
-                eve_lpstore::report::Field::System
+                Field::System
             )
             .is_none()
         );
@@ -1133,7 +1124,7 @@ mod tests {
             ..Default::default()
         });
         app.region_id = 10000002; // The Forge, where Jita is
-        app.form.system = "Jita".to_string();
+        app.form.set_value(Field::System, "Jita");
         let mut options = app.form.to_options(&app.applied);
         // The stations of a system are what `resolve` finds there, so the fixture carries them the
         // way a real resolved run does.
@@ -1154,7 +1145,11 @@ mod tests {
 
         assert!(keep_going, "clearing a filter cannot fail to resolve");
         assert_eq!(options.system, None, "the run drops the old system");
-        assert_eq!(app.form.system, "", "the form shows it dropped");
+        assert_eq!(
+            app.form.value(Field::System),
+            "",
+            "the form shows it dropped"
+        );
         assert!(
             resolved.system.is_none(),
             "the rebuilt run has no station filter"
@@ -1173,7 +1168,7 @@ mod tests {
     fn a_system_survives_when_the_region_did_not_move() {
         let mut app = App::new(LpStoreOptions::default());
         app.region_id = 10000002;
-        app.form.system = "Jita".to_string();
+        app.form.set_value(Field::System, "Jita");
         let mut options = app.form.to_options(&app.applied);
         let mut resolved = Resolved {
             system: Some(eve_lpstore::report::SystemSummary {
@@ -1197,7 +1192,7 @@ mod tests {
             before.system.as_ref().map(|s| s.value.clone())
         );
         assert_eq!(options.system.as_deref(), Some("Jita"));
-        assert_eq!(app.form.system, "Jita");
+        assert_eq!(app.form.value(Field::System), "Jita");
         assert!(
             app.log.is_empty(),
             "nothing was cleared, so nothing is logged"
@@ -1207,7 +1202,7 @@ mod tests {
     #[test]
     fn the_first_enter_never_clears_because_there_is_no_previous_region() {
         let mut app = App::new(LpStoreOptions::default());
-        app.form.system = "Jita".to_string();
+        app.form.set_value(Field::System, "Jita");
         let mut options = app.form.to_options(&app.applied);
         let mut resolved = Resolved {
             region_id: 10000043,
@@ -1293,11 +1288,12 @@ mod tests {
         };
         let app = App::new(options);
         let form = startup_form(&app, &StaticData::default());
-        assert_eq!(form.faction, "caldari");
-        assert_eq!(form.region, "10000002");
-        assert_eq!(form.depth, "10");
+        assert_eq!(form.value(Field::Faction), "caldari");
+        assert_eq!(form.value(Field::Region), "10000002");
+        assert_eq!(form.value(Field::Depth), "10");
         assert_eq!(
-            form.corporations, "",
+            form.value(Field::Lpstore),
+            "",
             "no filter is invented for the blank fields"
         );
     }

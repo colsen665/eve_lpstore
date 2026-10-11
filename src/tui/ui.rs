@@ -7,7 +7,7 @@ use super::qr;
 use crate::output;
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number, format_optional};
-use eve_lpstore::report::Group;
+use eve_lpstore::report::{Field, Group};
 use eve_lpstore::{OfferResult, StaticData};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -716,7 +716,7 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = usize::from(inner.width);
-    let mut lines: Vec<Line> = FormField::ALL
+    let mut lines: Vec<Line> = FormField::all()
         .iter()
         .map(|&field| form_row(app, field, sdata, width))
         .collect();
@@ -780,7 +780,7 @@ fn form_row(app: &App, field: FormField, sdata: &StaticData, width: usize) -> Li
         Style::new()
     };
     let value = if field == FormField::Expire {
-        if app.form.expire {
+        if app.form.expire() {
             "[x] yes".to_string()
         } else {
             "[ ] no".to_string()
@@ -822,13 +822,15 @@ fn hint_line(field: FormField, sdata: &StaticData) -> String {
 
 fn hint(field: FormField, sdata: &StaticData) -> String {
     match field {
-        FormField::Corporations => "IDs or names, comma-separated. Blank for all.".to_string(),
+        FormField::Text(Field::Lpstore) => {
+            "IDs or names, comma-separated. Blank for all.".to_string()
+        }
         // Two lines: what the field picks, then how to write it. Kept to what fits the hint column at
         // the minimum terminal width, so the second line is not wrapped away.
-        FormField::Region => {
+        FormField::Text(Field::Region) => {
             "Prices come from its market orders.\nID or name. Blank for The Forge.".to_string()
         }
-        FormField::Security => {
+        FormField::Text(Field::Security) => {
             // Two lines like the market fields: the first has to fit the row's detail column at the
             // minimum terminal width.
             "0.5 exact, 0.5..0.7 for a range.\n0.5.. is at least, ..0.5 is at most. Blank for any."
@@ -836,35 +838,37 @@ fn hint(field: FormField, sdata: &StaticData) -> String {
         }
         // Two lines like the market fields: what the filter keeps, then how to write it. The names
         // of the two pairs are close enough to mix up, so each line says which side of it this is.
-        FormField::AgentRegion => {
+        FormField::Text(Field::AgentRegion) => {
             "Keeps agents standing in it.\nID or name. Blank for any region.".to_string()
         }
-        FormField::AgentSystem => {
+        FormField::Text(Field::AgentSystem) => {
             "Keeps agents in this system.\nID or name. Blank for any system.".to_string()
         }
-        FormField::AgentLevel => "1 to 5. Blank for any.".to_string(),
-        FormField::Division => format!(
+        FormField::Text(Field::AgentLevel) => "1 to 5. Blank for any.".to_string(),
+        FormField::Text(Field::AgentDivision) => format!(
             "One of: {}. Blank for any.",
             sdata.division_names().join(", ")
         ),
-        FormField::Type => format!(
+        FormField::Text(Field::AgentType) => format!(
             "One of: {}. Blank for any.",
             sdata.agent_type_names().join(", ")
         ),
-        FormField::Faction => format!(
+        FormField::Text(Field::Faction) => format!(
             "One of: {}. Blank for any.",
             sdata.faction_names().join(", ")
         ),
-        FormField::System => {
+        FormField::Text(Field::System) => {
             "Prices use its NPC stations.\nName or ID. Blank for all systems.".to_string()
         }
-        FormField::Depth => "Offers per group, 1 or more. Blank for 10.".to_string(),
-        FormField::CacheMinutes => {
+        FormField::Text(Field::Depth) => "Offers per group, 1 or more. Blank for 10.".to_string(),
+        FormField::Text(Field::CacheMinutes) => {
             "Minutes past ESI Expires.\nBlank: filtered corp count; 0 disables.".to_string()
         }
         FormField::Expire => {
             "Space toggles. Ignore cached responses and call the API again.".to_string()
         }
+        // Set on the command line only, so the form never shows them.
+        FormField::Text(Field::Concurrency | Field::MaxInflight | Field::CacheDir) => String::new(),
     }
 }
 
@@ -873,23 +877,18 @@ fn hint(field: FormField, sdata: &StaticData) -> String {
 fn suggestions(app: &App, sdata: &StaticData) -> Option<String> {
     let query = app.form.name_query()?.to_lowercase();
     let mut names: Vec<String> = match app.form.focus {
-        FormField::Corporations => sdata
+        FormField::Text(Field::Lpstore) => sdata
             .corporation_ids()
             .map(|id| corp_name(sdata, id))
             .filter(|name| name.to_lowercase().contains(&query))
             .collect(),
-        FormField::Region => sdata
+        FormField::Text(Field::Region | Field::AgentRegion) => sdata
             .region_names()
             .filter(|name| name.to_lowercase().contains(&query))
             .cloned()
             .collect(),
-        FormField::System | FormField::AgentSystem => sdata
+        FormField::Text(Field::System | Field::AgentSystem) => sdata
             .system_names()
-            .filter(|name| name.to_lowercase().contains(&query))
-            .cloned()
-            .collect(),
-        FormField::AgentRegion => sdata
-            .region_names()
             .filter(|name| name.to_lowercase().contains(&query))
             .cloned()
             .collect(),
@@ -2062,8 +2061,14 @@ mod tests {
         // Before this split the two lines collided into one mangled row reading
         // "Prices use its NPC stations.Name or ID…".
         for (focus, purpose) in [
-            (FormField::Region, "Prices come from its market orders."),
-            (FormField::System, "Prices use its NPC stations."),
+            (
+                FormField::Text(Field::Region),
+                "Prices come from its market orders.",
+            ),
+            (
+                FormField::Text(Field::System),
+                "Prices use its NPC stations.",
+            ),
         ] {
             let mut app = App::new(LpStoreOptions::default());
             let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
@@ -2082,7 +2087,7 @@ mod tests {
     fn the_focused_market_field_shows_both_hint_lines_when_there_is_room() {
         let mut app = App::new(LpStoreOptions::default());
         let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
-        form.focus = FormField::System;
+        form.focus = FormField::Text(Field::System);
         app.show_filters(form);
         let text = view_text(&app, 120, 40);
         assert!(
@@ -2096,8 +2101,14 @@ mod tests {
         // The market fields ask for two lines, and the place fields do the same. This is what the
         // raised minimum height pays for: at the old size the second line had nowhere to go.
         for (focus, syntax) in [
-            (FormField::AgentRegion, "ID or name. Blank for any region."),
-            (FormField::AgentSystem, "ID or name. Blank for any system."),
+            (
+                FormField::Text(Field::AgentRegion),
+                "ID or name. Blank for any region.",
+            ),
+            (
+                FormField::Text(Field::AgentSystem),
+                "ID or name. Blank for any system.",
+            ),
         ] {
             let mut app = App::new(LpStoreOptions::default());
             let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
@@ -2115,7 +2126,7 @@ mod tests {
     fn the_cache_minutes_field_explains_the_blank_default_and_zero() {
         let mut app = App::new(LpStoreOptions::default());
         let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
-        form.focus = FormField::CacheMinutes;
+        form.focus = FormField::Text(Field::CacheMinutes);
         app.show_filters(form);
         let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
         assert!(text.contains("Minutes past ESI Expires."), "{text}");
@@ -2432,7 +2443,10 @@ mod tests {
         let mut app = App::new(LpStoreOptions::default());
         let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
         app.show_filters(form);
-        for focus in [FormField::AgentRegion, FormField::AgentSystem] {
+        for focus in [
+            FormField::Text(Field::AgentRegion),
+            FormField::Text(Field::AgentSystem),
+        ] {
             app.form.focus = focus;
             let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
             let hint = hint_line(focus, &StaticData::default());
@@ -2450,7 +2464,7 @@ mod tests {
         let mut app = App::new(LpStoreOptions::default());
         let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
         app.show_filters(form);
-        app.form.focus = FormField::AgentRegion;
+        app.form.focus = FormField::Text(Field::AgentRegion);
         app.form.set_errors(vec![OptionError {
             field: Field::AgentRegion,
             message: "Region 'Black Riss' not found".to_string(),
@@ -2466,15 +2480,14 @@ mod tests {
     fn the_place_fields_offer_name_matches_like_the_market_ones() {
         // The suggestions come from the static data, so an empty cache says so rather than nothing.
         for (field, typed) in [
-            (FormField::AgentRegion, "bla"),
-            (FormField::AgentSystem, "jit"),
+            (FormField::Text(Field::AgentRegion), "bla"),
+            (FormField::Text(Field::AgentSystem), "jit"),
         ] {
             let mut app = App::new(LpStoreOptions::default());
             let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
             form.focus = field;
-            match field {
-                FormField::AgentRegion => form.agent_region = typed.to_string(),
-                _ => form.agent_system = typed.to_string(),
+            if let FormField::Text(field) = field {
+                form.set_value(field, typed);
             }
             app.show_filters(form);
             let shown = suggestions(&app, &StaticData::default()).expect("a name field suggests");
@@ -2749,28 +2762,28 @@ mod tests {
     #[test]
     fn the_inline_hint_is_one_line_even_when_the_note_is_two() {
         assert_eq!(
-            hint_line(FormField::Region, &StaticData::default()),
+            hint_line(FormField::Text(Field::Region), &StaticData::default()),
             "Prices come from its market orders."
         );
         assert_eq!(
-            hint_line(FormField::System, &StaticData::default()),
+            hint_line(FormField::Text(Field::System), &StaticData::default()),
             "Prices use its NPC stations."
         );
         // The fields these changes worded have to fit the detail column at the minimum terminal
         // width, so their extra wording goes on the second line. Other hints are longer and already
         // truncate there, which is existing behaviour this test does not cover.
         assert_eq!(
-            hint_line(FormField::Security, &StaticData::default()),
+            hint_line(FormField::Text(Field::Security), &StaticData::default()),
             "0.5 exact, 0.5..0.7 for a range."
         );
         let detail = usize::from(MIN_WIDTH - 2) - (LABEL_WIDTH + VALUE_WIDTH + 2);
         for field in [
-            FormField::Region,
-            FormField::System,
-            FormField::Security,
-            FormField::AgentRegion,
-            FormField::AgentSystem,
-            FormField::CacheMinutes,
+            FormField::Text(Field::Region),
+            FormField::Text(Field::System),
+            FormField::Text(Field::Security),
+            FormField::Text(Field::AgentRegion),
+            FormField::Text(Field::AgentSystem),
+            FormField::Text(Field::CacheMinutes),
         ] {
             let line = hint_line(field, &StaticData::default());
             assert!(
@@ -2782,7 +2795,7 @@ mod tests {
             );
         }
         // No inline hint may carry a break, whatever its length.
-        for field in FormField::ALL {
+        for field in FormField::all() {
             assert!(
                 !hint_line(field, &StaticData::default()).contains('\n'),
                 "{field:?} kept the break in the row"
