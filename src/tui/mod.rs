@@ -4,6 +4,8 @@
 mod app;
 mod form;
 mod qr;
+#[cfg(test)]
+mod test_support;
 mod ui;
 
 use crate::output;
@@ -13,7 +15,7 @@ use eve_lpstore::StaticData;
 use eve_lpstore::esi::EsiClient;
 use eve_lpstore::export;
 use eve_lpstore::paths::Paths;
-use eve_lpstore::report::{self, Field, LpStoreOptions, Report, Resolved, RunEvent};
+use eve_lpstore::report::{self, Field, LpStoreOptions, OptionError, Report, Resolved, RunEvent};
 use eve_lpstore::saved_filters;
 use ratatui::DefaultTerminal;
 use std::io;
@@ -129,26 +131,26 @@ fn startup_form(app: &App, sdata: &StaticData) -> form::FilterForm {
 
 /// What the view does about the static data before it draws anything.
 enum Opening {
-    /// The data is on disk and read, so the filters can be asked for.
-    Filters(StaticData),
+    /// The data is on disk and read, so the filters can be asked for. Boxed because the data is
+    /// far larger than the other case, and this is built once.
+    Filters(Box<StaticData>),
     /// The data is not usable, so the user is asked whether to fetch it. `reason` says why when
     /// there is something specific to say, and is `None` when the files are simply not there.
     Ask { reason: Option<String> },
 }
 
-/// Decides how the view starts, from whether the files are on disk and what loading them returned.
-/// A missing cache is a question and never a silent download: `load` fetches the whole static data
-/// archive, which takes long enough that it has to be asked for rather than discovered.
-fn opening(cached: bool, loaded: Option<Result<StaticData, String>>) -> Opening {
-    match (cached, loaded) {
-        (false, _) => Opening::Ask { reason: None },
-        (_, Some(Ok(data))) => Opening::Filters(data),
+/// Decides how the view starts, from what loading the files returned, or `None` when they are not
+/// on disk and loading was not tried. A missing cache is a question and never a silent download:
+/// `load` fetches the whole static data archive, which takes long enough that it has to be asked
+/// for rather than discovered.
+fn opening(loaded: Option<Result<StaticData, String>>) -> Opening {
+    match loaded {
+        None => Opening::Ask { reason: None },
+        Some(Ok(data)) => Opening::Filters(Box::new(data)),
         // The files are there and cannot be read, so a download is the only way past it.
-        (_, Some(Err(reason))) => Opening::Ask {
+        Some(Err(reason)) => Opening::Ask {
             reason: Some(reason),
         },
-        // Unreachable, since `loaded` is only `None` when the cache is missing.
-        (true, None) => Opening::Ask { reason: None },
     }
 }
 
@@ -181,8 +183,7 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
     log_roots(&mut app, &paths);
 
     // Loading is only attempted when the files are there, so the question comes before the wait.
-    let cached = StaticData::is_cached(&paths.data);
-    let loaded = if cached {
+    let loaded = if StaticData::is_cached(&paths.data) {
         let data = StaticData::load(false, &paths.data)
             .await
             .map_err(|error| error.to_string());
@@ -190,8 +191,8 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
     } else {
         None
     };
-    let (sdata, ask) = match opening(cached, loaded) {
-        Opening::Filters(data) => (Arc::new(data), None),
+    let (sdata, ask) = match opening(loaded) {
+        Opening::Filters(data) => (Arc::new(*data), None),
         Opening::Ask { reason } => (Arc::new(StaticData::default()), Some(reason)),
     };
     match ask {
@@ -328,39 +329,110 @@ fn log_roots(app: &mut App, paths: &Paths) {
     }
 }
 
-/// Whether applying `resolved` moves the pricing to a different region than the run in progress.
-///
-/// Compared on ids rather than the typed text, so `Domain` and `10000043` are the same region and
-/// the system field survives. There is no run to compare against before the first Enter.
-fn region_moved(has_run: bool, current: i32, resolved: &Resolved) -> bool {
-    has_run && current != resolved.region_id
+/// The two region and system pairs the form holds: where prices come from, and where agents
+/// stand. Applying checks both the same way, so each step below is written once and asked of
+/// either pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pair {
+    Market,
+    Agent,
 }
 
-/// Clears `Market system` when the region moved out from under it, and returns `false` if the form
-/// has to show errors instead of running.
+impl Pair {
+    fn system_field(self) -> Field {
+        match self {
+            Pair::Market => Field::System,
+            Pair::Agent => Field::AgentSystem,
+        }
+    }
+
+    /// The region this pair named in the run in progress. The market pair always names one; the
+    /// agent pair only when the run filtered agents by a region.
+    fn previous_region(self, run: &RunInfo) -> Option<i32> {
+        match self {
+            Pair::Market => Some(run.region_id),
+            Pair::Agent => run.agent_region_id,
+        }
+    }
+
+    fn region(self, resolved: &Resolved) -> Option<i32> {
+        match self {
+            Pair::Market => Some(resolved.region_id),
+            Pair::Agent => resolved.agent_region.as_ref().map(|found| found.id),
+        }
+    }
+
+    fn region_label(self, resolved: &Resolved) -> Option<&str> {
+        match self {
+            Pair::Market => Some(&resolved.region_label),
+            Pair::Agent => resolved
+                .agent_region
+                .as_ref()
+                .map(|found| found.label.as_str()),
+        }
+    }
+
+    /// The system as typed, and the id it resolved to.
+    fn system(self, resolved: &Resolved) -> Option<(&str, i32)> {
+        match self {
+            Pair::Market => resolved
+                .system
+                .as_ref()
+                .map(|system| (system.value.as_str(), system.system_id)),
+            Pair::Agent => resolved
+                .agent_system
+                .as_ref()
+                .map(|system| (system.value.as_str(), system.id)),
+        }
+    }
+
+    fn cleared_message(self) -> &'static str {
+        match self {
+            Pair::Market => "Cleared the market system, which belonged to the previous region",
+            Pair::Agent => "Cleared the agent system, which belonged to the previous agent region",
+        }
+    }
+}
+
+/// Whether applying `resolved` moves `pair`'s region away from the one the run in progress used,
+/// as (from, to).
 ///
-/// A system prices from the NPC stations in it, so one left over from the previous region matches
-/// no orders there and every lookup fails. The second resolve is what makes the cleared field real:
-/// the station list comes from that result, so keeping the first would run against the old system's
-/// stations while the form showed an empty box.
+/// Compared on ids rather than the typed text, so `Domain` and `10000043` are the same region and
+/// the system field survives. There is no run to compare against before the first Enter. Both
+/// sides have to name a region: blanking the agent region lifts that filter rather than moving it,
+/// and a system left over under no region filter is not a mistake.
+fn region_moved(pair: Pair, run: Option<&RunInfo>, resolved: &Resolved) -> Option<(i32, i32)> {
+    let previous = pair.previous_region(run?)?;
+    let now = pair.region(resolved)?;
+    (previous != now).then_some((previous, now))
+}
+
+/// Clears `pair`'s system when its region moved out from under it, and returns `false` if the
+/// form has to show errors instead of running.
+///
+/// A market system prices from the NPC stations in it, so one left over from the previous region
+/// matches no orders there and every lookup fails. An agent system from the previous agent region
+/// can still be a real system, but the pair then keeps nothing. Either way the field the user did
+/// not touch is the one that has to go. The second resolve is what makes the cleared field real:
+/// the station list comes from that result, so keeping the first would run against the old
+/// system's stations while the form showed an empty box.
 fn clear_system_on_region_move(
+    pair: Pair,
     app: &mut App,
     options: &mut LpStoreOptions,
     resolved: &mut Resolved,
     sdata: &StaticData,
-    has_run: bool,
 ) -> bool {
-    if !region_moved(has_run, app.region_id, resolved) || resolved.system.is_none() {
+    if region_moved(pair, app.run.as_ref(), resolved).is_none() || pair.system(resolved).is_none() {
         return true;
     }
-    options.system = None;
-    app.form.set_value(Field::System, "");
+    *options.value_mut(pair.system_field()) = None;
+    app.form.set_value(pair.system_field(), "");
     match options.resolve(sdata) {
         Ok(next) => {
             *resolved = next;
             app.push_log(LogLine {
-                text: "Cleared the market system, which belonged to the previous region"
-                    .to_string(),
+                text: pair.cleared_message().to_string(),
                 is_error: false,
             });
             true
@@ -388,11 +460,11 @@ fn system_outside_region(
     region_id: i32,
     region_label: &str,
     region_of_system: Option<i32>,
-    field: eve_lpstore::report::Field,
-) -> Option<eve_lpstore::report::OptionError> {
+    field: Field,
+) -> Option<OptionError> {
     let system = system?;
     let actual = region_of_system?;
-    (actual != region_id).then(|| eve_lpstore::report::OptionError {
+    (actual != region_id).then(|| OptionError {
         field,
         message: format!(
             "'{}' is not in {}. Clear the system, or choose a system in it",
@@ -401,74 +473,16 @@ fn system_outside_region(
     })
 }
 
-/// Whether the run's agent region differs from the region the last run filtered agents by. Both
-/// sides have to name a region: blanking the field lifts the filter rather than moving it, and a
-/// system left over under no region filter is not a mistake.
-fn agent_region_moved(
-    has_run: bool,
-    current: Option<i32>,
-    resolved: &Resolved,
-) -> Option<(i32, i32)> {
-    let previous = current?;
-    let now = resolved.agent_region.as_ref()?.id;
-    (has_run && previous != now).then_some((previous, now))
-}
-
-/// Clears `Agent system` when the agent region moved out from under it, and returns `false` if the
-/// form has to show errors instead of running. The same reasoning as the market pair: an agent
-/// system from the previous region can still be a real system, but the pair then keeps nothing, and
-/// the field the user did not touch is the one that has to go.
-fn clear_agent_system_on_region_move(
-    app: &mut App,
-    options: &mut LpStoreOptions,
-    resolved: &mut Resolved,
-    sdata: &StaticData,
-    has_run: bool,
-) -> bool {
-    if agent_region_moved(has_run, app.agent_region_id, resolved).is_none()
-        || resolved.agent_system.is_none()
-    {
-        return true;
-    }
-    options.agent_system = None;
-    app.form.set_value(Field::AgentSystem, "");
-    match options.resolve(sdata) {
-        Ok(next) => {
-            *resolved = next;
-            app.push_log(LogLine {
-                text: "Cleared the agent system, which belonged to the previous agent region"
-                    .to_string(),
-                is_error: false,
-            });
-            true
-        }
-        Err(errors) => {
-            app.form.set_errors(errors);
-            false
-        }
-    }
-}
-
-/// The agent pair's own mismatch check. The error lands on the system field, as it does for the
-/// market pair, because the system is the value that cannot be reached from the region named.
-fn agent_system_outside_region(
-    resolved: &Resolved,
-    sdata: &StaticData,
-) -> Option<eve_lpstore::report::OptionError> {
-    let region = resolved.agent_region.as_ref()?;
-    let label = sdata.region_label(region.id);
+/// [`system_outside_region`] for one of the pairs of `resolved`. The error lands on the system
+/// field, because the system is the value that cannot be reached from the region named.
+fn pair_outside_region(pair: Pair, resolved: &Resolved, sdata: &StaticData) -> Option<OptionError> {
+    let (system, system_id) = pair.system(resolved)?;
     system_outside_region(
-        resolved
-            .agent_system
-            .as_ref()
-            .map(|found| found.value.as_str()),
-        region.id,
-        &label,
-        resolved
-            .agent_system
-            .as_ref()
-            .and_then(|found| sdata.region_of_system(found.id)),
-        Field::AgentSystem,
+        Some(system),
+        pair.region(resolved)?,
+        pair.region_label(resolved)?,
+        sdata.region_of_system(system_id),
+        pair.system_field(),
     )
 }
 
@@ -484,53 +498,23 @@ fn apply(app: &mut App, session: &mut Session) {
             return;
         }
     };
-    // A system from the previous region prices against stations that region has no orders for, so
-    // the region moving clears the field.
-    let keep_going = clear_system_on_region_move(
-        app,
-        &mut options,
-        &mut resolved,
-        &session.sdata,
-        session.current.is_some(),
-    );
-    if !keep_going {
-        return;
+    // Each pair's leftover system is cleared before the pair is checked, so a system the region
+    // move already removed is not also reported: the user sees one change, not a complaint about
+    // a value they no longer have.
+    for pair in [Pair::Market, Pair::Agent] {
+        if !clear_system_on_region_move(pair, app, &mut options, &mut resolved, &session.sdata) {
+            return;
+        }
+        if let Some(error) = pair_outside_region(pair, &resolved, &session.sdata) {
+            app.form.set_errors(vec![error]);
+            return;
+        }
     }
-    // Checked after the clearing above, so a system that the region move already removed is not
-    // also reported as an error: the user sees one change, not a complaint about a value they no
-    // longer have.
-    if let Some(error) = system_outside_region(
-        resolved.system.as_ref().map(|system| system.value.as_str()),
-        resolved.region_id,
-        &resolved.region_label,
-        resolved
-            .system
-            .as_ref()
-            .and_then(|system| session.sdata.region_of_system(system.system_id)),
-        Field::System,
-    ) {
-        app.form.set_errors(vec![error]);
-        return;
-    }
-    // The agent pair is checked the same way, after its own clearing step, so a system the region
-    // move already removed is not also reported.
-    if !clear_agent_system_on_region_move(
-        app,
-        &mut options,
-        &mut resolved,
-        &session.sdata,
-        session.current.is_some(),
-    ) {
-        return;
-    }
-    if let Some(error) = agent_system_outside_region(&resolved, &session.sdata) {
-        app.form.set_errors(vec![error]);
-        return;
-    }
-    if is_repeat(session.current.is_some(), &options, &app.applied) {
+    if is_repeat(app.run.is_some(), &options, &app.applied) {
         app.apply_depth(resolved.depth);
     } else {
-        let info = run_info(&resolved, filter_summary(&options));
+        let info = run_info(&resolved);
+        let depth = resolved.depth;
         let id = session.next_id;
         session.next_id += 1;
         let next = spawn_run(
@@ -543,9 +527,9 @@ fn apply(app: &mut App, session: &mut Session) {
         if let Some(previous) = session.current.replace(next) {
             previous.pipeline.abort();
         }
-        app.start_run(info);
+        app.start_run(info, filter_summary(&options), depth);
     }
-    app.set_applied(options);
+    app.applied = options;
     app.close_form();
     remember(app, &saved_filters::path(&session.paths.config));
 }
@@ -576,7 +560,7 @@ fn write_export(app: &mut App, sdata: &StaticData) {
         return;
     };
     let context = export::ExportContext {
-        region: &app.region,
+        region: app.region(),
         filters: &app.filters,
         depth: app.depth,
     };
@@ -597,14 +581,12 @@ fn write_export(app: &mut App, sdata: &StaticData) {
     }
 }
 
-fn run_info(resolved: &Resolved, filters: String) -> RunInfo {
+fn run_info(resolved: &Resolved) -> RunInfo {
     RunInfo {
         region: resolved.region_label.clone(),
         region_id: resolved.region_id,
         agent_region_id: resolved.agent_region.as_ref().map(|found| found.id),
         corporations: resolved.corp_ids.len(),
-        filters,
-        depth: resolved.depth,
         agent_filter: resolved.agent_filter,
     }
 }
@@ -650,59 +632,18 @@ fn filter_summary(options: &LpStoreOptions) -> String {
 mod tests {
     use super::*;
     use crate::tui::app::{Overlay, Stage};
-    use eve_lpstore::esi::loyalty::LoyaltyOffer;
-    use eve_lpstore::report::Group;
+    use crate::tui::test_support::{
+        forge_run, open_prompt, open_prompt_mut, priced_offer, results_app,
+    };
     use eve_lpstore::static_data::AgentFilter;
-    use eve_lpstore::{ExpenseBreakdown, OfferResult};
     use std::path::PathBuf;
 
     /// An app on the results view with the export prompt open and `path` typed into it.
     fn prompt(path: &str) -> App {
-        let info = RunInfo {
-            region: "The Forge".to_string(),
-            region_id: 10000002,
-            agent_region_id: None,
-            corporations: 1,
-            filters: "none".to_string(),
-            depth: 10,
-            agent_filter: AgentFilter::default(),
-        };
-        let mut app = App::new(LpStoreOptions::default());
-        app.begin_run(info);
-        app.finish(Report {
-            groups: vec![Group {
-                corp_ids: vec![1000002],
-                offer_count: 1,
-                results: vec![OfferResult {
-                    offer: LoyaltyOffer {
-                        offer_id: 1,
-                        type_id: 30486,
-                        quantity: 10,
-                        lp_cost: 1800,
-                        isk_cost: 1_200_000.0,
-                        required_items: Vec::new(),
-                    },
-                    breakdown: ExpenseBreakdown {
-                        offer_id: 1,
-                        lp_cost: 1800,
-                        isk_cost: 1_200_000.0,
-                        item_expenses: Vec::new(),
-                        total_isk: 1_649_000.0,
-                    },
-                    reward: Some(457_900.0),
-                    unit_cost: Some(164_900.0),
-                    isk_per_lp: Some(1627.78),
-                    best_ask: Some(515_000.0),
-                    spread: Some(12.5),
-                    book_depth: Some((2_474_600, 800_000)),
-                    imbalance: Some(51.2),
-                    within_10: Some((2_474_600, 3_980_000_000.0)),
-                }],
-                errors: Vec::new(),
-            }],
-        });
+        let offer = priced_offer(Some(12.5), Some(51.2), Some((2_474_600, 3_980_000_000.0)));
+        let mut app = results_app(vec![offer], 10);
         app.open_export();
-        app.export_path = path.to_string();
+        open_prompt_mut(&mut app).path = path.to_string();
         app
     }
 
@@ -720,7 +661,7 @@ mod tests {
         let path = format!("{}.csv", temp_path("csv"));
         let mut app = prompt(&path);
         write_export(&mut app, &StaticData::default());
-        let written = std::fs::read_to_string(&app.export_path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.starts_with("group,average_isk_per_lp,"));
         assert!(written.contains("30486"), "the offer row is there");
         assert!(written.contains("1627.78"));
@@ -728,7 +669,7 @@ mod tests {
         let line = app.log.back().expect("the write is reported");
         assert!(!line.is_error);
         assert!(line.text.contains("Wrote 1 offers"), "{}", line.text);
-        std::fs::remove_file(&app.export_path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -749,12 +690,14 @@ mod tests {
         // A directory that does not exist, so the write cannot succeed.
         let mut app = prompt("/no/such/directory/eve_lpstore_out.csv");
         write_export(&mut app, &StaticData::default());
-        assert_eq!(
-            app.overlay,
-            Overlay::Export,
+        assert!(
+            matches!(app.overlay, Overlay::Export(_)),
             "the name stays editable so it can be retried"
         );
-        let error = app.export_error.expect("the reason shows beside the name");
+        let error = open_prompt(&app)
+            .error
+            .clone()
+            .expect("the reason shows beside the name");
         assert!(error.contains("Could not write"), "{}", error);
         assert!(error.contains("no/such/directory"), "{}", error);
     }
@@ -817,31 +760,36 @@ mod tests {
             id: 10000043,
             label: "Domain (10000043)".to_string(),
         };
+        let unfiltered = forge_run(1);
+        let in_the_forge = RunInfo {
+            agent_region_id: Some(10000002),
+            ..forge_run(1)
+        };
         let mut moved = resolved_fixture();
         assert_eq!(
-            agent_region_moved(true, None, &moved),
+            region_moved(Pair::Agent, Some(&unfiltered), &moved),
             None,
             "no previous region"
         );
         moved.agent_region = Some(in_forge.clone());
         assert_eq!(
-            agent_region_moved(true, None, &moved),
+            region_moved(Pair::Agent, Some(&unfiltered), &moved),
             None,
             "blanking the field lifts the filter rather than moving it"
         );
         assert_eq!(
-            agent_region_moved(true, Some(10000002), &moved),
+            region_moved(Pair::Agent, Some(&in_the_forge), &moved),
             None,
             "the same region typed differently has not moved"
         );
         moved.agent_region = Some(in_domain.clone());
         assert_eq!(
-            agent_region_moved(true, Some(10000002), &moved),
+            region_moved(Pair::Agent, Some(&in_the_forge), &moved),
             Some((10000002, 10000043)),
             "and a different one has"
         );
         assert_eq!(
-            agent_region_moved(false, Some(10000002), &moved),
+            region_moved(Pair::Agent, None, &moved),
             None,
             "before the first run there is nothing to have moved"
         );
@@ -891,16 +839,13 @@ mod tests {
     fn a_missing_cache_asks_instead_of_downloading_silently() {
         // The regression this guards: the uncached branch used to report no reason, which read back
         // as success, so the view opened on the filters and never asked.
-        assert!(matches!(
-            opening(false, None),
-            Opening::Ask { reason: None }
-        ));
+        assert!(matches!(opening(None), Opening::Ask { reason: None }));
     }
 
     #[test]
     fn readable_static_data_goes_straight_to_the_filters() {
         assert!(matches!(
-            opening(true, Some(Ok(StaticData::default()))),
+            opening(Some(Ok(StaticData::default()))),
             Opening::Filters(_)
         ));
     }
@@ -908,7 +853,7 @@ mod tests {
     #[test]
     fn unreadable_static_data_asks_with_the_reason() {
         let reason = Some(Err("data/regions.json is not valid JSON".to_string()));
-        let ask = opening(true, reason);
+        let ask = opening(reason);
         assert!(matches!(ask, Opening::Ask { reason: Some(_) }));
     }
 
@@ -952,15 +897,7 @@ mod tests {
     fn a_failed_remember_is_only_a_log_line() {
         // The run is already going, so a file that cannot be written must not stop the view.
         let mut app = App::new(LpStoreOptions::default());
-        app.start_run(RunInfo {
-            region: "The Forge".to_string(),
-            region_id: 10000002,
-            agent_region_id: None,
-            corporations: 1,
-            filters: "none".to_string(),
-            depth: 10,
-            agent_filter: AgentFilter::default(),
-        });
+        app.start_run(forge_run(1), "none".to_string(), 10);
         remember(&mut app, Path::new("/no/such/directory/filters.json"));
         assert_eq!(app.stage, Stage::Starting, "the run is untouched");
         let line = app.log.back().expect("the failure is reported");
@@ -1123,7 +1060,7 @@ mod tests {
             system: Some("Jita".to_string()),
             ..Default::default()
         });
-        app.region_id = 10000002; // The Forge, where Jita is
+        app.run = Some(forge_run(1)); // The Forge, where Jita is
         app.form.set_value(Field::System, "Jita");
         let mut options = app.form.to_options(&app.applied);
         // The stations of a system are what `resolve` finds there, so the fixture carries them the
@@ -1140,8 +1077,13 @@ mod tests {
             ..resolved_fixture()
         };
 
-        let keep_going =
-            clear_system_on_region_move(&mut app, &mut options, &mut resolved, &sdata(), true);
+        let keep_going = clear_system_on_region_move(
+            Pair::Market,
+            &mut app,
+            &mut options,
+            &mut resolved,
+            &sdata(),
+        );
 
         assert!(keep_going, "clearing a filter cannot fail to resolve");
         assert_eq!(options.system, None, "the run drops the old system");
@@ -1167,7 +1109,7 @@ mod tests {
     #[test]
     fn a_system_survives_when_the_region_did_not_move() {
         let mut app = App::new(LpStoreOptions::default());
-        app.region_id = 10000002;
+        app.run = Some(forge_run(1));
         app.form.set_value(Field::System, "Jita");
         let mut options = app.form.to_options(&app.applied);
         let mut resolved = Resolved {
@@ -1181,11 +1123,11 @@ mod tests {
         let before = resolved.clone();
 
         assert!(clear_system_on_region_move(
+            Pair::Market,
             &mut app,
             &mut options,
             &mut resolved,
             &sdata(),
-            true
         ));
         assert_eq!(
             resolved.system.as_ref().map(|s| s.value.clone()),
@@ -1215,11 +1157,11 @@ mod tests {
         };
 
         assert!(clear_system_on_region_move(
+            Pair::Market,
             &mut app,
             &mut options,
             &mut resolved,
             &sdata(),
-            false
         ));
         assert_eq!(
             options.system.as_deref(),
@@ -1241,14 +1183,64 @@ mod tests {
             region_id,
             ..resolved_fixture()
         };
+        let in_domain = RunInfo {
+            region_id: 10000043,
+            ..forge_run(1)
+        };
         assert!(
-            !region_moved(false, 0, &resolved(10000043)),
+            region_moved(Pair::Market, None, &resolved(10000043)).is_none(),
             "the first Enter has no previous region"
         );
-        assert!(region_moved(true, 10000002, &resolved(10000043)));
+        assert_eq!(
+            region_moved(Pair::Market, Some(&forge_run(1)), &resolved(10000043)),
+            Some((10000002, 10000043))
+        );
         assert!(
-            !region_moved(true, 10000043, &resolved(10000043)),
+            region_moved(Pair::Market, Some(&in_domain), &resolved(10000043)).is_none(),
             "the same region typed differently has not moved"
+        );
+    }
+
+    #[test]
+    fn each_pair_reads_its_own_region_and_system() {
+        let resolved = Resolved {
+            system: Some(eve_lpstore::report::SystemSummary {
+                value: "Jita".to_string(),
+                system_id: 30000142,
+                stations: 1,
+            }),
+            agent_region: Some(eve_lpstore::report::NamedValue {
+                value: "Black Rise".to_string(),
+                id: 10000069,
+                label: "Black Rise (10000069)".to_string(),
+            }),
+            agent_system: Some(eve_lpstore::report::NamedValue {
+                value: "4-3L53".to_string(),
+                id: 30002812,
+                label: "4-3L53".to_string(),
+            }),
+            ..resolved_fixture()
+        };
+        assert_eq!(Pair::Market.region(&resolved), Some(10000002));
+        assert_eq!(Pair::Market.region_label(&resolved), Some("The Forge"));
+        assert_eq!(Pair::Market.system(&resolved), Some(("Jita", 30000142)));
+        assert_eq!(Pair::Market.system_field(), Field::System);
+        assert_eq!(Pair::Agent.region(&resolved), Some(10000069));
+        assert_eq!(
+            Pair::Agent.region_label(&resolved),
+            Some("Black Rise (10000069)")
+        );
+        assert_eq!(Pair::Agent.system(&resolved), Some(("4-3L53", 30002812)));
+        assert_eq!(Pair::Agent.system_field(), Field::AgentSystem);
+        let unfiltered = resolved_fixture();
+        assert_eq!(
+            Pair::Agent.region(&unfiltered),
+            None,
+            "no agent region filter"
+        );
+        assert!(
+            pair_outside_region(Pair::Agent, &unfiltered, &StaticData::default()).is_none(),
+            "nothing to check without a pair"
         );
     }
 

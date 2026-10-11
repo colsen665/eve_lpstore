@@ -56,18 +56,34 @@ impl Focus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What is drawn over the results, with the state that only exists while it is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overlay {
     None,
     Log,
     Help,
     Filters,
     Donate,
-    Export,
+    Export(ExportPrompt),
     /// Where the missions of the selected group's agent systems can take you.
     Destinations,
     /// Asking whether to download the static data, shown when it is not on disk.
-    StaticData,
+    StaticData(StaticDataDialog),
+}
+
+/// The export prompt: the file name typed into it, and why the last attempt was refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportPrompt {
+    pub path: String,
+    pub error: Option<String>,
+}
+
+/// The static data dialog: whether the archive is being fetched right now, and why the last
+/// download failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaticDataDialog {
+    pub downloading: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +97,9 @@ pub enum Action {
     Download,
 }
 
-/// What a run was started with, as the header and the detail pane show it.
+/// What a run was resolved to, as the header and the detail pane show it. The filter summary and
+/// the depth are handed to the view separately, because a depth-only apply changes the depth
+/// without starting a run.
 #[derive(Debug, Clone)]
 pub struct RunInfo {
     pub region: String,
@@ -92,21 +110,15 @@ pub struct RunInfo {
     /// region filter, which is not a place a system can have moved out of.
     pub agent_region_id: Option<i32>,
     pub corporations: usize,
-    pub filters: String,
-    pub depth: usize,
     pub agent_filter: AgentFilter,
 }
 
 pub struct App {
-    pub region: String,
-    /// The region of the run in progress, or the one last started. Zero until a run exists.
-    pub region_id: i32,
-    /// The region the run in progress filtered agents by, if it named one.
-    pub agent_region_id: Option<i32>,
-    pub corporations: usize,
+    /// The run in progress, or the one last started. `None` until the first one.
+    pub run: Option<RunInfo>,
+    /// The filters the header names: the run's, or before any run the command line's.
     pub filters: String,
     pub depth: usize,
-    pub agent_filter: AgentFilter,
     /// The options the current run was started with.
     pub applied: LpStoreOptions,
     pub form: FilterForm,
@@ -133,14 +145,6 @@ pub struct App {
     pub destinations_visible: usize,
     pub destinations_scroll: usize,
     pub overlay: Overlay,
-    /// The file name typed into the export prompt.
-    pub export_path: String,
-    /// Why the last export attempt was refused, shown beside the prompt.
-    pub export_error: Option<String>,
-    /// Whether the static data archive is being fetched right now.
-    pub downloading: bool,
-    /// Why the last static data download failed, shown in its dialog.
-    pub download_error: Option<String>,
     /// Where the static data files live, for the dialog's text. The view is given this after the
     /// platform roots are found; until then it says only that there is a data directory.
     pub data_dir: String,
@@ -154,13 +158,9 @@ impl App {
         let filters = filter_summary(&applied);
         let form = FilterForm::from_options(&applied);
         Self {
-            region: String::new(),
-            region_id: 0,
-            agent_region_id: None,
-            corporations: 0,
+            run: None,
             filters,
             depth: DEFAULT_DEPTH,
-            agent_filter: AgentFilter::default(),
             applied,
             form,
             stale: false,
@@ -179,12 +179,27 @@ impl App {
             destinations_visible: 0,
             destinations_scroll: 0,
             overlay: Overlay::None,
-            export_path: String::new(),
-            export_error: None,
-            downloading: false,
-            download_error: None,
             data_dir: super::ui::UNKNOWN_DATA_DIR.to_string(),
         }
+    }
+
+    /// The region the run prices in, as the header names it. Empty before the first run.
+    pub fn region(&self) -> &str {
+        self.run.as_ref().map_or("", |run| run.region.as_str())
+    }
+
+    /// How many corporations the run covers. Zero before the first run.
+    pub fn corporations(&self) -> usize {
+        self.run.as_ref().map_or(0, |run| run.corporations)
+    }
+
+    /// The agent filter of the run, which decides the systems the panes list. Before the first run
+    /// it is the empty filter, which matches every agent.
+    pub fn agent_filter(&self) -> AgentFilter {
+        self.run
+            .as_ref()
+            .map(|run| run.agent_filter)
+            .unwrap_or_default()
     }
 
     /// Tells the view where its files live, once the platform roots have been found.
@@ -260,20 +275,16 @@ impl App {
     }
 
     /// Takes in what a run was resolved to, without moving the stage on or logging it.
-    pub(crate) fn begin_run(&mut self, info: RunInfo) {
-        self.region = info.region;
-        self.region_id = info.region_id;
-        self.agent_region_id = info.agent_region_id;
-        self.corporations = info.corporations;
-        self.filters = info.filters;
-        self.agent_filter = info.agent_filter;
-        self.apply_depth(info.depth);
+    pub(crate) fn begin_run(&mut self, info: RunInfo, filters: String, depth: usize) {
+        self.run = Some(info);
+        self.filters = filters;
+        self.apply_depth(depth);
     }
 
     /// Switches the view to a new run. Earlier results stay on screen, marked stale, until
     /// this run finishes.
-    pub fn start_run(&mut self, info: RunInfo) {
-        self.begin_run(info);
+    pub fn start_run(&mut self, info: RunInfo, filters: String, depth: usize) {
+        self.begin_run(info, filters, depth);
         self.stale = self.report.is_some();
         // The previous run's summary, if one is still up, is not this run's news.
         self.awaiting_run_summary = false;
@@ -304,10 +315,6 @@ impl App {
         self.offer = self.offer.min(max);
     }
 
-    pub fn set_applied(&mut self, applied: LpStoreOptions) {
-        self.applied = applied;
-    }
-
     pub fn open_form(&mut self) {
         self.form = FilterForm::from_options(&self.applied);
         self.overlay = Overlay::Filters;
@@ -329,21 +336,22 @@ impl App {
     /// Asks whether to fetch the static data. Reached when the files are not on disk, or when they
     /// are and did not parse, in which case `reason` says so and a download replaces them.
     pub fn open_static_data(&mut self, reason: Option<String>) {
-        self.download_error = reason;
-        self.downloading = false;
-        self.overlay = Overlay::StaticData;
+        self.overlay = Overlay::StaticData(StaticDataDialog {
+            downloading: false,
+            error: reason,
+        });
     }
 
     /// The user chose to download. The fetch itself belongs to the caller, which owns the runtime.
     pub fn start_download(&mut self) {
-        self.downloading = true;
-        self.download_error = None;
+        if let Overlay::StaticData(dialog) = &mut self.overlay {
+            dialog.downloading = true;
+            dialog.error = None;
+        }
     }
 
     /// The fetch came back with data, so the filters dialog can be opened over it.
     pub fn download_finished(&mut self, form: FilterForm) {
-        self.downloading = false;
-        self.download_error = None;
         self.push_log(LogLine {
             text: "Downloaded the static data".to_string(),
             is_error: false,
@@ -353,37 +361,51 @@ impl App {
 
     /// The fetch failed. The dialog stays open so it can be tried again, with the reason beside it.
     pub fn download_failed(&mut self, reason: String) {
-        self.downloading = false;
         self.push_log(LogLine {
             text: format!("Static data download failed: {}", reason),
             is_error: true,
         });
-        self.download_error = Some(reason);
+        if let Overlay::StaticData(dialog) = &mut self.overlay {
+            dialog.downloading = false;
+            dialog.error = Some(reason);
+        }
     }
 
     /// Opens the export prompt with a name built from the region, so Enter on its own writes
     /// somewhere sensible. Only reachable once there are results to write.
     pub fn open_export(&mut self) {
-        self.export_path = self.suggested_path();
-        self.export_error = None;
-        self.overlay = Overlay::Export;
+        self.overlay = Overlay::Export(ExportPrompt {
+            path: self.suggested_path(),
+            error: None,
+        });
+    }
+
+    /// The export prompt, while it is open.
+    pub fn export_prompt(&self) -> Option<&ExportPrompt> {
+        match &self.overlay {
+            Overlay::Export(prompt) => Some(prompt),
+            _ => None,
+        }
     }
 
     pub fn close_export(&mut self) {
-        if self.overlay == Overlay::Export {
+        if matches!(self.overlay, Overlay::Export(_)) {
             self.overlay = Overlay::None;
         }
     }
 
     /// Keeps a refusal beside the prompt, so the name stays editable.
     pub fn refuse_export(&mut self, reason: impl Into<String>) {
-        self.export_error = Some(reason.into());
+        if let Overlay::Export(prompt) = &mut self.overlay {
+            prompt.error = Some(reason.into());
+        }
     }
 
     /// Where the report on screen would be written, as the prompt names it. `None` when the name
-    /// has no known extension, which is the same rule the exporter applies.
+    /// has no known extension, which is the same rule the exporter applies, and when the prompt is
+    /// not open.
     pub fn export_request(&self) -> Option<ExportRequest> {
-        ExportRequest::parse(&self.export_path)
+        ExportRequest::parse(&self.export_prompt()?.path)
     }
 
     /// A file name for this run: the mode, the region, and the filters, in lower case with
@@ -403,7 +425,7 @@ impl App {
                 .take(limit)
                 .collect()
         }
-        let mut name = format!("lpstores-{}", slug(&self.region, 64));
+        let mut name = format!("lpstores-{}", slug(self.region(), 64));
         if self.filters != "none" {
             name.push_str(&format!("-{}", slug(&self.filters, 32)));
         }
@@ -418,8 +440,6 @@ impl App {
         self.log.push_back(line);
     }
 
-    /// Records how the details pane was drawn: its total rows, and how many fit on screen.
-    /// Scrolling uses these, so the last row can always be reached.
     /// Records how tall the destinations pane was last frame, which bounds its scrolling. The pane is
     /// only measured while it is open, so a closed pane keeps the last count rather than resetting it;
     /// the scroll is clamped against it either way.
@@ -428,6 +448,8 @@ impl App {
         self.destinations_visible = visible;
     }
 
+    /// Records how the details pane was drawn: its total rows, and how many fit on screen.
+    /// Scrolling uses these, so the last row can always be reached.
     pub fn set_detail_layout(&mut self, rows: usize, visible: usize) {
         self.detail_rows = rows;
         self.detail_visible = visible;
@@ -452,10 +474,12 @@ impl App {
             Stage::Idle | Stage::Starting | Stage::Failed => ((0, 0), (0, 0)),
             Stage::Fetching { done, total } => ((done, total), (0, 0)),
             Stage::Pricing { done, total } => {
-                ((self.corporations, self.corporations), (done, total))
+                let corporations = self.corporations();
+                ((corporations, corporations), (done, total))
             }
             Stage::Finished { groups } => {
-                ((self.corporations, self.corporations), (groups, groups))
+                let corporations = self.corporations();
+                ((corporations, corporations), (groups, groups))
             }
         }
     }
@@ -492,24 +516,28 @@ impl App {
         // Any key acknowledges a run summary. It is not a mode and takes no key for itself: what the
         // press goes on to do — move a selection, open the log, quit — is unchanged.
         self.awaiting_run_summary = false;
-        if self.overlay == Overlay::Filters {
-            return self.on_form_key(key);
-        }
-        if self.overlay == Overlay::Export {
-            return self.on_export_key(key);
-        }
-        if is_quit(&key) {
-            return Action::Quit;
-        }
-        if self.overlay == Overlay::StaticData {
-            return self.on_static_data_key(key);
-        }
-        if self.overlay == Overlay::Donate {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('d')) {
-                self.overlay = Overlay::None;
+        // In order: the two text prompts take every key, so `q` types a letter there; everywhere
+        // else `q` and Ctrl+C quit before the overlay sees the key.
+        match &self.overlay {
+            Overlay::Filters => self.on_form_key(key),
+            Overlay::Export(_) => self.on_export_key(key),
+            _ if is_quit(&key) => Action::Quit,
+            Overlay::StaticData(dialog) => on_static_data_key(dialog, key),
+            Overlay::Donate => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('d')) {
+                    self.overlay = Overlay::None;
+                }
+                Action::Continue
             }
-            return Action::Continue;
+            Overlay::None | Overlay::Log | Overlay::Help | Overlay::Destinations => {
+                self.on_view_key(key)
+            }
         }
+    }
+
+    /// The keys of the results view and of the overlays that only show something: the log, the
+    /// help, and the mission destinations.
+    fn on_view_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => self.overlay = Overlay::None,
             KeyCode::Char('?') => self.toggle(Overlay::Help),
@@ -563,53 +591,40 @@ impl App {
         Action::Continue
     }
 
-    /// The static data dialog. While the fetch is running every key is ignored, since there is
-    /// nothing to interrupt but the process. Before it, Enter or `d` downloads and Esc or `x`
-    /// stops the application. `q` and Ctrl+C quit through the usual rule.
-    fn on_static_data_key(&mut self, key: KeyEvent) -> Action {
-        if self.downloading {
-            return Action::Continue;
-        }
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('d') => Action::Download,
-            KeyCode::Esc | KeyCode::Char('x') => Action::Quit,
-            _ => Action::Continue,
-        }
-    }
-
     /// While the export prompt is open, keys go to it, so `q` types a letter. Only Ctrl+C quits.
     fn on_export_key(&mut self, key: KeyEvent) -> Action {
         if is_ctrl_c(&key) {
             return Action::Quit;
         }
+        if key.code == KeyCode::Esc {
+            self.close_export();
+            return Action::Continue;
+        }
+        let Overlay::Export(prompt) = &mut self.overlay else {
+            return Action::Continue;
+        };
         let plain = !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
-            KeyCode::Esc => self.close_export(),
             KeyCode::Enter => {
-                return match self.export_request() {
-                    Some(_) => {
-                        self.export_error = None;
-                        Action::Export
-                    }
-                    None => {
-                        self.refuse_export("Use a file name ending in .csv or .json");
-                        Action::Continue
-                    }
-                };
+                if ExportRequest::parse(&prompt.path).is_some() {
+                    prompt.error = None;
+                    return Action::Export;
+                }
+                prompt.error = Some("Use a file name ending in .csv or .json".to_string());
             }
             KeyCode::Backspace => {
-                self.export_path.pop();
-                self.export_error = None;
+                prompt.path.pop();
+                prompt.error = None;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.export_path.clear();
-                self.export_error = None;
+                prompt.path.clear();
+                prompt.error = None;
             }
             KeyCode::Char(c) if plain => {
-                self.export_path.push(c);
-                self.export_error = None;
+                prompt.path.push(c);
+                prompt.error = None;
             }
             _ => {}
         }
@@ -671,6 +686,20 @@ impl App {
     }
 }
 
+/// The static data dialog. While the fetch is running every key is ignored, since there is
+/// nothing to interrupt but the process. Before it, Enter or `d` downloads and Esc or `x`
+/// stops the application. `q` and Ctrl+C quit through the usual rule, which `on_key` applies first.
+fn on_static_data_key(dialog: &StaticDataDialog, key: KeyEvent) -> Action {
+    if dialog.downloading {
+        return Action::Continue;
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('d') => Action::Download,
+        KeyCode::Esc | KeyCode::Char('x') => Action::Quit,
+        _ => Action::Continue,
+    }
+}
+
 fn shift(value: usize, delta: isize, max: usize) -> usize {
     (value as isize + delta).clamp(0, max as isize) as usize
 }
@@ -690,34 +719,19 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::test_support::{dialog, forge_run, open_prompt, open_prompt_mut, press};
     use crossterm::event::KeyEventState;
     use eve_lpstore::OfferError;
     use eve_lpstore::esi::error::EsiError;
     use eve_lpstore::report::Field;
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
-    fn info(depth: usize) -> RunInfo {
-        RunInfo {
-            region: "The Forge".to_string(),
-            region_id: 10000002,
-            agent_region_id: None,
-            corporations: 3,
-            filters: "none".to_string(),
-            depth,
-            agent_filter: AgentFilter::default(),
-        }
-    }
-
     fn new_app(depth: usize) -> App {
         let mut app = App::new(LpStoreOptions::default());
-        app.begin_run(info(depth));
+        app.begin_run(forge_run(3), "none".to_string(), depth);
         app.stage = Stage::Starting;
         app
     }
@@ -953,8 +967,8 @@ mod tests {
     fn e_opens_the_export_prompt_with_a_name_from_the_region() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         assert_eq!(app.on_key(press(KeyCode::Char('e'))), Action::Continue);
-        assert_eq!(app.overlay, Overlay::Export);
-        assert_eq!(app.export_path, "lpstores-the-forge.csv");
+        assert!(matches!(app.overlay, Overlay::Export(_)));
+        assert_eq!(open_prompt(&app).path, "lpstores-the-forge.csv");
         assert_eq!(
             app.export_request().map(|request| request.format),
             Some(eve_lpstore::export::ExportFormat::Csv)
@@ -1018,13 +1032,16 @@ mod tests {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.filters = "faction Caldari".to_string();
         app.open_export();
-        assert_eq!(app.export_path, "lpstores-the-forge-faction-caldari.csv");
+        assert_eq!(
+            open_prompt(&app).path,
+            "lpstores-the-forge-faction-caldari.csv"
+        );
         app.filters = "a".repeat(80);
         app.open_export();
         assert!(
-            app.export_path.len() < 80,
+            open_prompt(&app).path.len() < 80,
             "the filter part is cut short: {}",
-            app.export_path
+            open_prompt(&app).path
         );
     }
 
@@ -1032,11 +1049,10 @@ mod tests {
     fn enter_in_the_export_prompt_asks_for_the_write() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.open_export();
-        app.export_path = "out/offers.json".to_string();
+        open_prompt_mut(&mut app).path = "out/offers.json".to_string();
         assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Export);
-        assert_eq!(
-            app.overlay,
-            Overlay::Export,
+        assert!(
+            matches!(app.overlay, Overlay::Export(_)),
             "the prompt stays open until it is written"
         );
     }
@@ -1045,21 +1061,34 @@ mod tests {
     fn enter_refuses_an_unknown_extension() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.open_export();
-        app.export_path = "offers.txt".to_string();
+        open_prompt_mut(&mut app).path = "offers.txt".to_string();
         assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Continue);
-        assert!(app.export_error.unwrap().contains(".csv or .json"));
-        assert_eq!(app.overlay, Overlay::Export, "the name stays editable");
+        assert!(
+            open_prompt(&app)
+                .error
+                .clone()
+                .unwrap()
+                .contains(".csv or .json")
+        );
+        assert!(
+            matches!(app.overlay, Overlay::Export(_)),
+            "the name stays editable"
+        );
     }
 
     #[test]
     fn editing_the_export_name_clears_the_refusal() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.open_export();
-        app.export_path = "offers".to_string();
+        open_prompt_mut(&mut app).path = "offers".to_string();
         app.on_key(press(KeyCode::Enter));
-        assert!(app.export_error.is_some());
+        assert!(open_prompt(&app).error.is_some());
         app.on_key(press(KeyCode::Char('.')));
-        assert_eq!(app.export_error, None, "the refusal is about the old name");
+        assert_eq!(
+            open_prompt(&app).error,
+            None,
+            "the refusal is about the old name"
+        );
         app.on_key(press(KeyCode::Char('c')));
         app.on_key(press(KeyCode::Char('s')));
         app.on_key(press(KeyCode::Char('v')));
@@ -1070,9 +1099,9 @@ mod tests {
     fn q_is_a_letter_in_the_export_prompt() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.open_export();
-        app.export_path.clear();
+        open_prompt_mut(&mut app).path.clear();
         assert_eq!(app.on_key(press(KeyCode::Char('q'))), Action::Continue);
-        assert_eq!(app.export_path, "q");
+        assert_eq!(open_prompt(&app).path, "q");
     }
 
     #[test]
@@ -1089,14 +1118,15 @@ mod tests {
         for _ in 0..4 {
             app.on_key(press(KeyCode::Backspace));
         }
-        assert_eq!(app.export_path, "lpstores-the-forge");
+        assert_eq!(open_prompt(&app).path, "lpstores-the-forge");
         app.on_key(press(KeyCode::Char('u')));
         assert_eq!(
-            app.export_path, "lpstores-the-forgeu",
+            open_prompt(&app).path,
+            "lpstores-the-forgeu",
             "plain u types a letter"
         );
         app.on_key(ctrl('u'));
-        assert_eq!(app.export_path, "", "Ctrl+U clears the whole name");
+        assert_eq!(open_prompt(&app).path, "", "Ctrl+U clears the whole name");
     }
 
     #[test]
@@ -1111,7 +1141,7 @@ mod tests {
     fn starting_a_run_closes_the_export_prompt() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.open_export();
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         assert_eq!(app.overlay, Overlay::None);
     }
 
@@ -1119,7 +1149,7 @@ mod tests {
     fn the_static_data_dialog_offers_download_or_exit() {
         let mut app = new_app(10);
         app.open_static_data(None);
-        assert_eq!(app.overlay, Overlay::StaticData);
+        assert!(matches!(app.overlay, Overlay::StaticData(_)));
         assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Download);
         app.open_static_data(None);
         assert_eq!(app.on_key(press(KeyCode::Char('d'))), Action::Download);
@@ -1141,11 +1171,14 @@ mod tests {
         let mut app = new_app(10);
         app.open_static_data(None);
         app.start_download();
-        assert!(app.downloading);
+        assert!(dialog(&app).downloading);
         assert_eq!(app.on_key(press(KeyCode::Enter)), Action::Continue);
         assert_eq!(app.on_key(press(KeyCode::Esc)), Action::Continue);
         assert_eq!(app.on_key(press(KeyCode::Char('d'))), Action::Continue);
-        assert_eq!(app.overlay, Overlay::StaticData, "the dialog stays up");
+        assert!(
+            matches!(app.overlay, Overlay::StaticData(_)),
+            "the dialog stays up"
+        );
     }
 
     #[test]
@@ -1155,9 +1188,8 @@ mod tests {
         app.start_download();
         let form = FilterForm::from_options(&LpStoreOptions::default());
         app.download_finished(form);
+        // The dialog's state closes with it, so there is no download flag left to clear.
         assert_eq!(app.overlay, Overlay::Filters, "the filters come next");
-        assert!(!app.downloading);
-        assert_eq!(app.download_error, None);
         let line = app.log.back().expect("the download is reported");
         assert!(!line.is_error);
         assert!(line.text.contains("Downloaded the static data"));
@@ -1169,13 +1201,12 @@ mod tests {
         app.open_static_data(None);
         app.start_download();
         app.download_failed("connection refused".to_string());
-        assert_eq!(
-            app.overlay,
-            Overlay::StaticData,
+        assert!(
+            matches!(app.overlay, Overlay::StaticData(_)),
             "the dialog stays up so it can be retried"
         );
-        assert!(!app.downloading);
-        assert_eq!(app.download_error.as_deref(), Some("connection refused"));
+        assert!(!dialog(&app).downloading);
+        assert_eq!(dialog(&app).error.as_deref(), Some("connection refused"));
         let line = app.log.back().expect("the failure is logged");
         assert!(line.is_error);
         assert!(line.text.contains("connection refused"));
@@ -1186,9 +1217,9 @@ mod tests {
     fn unreadable_static_data_is_shown_with_the_reason_it_cannot_be_used() {
         let mut app = new_app(10);
         app.open_static_data(Some("data/regions.json is not valid JSON".to_string()));
-        assert_eq!(app.overlay, Overlay::StaticData);
+        assert!(matches!(app.overlay, Overlay::StaticData(_)));
         assert_eq!(
-            app.download_error.as_deref(),
+            dialog(&app).error.as_deref(),
             Some("data/regions.json is not valid JSON")
         );
     }
@@ -1204,8 +1235,12 @@ mod tests {
         assert!(app.report.is_none());
         assert_eq!(app.overlay, Overlay::None);
         assert_eq!(app.filters, "--faction caldari");
-        assert_eq!(app.region, "", "the region is not known until a run starts");
-        assert_eq!(app.corporations, 0);
+        assert_eq!(
+            app.region(),
+            "",
+            "the region is not known until a run starts"
+        );
+        assert_eq!(app.corporations(), 0);
     }
 
     #[test]
@@ -1260,11 +1295,11 @@ mod tests {
         // clear the summary the previous run left behind, which is the case set by hand below.
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.awaiting_run_summary = true;
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         assert!(!app.awaiting_run_summary, "the old outcome is stale news");
 
         let mut fresh = App::new(LpStoreOptions::default());
-        fresh.start_run(info(10));
+        fresh.start_run(forge_run(3), "none".to_string(), 10);
         assert!(
             !fresh.awaiting_run_summary,
             "nothing was superseded, so there is nothing to acknowledge"
@@ -1274,7 +1309,7 @@ mod tests {
     #[test]
     fn finishing_a_re_run_leaves_the_summary_and_a_key_clears_it() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         app.finish(Report { groups: vec![] });
         assert!(app.awaiting_run_summary, "the run ended over a report");
         app.on_key(press(KeyCode::Esc));
@@ -1284,14 +1319,14 @@ mod tests {
     #[test]
     fn a_stopped_re_run_summarises_and_a_stopped_first_run_does_not() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         app.fail();
         assert!(
             app.awaiting_run_summary,
             "stale results are still behind it"
         );
         let mut fresh = App::new(LpStoreOptions::default());
-        fresh.start_run(info(10));
+        fresh.start_run(forge_run(3), "none".to_string(), 10);
         fresh.fail();
         assert!(
             !fresh.awaiting_run_summary,
@@ -1302,10 +1337,10 @@ mod tests {
     #[test]
     fn a_newer_run_replaces_the_summary_it_was_given() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         app.finish(Report { groups: vec![] });
         assert!(app.awaiting_run_summary);
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         assert!(
             !app.awaiting_run_summary,
             "the old run's outcome is not news about this one"
@@ -1315,7 +1350,7 @@ mod tests {
     #[test]
     fn a_new_run_keeps_the_old_results_stale_until_it_finishes() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
-        app.start_run(info(10));
+        app.start_run(forge_run(3), "none".to_string(), 10);
         assert!(app.stale);
         assert_eq!(app.stage, Stage::Starting);
         assert_eq!(app.groups().len(), 1, "the old results stay on screen");

@@ -887,6 +887,60 @@ leave the program doing what it did.
       The two `HashMap`-ordered lists could be sorted before writing so the file is the same bytes
       on every download.
 
+#### The TUI state and render code
+
+- [x] The export prompt and the static data dialog carry their own state:
+      `Overlay::Export(ExportPrompt { path, error })` and
+      `Overlay::StaticData(StaticDataDialog { downloading, error })` replace four `App` fields that
+      outlived their popup. A download flag with no dialog open, or a refusal with no prompt, can
+      no longer be represented. One consequence: the export name is gone once the prompt closes,
+      which nothing read, since opening the prompt again always rebuilt it.
+- [x] `on_key` is one `match` on the overlay. The order that decides whether `q` quits, after the
+      two text prompts and before everything else, is a guard arm in that match instead of the
+      position of an `if` in a chain of five. The keys of the results view and of the overlays
+      that only show something are `on_view_key`.
+- [x] The run's region, region id, agent region, corporation count, and agent filter are one
+      `run: Option<RunInfo>`, read through `region()`, `corporations()`, and `agent_filter()`.
+      This removes the region id's zero placeholder for "no run yet". The filter summary and the
+      depth stay on `App`, because a depth-only apply changes the depth without a run, so
+      `RunInfo` no longer carries them and `start_run` takes them beside it. `set_applied`, a
+      setter for a public field, is gone.
+- [x] The market and agent pairs are one `Pair` with accessors, so `region_moved`,
+      `clear_system_on_region_move`, and the outside-the-region check are each written once and
+      `apply` walks both pairs in a loop, market first, as before. `system_outside_region`, the
+      testable rule, is unchanged.
+- [x] `opening` takes only what loading returned, and `None` means not on disk, which removes the
+      `cached` flag and the arm the old comment called unreachable. `Opening::Filters` boxes the
+      data, which was clippy's last warning in the crate; there are none now.
+- [x] `src/tui/test_support.rs` holds `press`, `forge_run`, `priced_offer`, and `results_app`.
+      The run info was written out six times across `app.rs`, `mod.rs`, and `ui.rs`, and the other
+      three twice each. `app.rs` keeps its own minimal `offer` and `app_with`, which build
+      different values.
+- [x] `ui.rs` was one 2,871-line file. It is now `ui/mod.rs` (`draw`, the header and footer, the
+      results layout), `text.rs`, `popups.rs`, `progress.rs`, `filters.rs`, `offers.rs`,
+      `details.rs`, `destinations.rs`, and `tests.rs`, which holds the tests as they were, since
+      most render the whole view. The cut was at item boundaries again, and a line comparison
+      against the file formatted the same way shows only visibility, module headers, and
+      signatures rustfmt re-wrapped for the longer prefix.
+- [x] Three popups share one `popup` helper and `POPUP_WIDTH`, instead of writing 64 three times.
+      The offers table is one `OFFER_COLUMNS` array of title, width per layout, and cell
+      function, replacing three parallel lists that a test had to keep the same length and a
+      comment about column 4 that was wrong. Three doc comments that sat on the wrong item are
+      on the right one.
+- [x] Checked in a pseudo-terminal, 120x40, against temporary homes: with no static data the view
+      opened on the download dialog and Esc exited 0 without creating a directory; with the
+      static data it opened on the filters dialog and Esc exited 0; a one-corporation run against
+      the copied cache, then `e` and Enter, drew the export prompt and wrote
+      `lpstores-the-forge--10000002----lpstore-1000002.csv` with the run's rows. The render sweep
+      from 80 to 160 columns still passes, which is what covers the offers table layout.
+- [x] Tests: 3 added and 1 replaced, for each pair reading its own fields, each layout's column
+      titles and widths, and only the spread and imbalance cells being coloured; the length check
+      between the three old lists is gone with the lists.
+- [ ] Not done here, and noted by the review: `mission_spread` runs on every redraw, 6.9 ms
+      across all agent systems by the review's measurement; the run and download results arrive
+      by `oneshot` polled beside the event channel; the export prompt and the form edit text with
+      two copies of the same key handling; and `Session.sdata` is an `Arc` nothing clones.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.
