@@ -311,7 +311,7 @@ impl LpStoreOptions {
         if agent_filtering || faction_id.is_some() {
             let before = corp_ids.len();
             corp_ids.retain(|&id| {
-                faction_id.map_or(true, |f| sdata.corporation_in_faction(id, f))
+                faction_id.is_none_or(|f| sdata.corporation_in_faction(id, f))
                     && (!agent_filtering || sdata.corporation_passes(id, &agent_filter))
             });
             filter_summary = Some(FilterSummary {

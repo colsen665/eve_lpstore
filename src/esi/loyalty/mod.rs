@@ -9,7 +9,7 @@ pub struct RequiredItem {
 }
 
 /// A loyalty store offer.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LoyaltyOffer {
     pub offer_id: i32,
     pub type_id: i32,

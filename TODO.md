@@ -747,6 +747,48 @@ leave the program doing what it did.
       first fails on the old loop: mutated to stop after page 1, it returns `[1]` against
       `[1, 2, 3]`.
 
+#### Cheap cleanups
+
+- [x] Removed code nothing called: `ExpensesEndpoint::offer_expenses`,
+      `MarketsEndpoint::orders_by_type`, `EsiClient::stats_clone`, `StaticData::corporation_names`,
+      and `saved_filters::save`, whose one caller had moved to `save_to`. Each was checked with a
+      grep over `src/`; there is no `tests/` or `examples/` directory. The ESI builder setters stay,
+      since they set public config fields and `base_url` is what the offline cache tests use.
+      Making the static data module's internal `pub` items private is left to the static data
+      piece, which moves them between files anyway.
+- [x] `OfferResult::profit_per_unit` replaces the reward-less-unit-cost match written out in
+      `output.rs`, the details pane, and the export. `format::format_optional` replaces the
+      `map(format_number).unwrap_or("n/a")` chains in `output.rs` and backs the details pane's
+      `optional`.
+- [x] `OfferResult`, `LoyaltyOffer`, and `ExpenseBreakdown` derive `Default`, so a test fixture names
+      only the fields it is about. The two `group` helpers in `src/report/` are one, and the four
+      sort tests moved from `pipeline.rs` to `report/mod.rs`, beside `Report::sort_by_depth`, which
+      is what they test. The full priced-offer fixtures in the TUI are left for the TUI piece,
+      which gives them one home.
+- [x] `corp_line` cut its system list at a literal `10` while `MAX_SYSTEMS_SHOWN` named it, and
+      `--example` defaulted to a literal `10000002` and rebuilt `region_label` by hand. Both use the
+      names now. `output::corp_label` was a private copy behind `corporation_label` and is gone.
+- [x] Docs that the code contradicted: the field counts in `saved_filters.rs` ("nine",
+      "eleven"; there are twelve, and the text now gives no number), the `StaticData` summary
+      (three `data/` files, name-to-ID only), the archive size ("several hundred megabyte";
+      `curl -I` gives a `content-length` of 99,297,801), the stargate note saying the cache builder
+      deduplicates (`neighbour_map` does), `status_text` claiming the TUI footer as a caller, the
+      comment on the offers table's column 4, `main.rs` naming `eve_lpstore::tui::run` when the TUI
+      is part of the binary, and `--verbose` in `HELP_TEXT` implying the view logs the two
+      directories only with the flag. Two test comments described values their fixtures do not
+      hold, and one doc comment sat above the wrong item.
+- [x] Clippy: 26 warnings before, 17 after. The 16 in `src/static_data/mod.rs` go with that piece,
+      and `large_enum_variant` on `Opening` with the TUI piece. `format_imbalance`'s `Some(0.0)`
+      pattern compares with `==`, so it still matches `-0.0`, which
+      `the_imbalance_shows_its_sign_and_never_a_negative_zero` covers and still passes.
+- [x] Checked by output: `--lpstores` over all 283 corporations, run by the binary from before
+      this review and by this one against the same copied cache with `--cache-minutes 1000000`,
+      printed the same 2,499 lines apart from the timings, from 24,233 cache hits and no misses.
+- [ ] Observed during that check, and not in any piece: pricing took 78 to 81 seconds in a debug
+      build with every lookup a cache hit. Each lookup reads the whole cache directory, 3,734
+      files at the time, which is the likely cost but was not profiled. Indexing the directory
+      once per client was offered with the ESI piece and not chosen.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

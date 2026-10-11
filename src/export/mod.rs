@@ -265,10 +265,7 @@ fn export_offer<'a>(
         units: offer.quantity,
         reward: money(result.reward),
         unit_cost: money(result.unit_cost),
-        profit_per_unit: match (result.reward, result.unit_cost) {
-            (Some(reward), Some(unit_cost)) => Some(round_money(reward - unit_cost)),
-            _ => None,
-        },
+        profit_per_unit: money(result.profit_per_unit()),
         isk_per_lp: money(result.isk_per_lp),
         best_ask: money(result.best_ask),
         spread_percent: money(result.spread),
@@ -535,8 +532,7 @@ mod tests {
         let mut fields = Vec::new();
         let mut field = String::new();
         let mut quoted = false;
-        let mut characters = row.chars();
-        while let Some(character) = characters.next() {
+        for character in row.chars() {
             match character {
                 '"' => quoted = !quoted,
                 ',' if !quoted => {

@@ -691,9 +691,8 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
 mod tests {
     use super::*;
     use crossterm::event::KeyEventState;
+    use eve_lpstore::OfferError;
     use eve_lpstore::esi::error::EsiError;
-    use eve_lpstore::esi::loyalty::LoyaltyOffer;
-    use eve_lpstore::{ExpenseBreakdown, OfferError};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -724,29 +723,8 @@ mod tests {
 
     fn offer(isk_per_lp: f64) -> OfferResult {
         OfferResult {
-            offer: LoyaltyOffer {
-                offer_id: 1,
-                type_id: 1,
-                quantity: 1,
-                lp_cost: 1,
-                isk_cost: 0.0,
-                required_items: Vec::new(),
-            },
-            breakdown: ExpenseBreakdown {
-                offer_id: 1,
-                lp_cost: 1,
-                isk_cost: 0.0,
-                item_expenses: Vec::new(),
-                total_isk: 0.0,
-            },
-            reward: None,
-            unit_cost: None,
             isk_per_lp: Some(isk_per_lp),
-            best_ask: None,
-            spread: None,
-            book_depth: None,
-            imbalance: None,
-            within_10: None,
+            ..Default::default()
         }
     }
 

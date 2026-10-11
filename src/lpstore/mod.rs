@@ -8,7 +8,9 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 /// The calculated expenses, reward, and profit for a loyalty offer.
-#[derive(Debug, Clone)]
+///
+/// The default is an offer with no market data and nothing priced, which is what a test builds on.
+#[derive(Debug, Clone, Default)]
 pub struct OfferResult {
     pub offer: LoyaltyOffer,
     pub breakdown: ExpenseBreakdown,
@@ -26,6 +28,13 @@ pub struct OfferResult {
     /// How lopsided that volume is, from -100 to +100, or `None` when either side is empty.
     pub imbalance: Option<f64>,
     pub within_10: Option<(i64, f64)>,
+}
+
+impl OfferResult {
+    /// The reward less the cost of one unit, or `None` when either is unknown.
+    pub fn profit_per_unit(&self) -> Option<f64> {
+        Some(self.reward? - self.unit_cost?)
+    }
 }
 
 /// An offer that could not be priced.

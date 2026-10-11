@@ -4,10 +4,9 @@
 //! right answer for a script and the wrong one for an interactive session, where the same handful
 //! of corporations or the same region is usually wanted again. So a successful apply in the view
 //! writes the filters it used to a file in the platform config directory, and the next session
-//! reads them back before it
-//! shows the filters dialog.
+//! reads them back before it shows the filters dialog.
 //!
-//! Only the nine fields the form carries are kept. `--expire` is a one-shot cache bypass, and
+//! Only the text fields the form carries are kept. `--expire` is a one-shot cache bypass, and
 //! remembering it would refetch every offer on every later run, and the command-line-only fields
 //! are not shown by the form, so there is nothing to remember about them.
 
@@ -72,8 +71,8 @@ impl SavedFilters {
             system: pick(&cli.system, &self.system),
             depth: pick(&cli.depth, &self.depth),
             cache_minutes: pick(&cli.cache_minutes, &self.cache_minutes),
-            // concurrency, max_inflight, expire, and verbose are command line only, so they come
-            // from `cli` and there is no saved value that could override them.
+            // concurrency, max_inflight, cache_dir, expire, and verbose are command line only, so
+            // they come from `cli` and there is no saved value that could override them.
             ..cli.clone()
         }
     }
@@ -106,8 +105,8 @@ impl From<&LpStoreOptions> for SavedFilters {
 pub enum Loaded {
     /// No file is there, which is the state until a run is applied for the first time.
     Absent,
-    /// The filters from the last applied run. Boxed because the struct is now eleven fields, and an
-    /// unboxed variant of its size next to a bare `String` is what `large_enum_variant` asks about:
+    /// The filters from the last applied run. Boxed because an unboxed variant the size of the
+    /// struct next to a bare `String` is what `large_enum_variant` asks about:
     /// the whole enum would be that large for the one case that reads it once at start-up.
     Filters(Box<SavedFilters>),
     /// A file is there and cannot be used. The reason is for a log line.
@@ -155,13 +154,8 @@ pub fn load_from(file: &Path) -> Loaded {
     }
 }
 
-/// Write the remembered filters of `options` to [`path`](path) inside `config`.
-pub fn save(options: &LpStoreOptions, config: &Path) -> io::Result<()> {
-    save_to(&path(config), options)
-}
-
-/// Write the nine persisted fields of `options` to `file`, as JSON that is readable and editable by
-/// hand. Takes an explicit path so a test can write somewhere else than the project directory.
+/// Write the persisted fields of `options` to `file`, as JSON that is readable and editable by
+/// hand. Takes an explicit path so a test can write somewhere other than the config directory.
 pub fn save_to(file: &Path, options: &LpStoreOptions) -> io::Result<()> {
     let text = serde_json::to_string_pretty(&SavedFilters::from(options))
         .expect("the saved filters always serialize");

@@ -246,11 +246,6 @@ impl EsiClient {
         self.stats.lock().unwrap().clone()
     }
 
-    /// Returns a clone of the shared stats Arc for background monitoring.
-    pub fn stats_clone(&self) -> Arc<Mutex<ClientStats>> {
-        self.stats.clone()
-    }
-
     /// Spawns a task that passes a snapshot of the stats to `on_status` once per second.
     pub fn spawn_status_monitor<F>(&self, on_status: F) -> tokio::task::JoinHandle<()>
     where
@@ -401,15 +396,13 @@ impl EsiClient {
         let mut entry_id = segments[1..].join("_");
 
         // Append query parameters to entry ID
-        if let Some(query) = url.query() {
-            if !query.is_empty() {
-                let params: Vec<String> = url
-                    .query_pairs()
-                    .map(|(k, v)| format!("{}_{}", k, v))
-                    .collect();
-                entry_id.push('_');
-                entry_id.push_str(&params.join("_"));
-            }
+        if url.query().is_some_and(|query| !query.is_empty()) {
+            let params: Vec<String> = url
+                .query_pairs()
+                .map(|(k, v)| format!("{}_{}", k, v))
+                .collect();
+            entry_id.push('_');
+            entry_id.push_str(&params.join("_"));
         }
 
         Some((entry_type, entry_id))

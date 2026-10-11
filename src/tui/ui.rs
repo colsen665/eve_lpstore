@@ -6,7 +6,7 @@ use super::form::FormField;
 use super::qr;
 use crate::output;
 use eve_lpstore::esi::ClientStats;
-use eve_lpstore::format::{format_isk, format_number};
+use eve_lpstore::format::{format_isk, format_number, format_optional};
 use eve_lpstore::report::Group;
 use eve_lpstore::{OfferResult, StaticData};
 use ratatui::Frame;
@@ -970,10 +970,7 @@ fn group_item(
     sdata: &StaticData,
     names_width: usize,
 ) -> ListItem<'static> {
-    let isk = group
-        .average_isk_per_lp(depth)
-        .map(|value| format_number(value, 2))
-        .unwrap_or_else(|| "n/a".to_string());
+    let isk = optional(group.average_isk_per_lp(depth));
     let names: Vec<String> = group
         .corp_ids
         .iter()
@@ -1092,7 +1089,8 @@ fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData, wide: bool) 
         .into_iter()
         .enumerate()
         .map(|(column, text)| {
-            // The imbalance column only exists in the wide layout, where index 4 is the volume.
+            // The imbalance column only exists in the wide layout. In the narrow one the same index
+            // is the profit, which takes no colour.
             let style = match column {
                 SPREAD_COLUMN => spread_style(result.spread),
                 IMBALANCE_COLUMN if wide => imbalance_style(result.imbalance),
@@ -1107,10 +1105,7 @@ fn offer_row(rank: usize, result: &OfferResult, sdata: &StaticData, wide: bool) 
 /// The cells of an offer row. The imbalance and the volume within 10% of the best bid are left out
 /// when `wide` is false, and the profit is the total on that volume.
 fn offer_cells(rank: usize, result: &OfferResult, item: String, wide: bool) -> Vec<String> {
-    let isk_per_lp = result
-        .isk_per_lp
-        .map(|value| format_number(value, 2))
-        .unwrap_or_else(|| "n/a".to_string());
+    let isk_per_lp = optional(result.isk_per_lp);
     let (volume, profit) = match result.within_10 {
         Some((volume, profit)) => (format_number(volume as f64, 0), short_isk(profit)),
         None => ("n/a".to_string(), "n/a".to_string()),
@@ -1159,7 +1154,8 @@ fn spread_style(spread: Option<f64>) -> Style {
 fn format_imbalance(imbalance: Option<f64>) -> String {
     match imbalance.map(|value| value.round()) {
         None => "n/a".to_string(),
-        Some(rounded) if rounded == 0.0 => "0%".to_string(),
+        // The literal pattern compares with `==`, so it matches -0.0 as well.
+        Some(0.0) => "0%".to_string(),
         Some(rounded) if rounded > 0.0 => format!("+{:.0}%", rounded),
         Some(rounded) => format!("{:.0}%", rounded),
     }
@@ -1356,10 +1352,7 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
                     "Reward: {} | Unit cost: {} | Profit per unit: {}",
                     optional(result.reward),
                     optional(result.unit_cost),
-                    match (result.reward, result.unit_cost) {
-                        (Some(reward), Some(unit_cost)) => format_number(reward - unit_cost, 2),
-                        _ => "n/a".to_string(),
-                    }
+                    optional(result.profit_per_unit())
                 ),
                 plain,
             ));
@@ -1422,9 +1415,7 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
 }
 
 fn optional(value: Option<f64>) -> String {
-    value
-        .map(|value| format_number(value, 2))
-        .unwrap_or_else(|| "n/a".to_string())
+    format_optional(value, 2)
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {

@@ -1,6 +1,6 @@
 use eve_lpstore::StaticData;
 use eve_lpstore::esi::ClientStats;
-use eve_lpstore::format::{format_isk, format_number};
+use eve_lpstore::format::{format_isk, format_number, format_optional};
 use eve_lpstore::report::{Event, Report, Resolved};
 use eve_lpstore::static_data::AgentFilter;
 
@@ -17,10 +17,6 @@ pub const MAX_SYSTEMS_SHOWN: usize = 10;
 
 /// The corporation's name and id on its own, for panes that list systems separately.
 pub fn corporation_label(sdata: &StaticData, corp_id: i32) -> String {
-    corp_label(sdata, corp_id)
-}
-
-fn corp_label(sdata: &StaticData, corp_id: i32) -> String {
     match sdata.corporation_name(corp_id) {
         Some(name) => format!("{} ({})", name, corp_id),
         None => corp_id.to_string(),
@@ -30,7 +26,7 @@ fn corp_label(sdata: &StaticData, corp_id: i32) -> String {
 /// A corporation with its agent systems, as the CLI prints it.
 pub fn corp_line(sdata: &StaticData, corp_id: i32, filter: &AgentFilter) -> String {
     let systems = sdata.corporation_systems(corp_id, filter);
-    let mut line = corp_label(sdata, corp_id);
+    let mut line = corporation_label(sdata, corp_id);
     if !systems.is_empty() {
         let shown: Vec<String> = systems
             .iter()
@@ -39,7 +35,7 @@ pub fn corp_line(sdata: &StaticData, corp_id: i32, filter: &AgentFilter) -> Stri
             .collect();
         line.push_str(": ");
         line.push_str(&shown.join(", "));
-        if systems.len() > 10 {
+        if systems.len() > MAX_SYSTEMS_SHOWN {
             line.push_str(", ...");
         }
     }
@@ -97,7 +93,7 @@ pub fn message(event: &Event, sdata: &StaticData) -> Option<Message> {
         Event::CorpFetchFailed { corp_id, error } => (
             format!(
                 "Failed to fetch loyalty offers for corporation {}: {}",
-                corp_label(sdata, *corp_id),
+                corporation_label(sdata, *corp_id),
                 error
             ),
             true,
@@ -158,7 +154,8 @@ pub fn rate_limit_text(s: &ClientStats) -> String {
     }
 }
 
-/// The client's counters on one line, shared by `--status` and the TUI footer.
+/// The client's counters on one line, as `--status` prints them. The TUI footer builds its own
+/// shorter line, sharing only [`rate_limit_text`].
 pub fn status_text(s: &ClientStats) -> String {
     format!(
         "In-flight: {} | Waiting: {} | Rate limit: {} | Total: {} | Errors: {}",
@@ -195,22 +192,10 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 .type_name(r.offer.type_id)
                 .cloned()
                 .unwrap_or_else(|| format!("Type {}", r.offer.type_id));
-            let reward_str = r
-                .reward
-                .map(|v| format_number(v, 2))
-                .unwrap_or_else(|| "n/a".to_string());
-            let unit_cost_str = r
-                .unit_cost
-                .map(|v| format_number(v, 2))
-                .unwrap_or_else(|| "n/a".to_string());
-            let profit_per_unit_str = match (r.reward, r.unit_cost) {
-                (Some(reward), Some(unit_cost)) => format_number(reward - unit_cost, 2),
-                _ => "n/a".to_string(),
-            };
-            let isk_per_lp_str = r
-                .isk_per_lp
-                .map(|v| format_number(v, 2))
-                .unwrap_or_else(|| "n/a".to_string());
+            let reward_str = format_optional(r.reward, 2);
+            let unit_cost_str = format_optional(r.unit_cost, 2);
+            let profit_per_unit_str = format_optional(r.profit_per_unit(), 2);
+            let isk_per_lp_str = format_optional(r.isk_per_lp, 2);
             let spread_str = r
                 .spread
                 .map(|v| format!("{:.2}%", v))

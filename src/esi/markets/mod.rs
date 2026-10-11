@@ -39,17 +39,4 @@ impl<'a> MarketsEndpoint<'a> {
             .unwrap_or_default();
         self.client.get(&path, &query).await
     }
-
-    /// Get market orders in a region, filtered by order type.
-    ///
-    /// `GET /markets/{region_id}/orders/?order_type={order_type}`
-    pub async fn orders_by_type(
-        &self,
-        region_id: i32,
-        order_type: &str,
-    ) -> Result<Vec<MarketOrder>, crate::esi::error::EsiError> {
-        let path = format!("markets/{}/orders/", region_id);
-        let query: [(&str, String); 1] = [("order_type", order_type.to_string())];
-        self.client.get(&path, &query).await
-    }
 }

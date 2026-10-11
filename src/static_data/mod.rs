@@ -229,7 +229,8 @@ struct SdeSolarSystem {
 }
 
 /// Stargate record, used only for the pair of systems it joins. The archive lists one record per
-/// direction, so every edge appears twice, which the cache builder deduplicates.
+/// direction, so every edge appears twice. The cache keeps both, and `neighbour_map` collapses
+/// any repeats.
 #[derive(Debug, Deserialize)]
 struct SdeStargate {
     #[serde(rename = "solarSystemID")]
@@ -473,14 +474,16 @@ impl AgentFilter {
     }
 }
 
-/// Static data cache for region, corporation, and type name → ID lookups.
+/// Names, agents, systems, and stargates from the EVE Online static data, looked up by name or by
+/// ID.
 ///
-/// Data is cached locally at `data/regions.json`, `data/corporations.json`, and `data/types.json`.
-/// The cache is only downloaded when explicitly forced or when no cache file exists.
+/// The four files that [`files`](Self::files) names are kept in the platform data directory. They
+/// are downloaded when forced, when one is missing, or when the agent file is from an older
+/// build.
 ///
 /// The default is an empty cache: every lookup misses and callers fall back to IDs. That is a
-/// usable value, and it lets the `--tui` view be render-tested without the `data/` files, which
-/// are gitignored and downloaded on demand.
+/// usable value, and it lets the `--tui` view be render-tested without the data files, which are
+/// downloaded on demand.
 #[derive(Default)]
 pub struct StaticData {
     regions: HashMap<String, i32>,
@@ -509,8 +512,8 @@ impl StaticData {
     /// Whether every file [`load`](Self::load) reads from disk is there and current. It says nothing
     /// about whether they parse, so a `true` answer can still fail to load.
     ///
-    /// `load` downloads on its own when this is `false`, which is a several hundred megabyte fetch
-    /// of the whole static data archive. Callers that want to ask before spending that, rather than
+    /// `load` downloads on its own when this is `false`, which is a fetch of the whole static data
+    /// archive, about 100 MB. Callers that want to ask before spending that, rather than
     /// finding out silently, check this first.
     ///
     /// The agent file is read rather than merely stat-ed, because a cache written by an older build
@@ -579,26 +582,22 @@ impl StaticData {
         self.corporations.get(&name.to_lowercase()).copied()
     }
 
-    /// Get all known corporation names.
-    pub fn corporation_names(&self) -> impl Iterator<Item = &String> {
-        self.corporations.keys()
-    }
-
-    /// Get all known corporation IDs.
+    /// The name of a corporation, or `None` when the id is unknown.
     pub fn corporation_name(&self, corporation_id: i32) -> Option<&String> {
         self.corporation_names_by_id.get(&corporation_id)
     }
 
+    /// Get all known corporation IDs.
     pub fn corporation_ids(&self) -> impl Iterator<Item = i32> {
         self.corporations.values().copied()
     }
 
-    /// Get all known solar system names.
     /// The name of a solar system, or `None` when the id is unknown.
     pub fn system_name(&self, system_id: i32) -> Option<&String> {
         self.systems.get(&system_id).map(|(name, _, _, _)| name)
     }
 
+    /// Get all known solar system names.
     pub fn system_names(&self) -> impl Iterator<Item = &String> {
         self.systems.values().map(|(name, _, _, _)| name)
     }
@@ -1620,8 +1619,6 @@ mod tests {
         (30000145, 30000143),
     ];
 
-    /// A hand-built static data with one constellation of four systems at the true security values
-    /// from the worked example, with the gates as the caller describes them.
     /// One row of a test fixture: id, name, true security, region and constellation.
     type FixtureRow = (i32, (&'static str, f64, i32, i32));
 
@@ -1656,6 +1653,8 @@ mod tests {
         (4, ("D", 0.60, 7, 100)),
     ];
 
+    /// A hand-built static data with one constellation of four systems at the true security values
+    /// from the worked example, with the gates as the caller describes them.
     fn four_system_constellation(edges: &[(i32, i32)]) -> StaticData {
         fixture(&FOUR_SYSTEMS, edges)
     }
@@ -2209,10 +2208,8 @@ mod tests {
 
     #[test]
     fn the_safest_route_is_preferred_and_the_shortest_only_breaks_ties() {
-        // D sits behind C at 0.51 on the direct way, and behind B at 0.50 the other way. The floor
-        // of the direct route is the start's 0.49 either way here, so the shorter route wins; raise
-        // the start to 0.52 and the route through B, whose lowest is 0.50, beats the one through C
-        // at 0.51 only when it is also no longer.
+        // D is two gates away through B and two through C, so the hop count cannot choose between
+        // the routes and only their lowest security can.
         let raised: [FixtureRow; 4] = [
             (1, ("A", 0.56, 7, 100)),
             (2, ("B", 0.55, 7, 100)),
@@ -2334,12 +2331,11 @@ mod tests {
         for path in StaticData::files(&dir) {
             std::fs::write(path, "[]").unwrap();
         }
-        // A version 2 file exists but is stale, which is the case the gate needs to catch.
+        // A version 2 file exists but is stale, which is the case the gate needs to catch. All four
+        // files exist, so a purely existence-based check would say yes and then read a mapping
+        // that is not there.
         std::fs::write(StaticData::security_path(&dir), r#"{"version":2}"#).unwrap();
         assert!(!StaticData::is_cached(&dir), "a stale shape is not cached");
-        // All five files exist, so a purely existence-based check would say yes and then read a
-        // mapping that is not there.
-        assert!(!StaticData::is_cached(&dir));
         std::fs::write(
             StaticData::security_path(&dir),
             format!(r#"{{"version":{AGENT_CACHE_VERSION}}}"#),

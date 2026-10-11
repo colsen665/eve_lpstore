@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 /// Whether an order's location is allowed. With no location set, every order is allowed.
 fn in_locations(locations: Option<&HashSet<i64>>, location_id: i64) -> bool {
-    locations.map_or(true, |set| set.contains(&location_id))
+    locations.is_none_or(|set| set.contains(&location_id))
 }
 
 /// One order on either side of the market for an item in a region.
@@ -58,7 +58,7 @@ pub struct ItemExpense {
 }
 
 /// Full expense breakdown for a loyalty offer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExpenseBreakdown {
     pub offer_id: i32,
     pub lp_cost: i32,
@@ -156,21 +156,5 @@ impl<'a> ExpensesEndpoint<'a> {
             best_price,
             total_cost: best_price * item.quantity as f64,
         })
-    }
-
-    /// Calculate the total ISK expenses for a loyalty offer.
-    ///
-    /// Uses the best (lowest) sell price in the given region for each required
-    /// item, regardless of whether any single order has sufficient volume.
-    pub async fn offer_expenses(
-        &self,
-        offer: &LoyaltyOffer,
-        region_id: i32,
-    ) -> Result<ExpenseBreakdown, EsiError> {
-        let mut item_expenses = Vec::with_capacity(offer.required_items.len());
-        for item in &offer.required_items {
-            item_expenses.push(self.item_expense(item, region_id, None).await?);
-        }
-        Ok(breakdown_from(offer, item_expenses))
     }
 }

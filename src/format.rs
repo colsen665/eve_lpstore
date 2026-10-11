@@ -2,7 +2,7 @@
 pub fn group_digits(digits: &str) -> String {
     let mut grouped = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(c);
@@ -18,6 +18,11 @@ pub fn format_number(value: f64, decimals: usize) -> String {
         Some((int_part, frac_part)) => format!("{}{}.{}", sign, group_digits(int_part), frac_part),
         None => format!("{}{}", sign, group_digits(&text)),
     }
+}
+
+/// [`format_number`] for a value that may be unknown, which reads `n/a`.
+pub fn format_optional(value: Option<f64>, decimals: usize) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format_number(value, decimals))
 }
 
 /// Format an ISK amount, shown in millions or billions when large enough.
@@ -41,6 +46,12 @@ mod tests {
         assert_eq!(format_number(1234567.891, 2), "1,234,567.89");
         assert_eq!(format_number(-1234.5, 1), "-1,234.5");
         assert_eq!(format_number(999.0, 0), "999");
+    }
+
+    #[test]
+    fn an_unknown_value_reads_n_a() {
+        assert_eq!(format_optional(None, 2), "n/a");
+        assert_eq!(format_optional(Some(1234.5), 2), "1,234.50");
     }
 
     #[test]

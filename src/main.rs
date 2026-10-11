@@ -47,7 +47,7 @@ Options:
   --concurrency <n>      Corporation groups priced at once with --lpstores. Default 2x the tokio worker threads.
   --max-inflight <n>     Maximum ESI requests in flight at once across all groups. Default 4.
   --depth <n>            Offers printed per corporation group with --lpstores. Default 10.
-  --verbose              Print cache hits, misses, and writes, with reasons and file names. In the full-screen view, the default when no mode is given, they go to the log, and so do the two lines naming the cache and data directories.
+  --verbose              Print cache hits, misses, and writes, with reasons and file names, and the cache and data directories. In the full-screen view, the default when no mode is given, they go to the log, which names the two directories with or without this flag.
   --clear-cache          Delete the cached ESI responses, and the static data archive if one is on disk. The four extracted static data files stay. With no other mode this stops there rather than opening the full-screen view.
 
 Examples:
@@ -211,7 +211,7 @@ async fn main() {
         }
     };
     // The view draws over stdout, so the paths it needs go to its log instead of the screen it is
-    // about to take over. `eve_lpstore::tui::run` reports both roots there unconditionally.
+    // about to take over. `tui::run` reports both roots there unconditionally.
     if verbose && mode != Mode::Tui {
         println!("Cache: {}", paths.cache.display());
         println!("Static data: {}", paths.data.display());
@@ -460,13 +460,9 @@ async fn run_example(
                 }
             },
         },
-        None => 10000002,
+        None => report::DEFAULT_REGION_ID,
     };
-    let region_label = match sdata.region_name(region_id) {
-        Some(name) => format!("{} ({})", name, region_id),
-        None => region_id.to_string(),
-    };
-    println!("Region: {}", region_label);
+    println!("Region: {}", sdata.region_label(region_id));
 
     let esi = EsiClient::builder()
         .cache_dir(paths.cache.clone())
