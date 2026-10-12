@@ -1359,6 +1359,34 @@ leave the program doing what it did.
       and macOS, some of which time requests against a local server, and every GitHub-side step.
       The first push and the first tag are those checks.
 
+#### A single-thread runtime
+
+- [x] `--single-thread`, the name chosen over `--green`: tokio tasks are green threads on either
+      runtime, and what the flag changes is that the current-thread runtime runs all of them on
+      the thread that calls `block_on`, instead of on a worker per CPU core. `main` is a plain
+      function now, since the runtime has to be chosen before it exists: it answers `--help` and
+      `--version` without one, then builds the runtime, multi-thread with `enable_all` as
+      `#[tokio::main]` did, or current-thread with the flag. The flag is in `FLAGS`, the help, and
+      the usage line.
+- [x] Nothing else had to change, by reading the code: no `block_in_place`, which panics on a
+      current-thread runtime; no nested runtime and no read of the worker count; no lock held
+      across an `.await`, which clippy's `await_holding_lock` would report; and `#[tokio::test]`
+      already runs the async tests on a current-thread runtime. The view's loop runs in
+      `spawn_blocking` and reads finished tasks with `Handle::block_on`, which tokio documents as
+      unable to drive I/O or timers on a current-thread runtime unless another thread is inside
+      `Runtime::block_on`; the main thread is, and a finished task needs neither.
+- [x] Measured fully cached, three runs each way on one warm copy, on this four-core machine:
+      pricing took 0.17 to 0.19 s by default and 0.37 to 0.38 s with `--single-thread`, and the
+      whole run 0.43 to 0.49 s against 0.72 to 0.74 s. The 1,631 printed lines are the same. The
+      most threads seen, sampling every 5 ms, were 49 and 31: by inference mostly tokio's
+      blocking pool, which serves the cache file reads and grows with how many run at once. A cold
+      run is bound by ESI's four requests in flight and was not measured. The view had no live
+      terminal check.
+- [x] Tests: 2 added, for the flag picking the runtime and being documented, and for a finished
+      task being read on a current-thread runtime the way the view reads it. Running that loop on
+      the runtime's own thread instead of a blocking one makes the second fail: the task never
+      runs.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

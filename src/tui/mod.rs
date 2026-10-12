@@ -861,6 +861,41 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_task_is_read_on_a_current_thread_runtime_too() {
+        // As `--single-thread` runs the view: the main thread drives the runtime inside
+        // `block_on`, and the view's loop runs on a blocking thread, starting a task and reading
+        // it with `take_finished`. The task sleeps, so it needs the timer, which only the main
+        // thread's `block_on` drives on this runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let read = runtime.block_on(async {
+            let handle = Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let mut task = Some(handle.spawn(async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    5
+                }));
+                let give_up = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(read) = take_finished(&handle, &mut task) {
+                        return read;
+                    }
+                    assert!(
+                        std::time::Instant::now() < give_up,
+                        "the task never ran while the loop waited"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .await
+            .unwrap()
+        });
+        assert!(matches!(read, Ok(5)));
+    }
+
+    #[test]
     fn a_missing_cache_asks_instead_of_downloading_silently() {
         // The regression this guards: the uncached branch used to report no reason, which read back
         // as success, so the view opened on the filters and never asked.
