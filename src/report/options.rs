@@ -427,18 +427,12 @@ impl LpStoreOptions {
         // Both are resolved the way the market pair is: a number is taken as an ID without checking
         // that it exists, and a name is looked up and refused when nothing answers it.
         let agent_region = self.agent_region.as_deref().and_then(|value| {
-            let id = match value.parse::<i32>() {
+            let id = match region_id(value, sdata, Field::AgentRegion) {
                 Ok(id) => id,
-                Err(_) => match sdata.region_id(value) {
-                    Some(id) => id,
-                    None => {
-                        errors.push(OptionError {
-                            field: Field::AgentRegion,
-                            message: format!("Region '{}' not found", value),
-                        });
-                        return None;
-                    }
-                },
+                Err(error) => {
+                    errors.push(error);
+                    return None;
+                }
             };
             Some(NamedValue {
                 label: sdata.region_label(id),
@@ -495,16 +489,10 @@ impl LpStoreOptions {
         }
 
         let region_id = match self.region.as_deref() {
-            Some(value) => match value.parse::<i32>() {
-                Ok(id) => id,
-                Err(_) => sdata.region_id(value).unwrap_or_else(|| {
-                    errors.push(OptionError {
-                        field: Field::Region,
-                        message: format!("Region '{}' not found", value),
-                    });
-                    DEFAULT_REGION_ID
-                }),
-            },
+            Some(value) => region_id(value, sdata, Field::Region).unwrap_or_else(|error| {
+                errors.push(error);
+                DEFAULT_REGION_ID
+            }),
             None => DEFAULT_REGION_ID,
         };
         let region_label = sdata.region_label(region_id);
@@ -622,6 +610,19 @@ impl Resolved {
             })
             .build()
     }
+}
+
+/// A region given by its ID or its name. A number is taken as an ID without checking that it
+/// exists, as `--region` always has; a name has to be one the static data holds, and the error is
+/// reported on `field`.
+pub fn region_id(value: &str, sdata: &StaticData, field: Field) -> Result<i32, OptionError> {
+    if let Ok(id) = value.parse::<i32>() {
+        return Ok(id);
+    }
+    sdata.region_id(value).ok_or_else(|| OptionError {
+        field,
+        message: format!("Region '{}' not found", value),
+    })
 }
 
 fn parse_option<T>(
@@ -829,6 +830,23 @@ mod tests {
             Some(1),
             "and the view is told one corporation was removed"
         );
+    }
+
+    #[test]
+    fn a_region_is_an_id_as_written_or_a_name_the_data_holds() {
+        let sdata = StaticData::default();
+        assert_eq!(
+            region_id("10000043", &sdata, Field::Region).unwrap(),
+            10000043,
+            "a number is not checked against the data"
+        );
+        let error = region_id("Domain", &sdata, Field::AgentRegion).unwrap_err();
+        assert_eq!(
+            error.field,
+            Field::AgentRegion,
+            "reported on the field asked for"
+        );
+        assert_eq!(error.message, "Region 'Domain' not found");
     }
 
     #[test]

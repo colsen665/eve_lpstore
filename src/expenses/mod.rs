@@ -8,6 +8,19 @@ fn in_locations(locations: Option<&HashSet<i64>>, location_id: i64) -> bool {
     locations.is_none_or(|set| set.contains(&location_id))
 }
 
+/// Why an offer could not be priced: an ESI request failed, or a required item has nothing for sale
+/// where the run prices.
+#[derive(Debug, thiserror::Error)]
+pub enum PricingError {
+    #[error(transparent)]
+    Esi(#[from] EsiError),
+
+    /// Every required item is bought at the lowest sell price, so an item nobody sells leaves the
+    /// offer without a cost. This is an answer from the market, not a failed request.
+    #[error("no sell orders found for type_id {type_id} in region {region_id}")]
+    NoSellOrders { type_id: i32, region_id: i32 },
+}
+
 /// One order on either side of the market for an item in a region.
 #[derive(Debug, Clone)]
 pub struct BookOrder {
@@ -127,7 +140,7 @@ impl<'a> ExpensesEndpoint<'a> {
         item: &RequiredItem,
         region_id: i32,
         locations: Option<&HashSet<i64>>,
-    ) -> Result<ItemExpense, EsiError> {
+    ) -> Result<ItemExpense, PricingError> {
         let orders = self
             .client
             .markets()
@@ -141,12 +154,9 @@ impl<'a> ExpensesEndpoint<'a> {
             .fold(f64::INFINITY, f64::min);
 
         if best_price.is_infinite() {
-            return Err(EsiError::Esi {
-                status: 404,
-                message: format!(
-                    "no sell orders found for type_id {} in region {}",
-                    item.type_id, region_id
-                ),
+            return Err(PricingError::NoSellOrders {
+                type_id: item.type_id,
+                region_id,
             });
         }
 

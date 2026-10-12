@@ -446,15 +446,12 @@ async fn run_example(
 
     // Resolve the region from --region, or default to The Forge
     let region_id = match region {
-        Some(val) => match val.parse::<i32>() {
+        Some(value) => match report::region_id(value, &sdata, Field::Region) {
             Ok(id) => id,
-            Err(_) => match sdata.region_id(val) {
-                Some(id) => id,
-                None => {
-                    eprintln!("Region '{}' not found", val);
-                    std::process::exit(1);
-                }
-            },
+            Err(error) => {
+                eprintln!("{}", error.message);
+                std::process::exit(1);
+            }
         },
         None => report::DEFAULT_REGION_ID,
     };

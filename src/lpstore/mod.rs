@@ -1,7 +1,7 @@
 use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
 use crate::esi::EsiClient;
-use crate::expenses::{breakdown_from, ExpenseBreakdown, ItemExpense, MarketQuote};
+use crate::expenses::{ExpenseBreakdown, ItemExpense, MarketQuote, PricingError, breakdown_from};
 use crate::tasks::run_children;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ impl OfferResult {
 #[derive(Debug)]
 pub struct OfferError {
     pub offer_id: i32,
-    pub error: EsiError,
+    pub error: PricingError,
 }
 
 /// Endpoint for evaluating loyalty store offers.
@@ -100,7 +100,7 @@ enum Child {
 
 /// The output of a subtask of pricing one offer.
 enum Priced {
-    Item(Result<ItemExpense, EsiError>),
+    Item(Result<ItemExpense, PricingError>),
     Reward(Result<MarketQuote, EsiError>),
 }
 
@@ -147,8 +147,11 @@ async fn price_offer(
         match outcome {
             Priced::Item(Ok(item)) => item_expenses.push(item),
             Priced::Reward(Ok(market)) => quote = Some(market),
-            Priced::Item(Err(error)) | Priced::Reward(Err(error)) => {
+            Priced::Item(Err(error)) => {
                 failure.get_or_insert(error);
+            }
+            Priced::Reward(Err(error)) => {
+                failure.get_or_insert(error.into());
             }
         }
     }

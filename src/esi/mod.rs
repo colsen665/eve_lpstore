@@ -213,6 +213,8 @@ pub struct EsiClient {
     inflight: Mutex<HashMap<String, Arc<OnceCell<Arc<PageResult>>>>>,
     request_permits: Semaphore,
     cache_index: Mutex<CacheIndex>,
+    /// When requests may be sent again after ESI's error limit was spent, or `None`.
+    error_limit_until: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl EsiClient {
@@ -233,6 +235,7 @@ impl EsiClient {
             inflight: Mutex::new(HashMap::new()),
             request_permits,
             cache_index: Mutex::new(CacheIndex::default()),
+            error_limit_until: Mutex::new(None),
         }
     }
 
@@ -240,6 +243,40 @@ impl EsiClient {
     fn verbose_log(&self, message: String) {
         if let Some(sink) = &self.config.log {
             sink.send(message);
+        }
+    }
+
+    /// When requests may be sent again, if the error limit is spent and has not yet reset.
+    fn error_limit_hold(&self) -> Option<tokio::time::Instant> {
+        let until = (*self.error_limit_until.lock().unwrap())?;
+        (until > tokio::time::Instant::now()).then_some(until)
+    }
+
+    /// Waits until the error limit has reset, if it is spent.
+    async fn wait_for_error_limit(&self) {
+        while let Some(until) = self.error_limit_hold() {
+            tokio::time::sleep_until(until).await;
+        }
+    }
+
+    /// Holds every request not yet sent for `reset` seconds, the time ESI gave until the error
+    /// window resets, plus one: the header is whole seconds, so the window can end up to a second
+    /// after it says.
+    fn hold_requests(&self, reset: u32) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(u64::from(reset) + 1);
+        let extended = {
+            let mut slot = self.error_limit_until.lock().unwrap();
+            let extends = slot.is_none_or(|current| current < until);
+            if extends {
+                *slot = Some(until);
+            }
+            extends
+        };
+        if extended {
+            self.verbose_log(format!(
+                "[ERROR LIMIT] no errors left in ESI's window; holding requests for {}s",
+                u64::from(reset) + 1
+            ));
         }
     }
 
@@ -654,11 +691,19 @@ impl EsiClient {
             }
 
             let waiting = WaitingGuard::new(self.stats.clone());
-            let permit = self
-                .request_permits
-                .acquire()
-                .await
-                .expect("request semaphore is never closed");
+            // Checked again once a permit is held, since another response may have spent the
+            // error limit while this request waited for one.
+            let permit = loop {
+                self.wait_for_error_limit().await;
+                let permit = self
+                    .request_permits
+                    .acquire()
+                    .await
+                    .expect("request semaphore is never closed");
+                if self.error_limit_hold().is_none() {
+                    break permit;
+                }
+            };
             drop(waiting);
             let in_flight = InFlightGuard::new(self.stats.clone());
             let response = self
@@ -685,11 +730,20 @@ impl EsiClient {
 
             // Update rate limit stats
             if let (Some(remain), Some(reset)) = (remain, reset) {
-                let mut stats = self.stats.lock().unwrap();
-                stats.rate_limit_remain = Some(remain);
-                stats.rate_limit_reset = Some(reset);
+                {
+                    let mut stats = self.stats.lock().unwrap();
+                    stats.rate_limit_remain = Some(remain);
+                    stats.rate_limit_reset = Some(reset);
+                }
+                // With no errors left in the window, ESI answers everything with 420 until it
+                // resets, and a client that keeps sending is misbehaving. Every request not sent
+                // yet is held until then. This response is kept when it succeeded, since its body
+                // is valid; an error at the limit is reported as the limit, as before.
                 if remain == 0 {
-                    return Err(EsiError::RateLimit { remain, reset });
+                    self.hold_requests(reset);
+                    if !status.is_success() {
+                        return Err(EsiError::RateLimit { remain, reset });
+                    }
                 }
             }
 
@@ -1113,6 +1167,109 @@ mod tests {
         );
         assert_eq!(parse_cache_file_name("notes.txt"), None);
         assert_eq!(parse_cache_file_name("markets_1_orders_soon.json"), None);
+    }
+
+    /// A local HTTP server that answers every request with `status`, the two error-limit headers,
+    /// and `body`, and records when each request arrived.
+    async fn serve(
+        status: &'static str,
+        remain: u32,
+        reset: u32,
+        body: &'static str,
+    ) -> (String, Arc<Mutex<Vec<std::time::Instant>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let arrivals = Arc::new(Mutex::new(Vec::new()));
+        let seen = arrivals.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                seen.lock().unwrap().push(std::time::Instant::now());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                     x-esi-error-limit-remain: {remain}\r\nx-esi-error-limit-reset: {reset}\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (base, arrivals)
+    }
+
+    /// A client of `base` with no cache, whose log lines are collected.
+    fn logged_client(base: &str) -> (EsiClient, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let client = EsiClient::builder()
+            .base_url(base)
+            .log(move |line| sink.lock().unwrap().push(line))
+            .build();
+        (client, lines)
+    }
+
+    #[tokio::test]
+    async fn a_success_at_the_error_limit_keeps_its_body_and_holds_the_next_request() {
+        let (base, arrivals) = serve("200 OK", 0, 1, "[1]").await;
+        let (client, lines) = logged_client(&base);
+        let first: Vec<i32> = client
+            .get("universe/types/", &[])
+            .await
+            .expect("a successful body is kept at the limit");
+        assert_eq!(first, [1]);
+        assert_eq!(client.status().rate_limit_remain, Some(0));
+        let second: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
+        assert_eq!(second, [1]);
+        let arrivals = arrivals.lock().unwrap().clone();
+        assert_eq!(arrivals.len(), 2);
+        let gap = arrivals[1] - arrivals[0];
+        assert!(
+            gap >= Duration::from_millis(1900),
+            "the second request waited out the reset and its extra second: {gap:?}"
+        );
+        let lines = lines.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|line| line.starts_with("[ERROR LIMIT]")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_at_the_error_limit_is_reported_as_the_limit() {
+        let (base, _) = serve("404 Not Found", 0, 1, "{}").await;
+        let (client, _) = logged_client(&base);
+        let error = client
+            .get::<Vec<i32>>("universe/types/", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("Rate limit exceeded"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_are_not_held_while_errors_remain() {
+        let (base, arrivals) = serve("200 OK", 50, 30, "[1]").await;
+        let (client, lines) = logged_client(&base);
+        for _ in 0..2 {
+            let _: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
+        }
+        let arrivals = arrivals.lock().unwrap().clone();
+        assert!(arrivals[1] - arrivals[0] < Duration::from_millis(500));
+        assert!(lines.lock().unwrap().is_empty(), "nothing was held");
     }
 
     #[tokio::test]

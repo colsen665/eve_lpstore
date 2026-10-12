@@ -8,7 +8,7 @@ use std::time::Duration;
 
 pub use options::{
     DEFAULT_DEPTH, DEFAULT_REGION_ID, Field, FieldSpec, FilterSummary, LpStoreOptions, NamedValue,
-    OptionError, Parsed, Resolved, SystemSummary,
+    OptionError, Parsed, Resolved, SystemSummary, region_id,
 };
 pub use pipeline::run;
 

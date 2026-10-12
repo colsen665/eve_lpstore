@@ -11,7 +11,7 @@ mod tasks;
 
 pub use esi::error::EsiError;
 pub use esi::{EsiClient, EsiClientBuilder, EsiConfig};
-pub use expenses::{ExpenseBreakdown, ExpensesEndpoint, ItemExpense};
+pub use expenses::{ExpenseBreakdown, ExpensesEndpoint, ItemExpense, PricingError};
 pub use lpstore::{LpStore, OfferError, OfferResult};
 pub use paths::Paths;
 pub use saved_filters::{Loaded, SavedFilters};

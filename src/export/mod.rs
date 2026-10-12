@@ -349,9 +349,8 @@ fn csv_field(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::esi::error::EsiError;
     use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
-    use crate::{ExpenseBreakdown, ItemExpense, OfferError};
+    use crate::{ExpenseBreakdown, ItemExpense, OfferError, PricingError};
 
     /// A run over one group of two corporations, with two priced offers and one that failed.
     fn report() -> Report {
@@ -363,9 +362,9 @@ mod tests {
                     results: vec![offer(30486, 1627.78, true), offer(1, 900.0, false)],
                     errors: vec![OfferError {
                         offer_id: 42,
-                        error: EsiError::Esi {
-                            status: 404,
-                            message: "no sell orders".to_string(),
+                        error: PricingError::NoSellOrders {
+                            type_id: 34,
+                            region_id: 10000002,
                         },
                     }],
                 },

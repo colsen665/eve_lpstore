@@ -1039,6 +1039,33 @@ leave the program doing what it did.
 - [x] Tests: 2 added, for a finished task being read once with a panic reading as an error and a
       running one left alone, and for the editing keys.
 
+#### Small correctness items
+
+- [x] An item nobody sells where the run prices is `PricingError::NoSellOrders`, not an
+      `EsiError::Esi` with a made-up status 404, since no request failed. `OfferError` carries a
+      `PricingError`, whose `Esi` case writes an ESI error exactly as before. The text the CLI,
+      the log, and the JSON export show lost its prefix: `no sell orders found for type_id 87618
+      in region 10000002` where it read `ESI error (status 404): no sell orders found ...`.
+      Checked by output: `--lpstores` over all 283 corporations, before and after against one
+      warm copied cache, differs in exactly the 55 offer-error lines, each by that prefix.
+- [x] `report::region_id` is the one rule for a region given by ID or name: a number is taken as
+      an ID without checking, a name has to be in the static data, and the error names the field.
+      `--region`, `--agent-region`, and `--example` each had their own copy. `--example --region
+      Nowhere` still prints `Region 'Nowhere' not found` and exits 1, checked before and after.
+- [x] A successful response that reports no errors left in ESI's window keeps its body, where it
+      used to be thrown away and returned as a rate-limit error. Every request not sent yet is
+      held until the window resets, the `x-esi-error-limit-reset` seconds plus one, since the
+      header is whole seconds; a request that was waiting for a permit checks again once it has
+      one. A held client logs `[ERROR LIMIT] ... holding requests for Ns` once per hold. An error
+      response at the limit is still reported as the limit. Before, the other requests kept going
+      out into 420 responses and retried them.
+- [x] Tests: 4 added. Three run against a local HTTP server started by the test, so no network is
+      needed: a success at the limit keeps its body and the next request arrives at least 1.9 s
+      later, which fails at 1.2 ms with the hold removed; an error at the limit reads as the
+      limit; and nothing is held while errors remain. The fourth covers `region_id`. The offer
+      error fixtures in the export and the view tests use the new case, and the view's test now
+      pins the logged text.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

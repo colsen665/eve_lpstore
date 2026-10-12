@@ -742,9 +742,8 @@ mod tests {
     use super::*;
     use crate::tui::test_support::{dialog, forge_run, open_prompt, open_prompt_mut, press};
     use crossterm::event::KeyEventState;
-    use eve_lpstore::OfferError;
-    use eve_lpstore::esi::error::EsiError;
     use eve_lpstore::report::Field;
+    use eve_lpstore::{OfferError, PricingError};
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
@@ -885,9 +884,9 @@ mod tests {
         let mut failing = group(1, &[5.0]);
         failing.errors.push(OfferError {
             offer_id: 7,
-            error: EsiError::Esi {
-                status: 404,
-                message: "no sell orders".to_string(),
+            error: PricingError::NoSellOrders {
+                type_id: 34,
+                region_id: 10000002,
             },
         });
         let app = app_with(vec![failing], 10);
@@ -895,7 +894,11 @@ mod tests {
         assert_eq!(app.groups().len(), 1);
         let last = app.log.back().expect("the offer error is logged");
         assert!(last.is_error);
-        assert!(last.text.starts_with("Failed to price offer 7"));
+        assert_eq!(
+            last.text,
+            "Failed to price offer 7: no sell orders found for type_id 34 in region 10000002",
+            "no ESI status, since no request failed"
+        );
     }
 
     #[test]
