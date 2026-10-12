@@ -9,9 +9,10 @@ use tokio::sync::mpsc::UnboundedSender;
 /// The region prices come from when `--region` is not given.
 pub const DEFAULT_REGION_ID: i32 = 10000002;
 const DEFAULT_MAX_INFLIGHT: usize = 4;
-/// Fetch and pricing tasks that run at once when `--tasks` is not given. Enough for every group
-/// of a full run to be priced at once with room left for their offers; the ESI requests they make
-/// are bounded separately, by `--max-inflight`.
+/// Fetch and pricing tasks that run at once when `--tasks` is not given. High, so that work is
+/// ready whenever one of the `--max-inflight` ESI request slots frees, while still bounding the
+/// work in progress. A full run has more groups than this, 71 on 2026-10-12, so the first 64 take
+/// every slot, and offers get spare slots only once the rest have started and groups finish.
 const DEFAULT_TASKS: usize = 64;
 /// The offers printed per corporation group when `--depth` is not given.
 pub const DEFAULT_DEPTH: usize = 10;

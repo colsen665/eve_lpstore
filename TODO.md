@@ -1107,7 +1107,21 @@ leave the program doing what it did.
       The help used to say "corporation groups priced at once", which described only one of
       those; it now says "Fetch and pricing tasks that run at once", and that ESI requests are
       capped separately by `--max-inflight`. 64 lets all 71 groups of a full run start at once
-      bar seven, with the rest of the pool for their offers.
+      bar seven.
+- [x] Corrected: this entry and the `DEFAULT_TASKS` comment first said 64 left "the rest of the
+      pool for their offers". It does not. The first 64 groups take every slot; while groups 65
+      to 71 wait, their queued acquire gets each freed slot first, and offers get spare slots
+      only after that, as groups finish.
+- [x] Why the pool is bounded at all, recorded on 2026-10-12. Throughput is set by the slowest
+      stage, the four ESI requests in flight, and the pool only has to keep work ready for them;
+      at 8, 81% of seconds were at that cap and pricing took 144.0 s, at 64 it took 127.7 s and
+      128.9 s, on different binaries and starting budgets. Nothing was measured at 16 or 32, so
+      64 is shown to be enough, not to be needed. The bound is not there against starvation:
+      without it every request would queue on the client's request semaphore, and tokio's
+      `Semaphore` hands out permits in the order they were asked for, as its `Mutex`, the
+      low-budget gate, does too, so no request would wait forever. What it does bound, by
+      inference rather than measurement, is the work in progress, the memory it holds as the
+      input grows, and the backlog behind a 429 hold.
 - [x] `--concurrency` is not kept as an alias, as chosen, so it is now refused as an unknown
       argument. The renamed field runs through the option table: `Field::Tasks`, and `tasks` in
       `LpStoreOptions`, `Parsed`, and `Resolved`.
