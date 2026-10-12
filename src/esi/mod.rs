@@ -9,9 +9,9 @@ use error::{EsiError, SharedError};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{OnceCell, Semaphore};
@@ -212,6 +212,7 @@ pub struct EsiClient {
     stats: Arc<Mutex<ClientStats>>,
     inflight: Mutex<HashMap<String, Arc<OnceCell<Arc<PageResult>>>>>,
     request_permits: Semaphore,
+    cache_index: Mutex<CacheIndex>,
 }
 
 impl EsiClient {
@@ -231,6 +232,7 @@ impl EsiClient {
             stats: Arc::new(Mutex::new(ClientStats::default())),
             inflight: Mutex::new(HashMap::new()),
             request_permits,
+            cache_index: Mutex::new(CacheIndex::default()),
         }
     }
 
@@ -435,86 +437,48 @@ impl EsiClient {
                 return None;
             }
         };
-        let cache_path = std::path::Path::new(cache_dir);
-
-        // Look for cache files matching this entry
-        let mut entries = match tokio::fs::read_dir(cache_path).await {
-            Ok(entries) => entries,
-            Err(_) => {
-                if self.config.verbose {
-                    self.verbose_log(format!("[CACHE MISS] {} (cache dir not found)", url.path()));
-                }
-                return None;
-            }
-        };
-
-        let mut found_expired = false;
-        let mut found_corrupt = false;
+        let key = format!("{}_{}", entry_type, entry_id);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let mut seen = MissReasons::default();
 
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let filename = entry.file_name().to_string_lossy().to_string();
-            let expected_prefix = format!("{}_{}_", entry_type, entry_id);
-            if !filename.starts_with(&expected_prefix) || !filename.ends_with(".json") {
-                continue;
+        // The index answers a hit without listing the directory. Only a miss lists it again, which
+        // is how a file another process wrote since the last listing is found.
+        let mut found = self.read_indexed(cache_dir, &key, now, &mut seen).await;
+        let mut listed = true;
+        if found.is_none() {
+            listed = self.list_cache(cache_dir).await;
+            found = self.read_indexed(cache_dir, &key, now, &mut seen).await;
+        }
+
+        if let Some((value, effective_expiry)) = found {
+            if self.config.verbose {
+                let remaining = effective_expiry - now;
+                let expiry_dt = chrono::DateTime::from_timestamp(effective_expiry as i64, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| effective_expiry.to_string());
+                self.verbose_log(format!(
+                    "[CACHE HIT] {} → expires {} (in {}s)",
+                    url.path(),
+                    expiry_dt,
+                    remaining
+                ));
             }
-
-            // Extract expiry timestamp from filename (last segment before .json). Files for
-            // other URLs that share the prefix, such as page 2, are skipped.
-            let Some(expiry_str) = filename
-                .strip_prefix(&expected_prefix)
-                .and_then(|rest| rest.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            let Ok(expiry) = expiry_str.parse::<u64>() else {
-                continue;
-            };
-
-            // Check if cache is still valid, allowing the configured extra minutes past expiry
-            let effective_expiry = expiry + self.config.cache_expiry_offset.as_secs();
-            if now < effective_expiry {
-                // Cache is valid, read and return
-                let content = match tokio::fs::read_to_string(entry.path()).await {
-                    Ok(content) => content,
-                    Err(_) => {
-                        found_corrupt = true;
-                        continue;
-                    }
-                };
-                if let Ok(value) = serde_json::from_str(&content) {
-                    if self.config.verbose {
-                        let remaining = effective_expiry - now;
-                        let expiry_dt = chrono::DateTime::from_timestamp(effective_expiry as i64, 0)
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                            .unwrap_or_else(|| effective_expiry.to_string());
-                        self.verbose_log(format!(
-                            "[CACHE HIT] {} → expires {} (in {}s)",
-                            url.path(),
-                            expiry_dt,
-                            remaining
-                        ));
-                    }
-                    return Some(unwrap_cached(value));
-                } else {
-                    found_corrupt = true;
-                }
-            } else {
-                // Cache expired, delete it
-                found_expired = true;
-                let _ = tokio::fs::remove_file(entry.path()).await;
-            }
+            return Some(value);
         }
 
         if self.config.verbose {
-            let reason = if found_expired {
+            if !listed {
+                self.verbose_log(format!("[CACHE MISS] {} (cache dir not found)", url.path()));
+                return None;
+            }
+            let reason = if seen.expired {
                 "entry expired"
-            } else if found_corrupt {
+            } else if seen.corrupt {
                 "entry corrupt"
             } else {
                 "no matching entry"
             };
-            let expected_file = format!("{}_{}_<expiry_timestamp>.json", entry_type, entry_id);
+            let expected_file = format!("{}_<expiry_timestamp>.json", key);
             self.verbose_log(format!(
                 "[CACHE MISS] {} ({}) — expected file: {}",
                 url.path(),
@@ -523,6 +487,64 @@ impl EsiClient {
             ));
         }
         None
+    }
+
+    /// Reads the newest usable file the index holds for `key`, with the time it stops being
+    /// usable. Every expired file for the entry is deleted on the way, a file that has gone from
+    /// disk is dropped from the index, and one that does not read or parse is passed over.
+    async fn read_indexed(
+        &self,
+        dir: &Path,
+        key: &str,
+        now: u64,
+        seen: &mut MissReasons,
+    ) -> Option<((serde_json::Value, Option<u32>), u64)> {
+        let expiries = self.cache_index.lock().unwrap().expiries(key);
+        let offset = self.config.cache_expiry_offset.as_secs();
+        let (usable, expired): (Vec<u64>, Vec<u64>) = expiries
+            .into_iter()
+            .partition(|expiry| now < expiry + offset);
+        for expiry in expired {
+            seen.expired = true;
+            let _ = tokio::fs::remove_file(dir.join(cache_file_name(key, expiry))).await;
+            self.cache_index.lock().unwrap().remove(key, expiry);
+        }
+        for expiry in usable {
+            match tokio::fs::read_to_string(dir.join(cache_file_name(key, expiry))).await {
+                Ok(content) => match serde_json::from_str(&content) {
+                    Ok(value) => return Some((unwrap_cached(value), expiry + offset)),
+                    Err(_) => seen.corrupt = true,
+                },
+                // Removed by something else since the index saw it, such as --clear-cache.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    self.cache_index.lock().unwrap().remove(key, expiry);
+                }
+                Err(_) => seen.corrupt = true,
+            }
+        }
+        None
+    }
+
+    /// Lists the cache directory into the index, keeping what the index already holds, so a file
+    /// this client wrote while the listing ran is not dropped. `false` when the directory cannot
+    /// be read, which is the state before the first write creates it.
+    async fn list_cache(&self, dir: &Path) -> bool {
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+            return false;
+        };
+        let mut found = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            if let Some((key, expiry)) = name.to_str().and_then(parse_cache_file_name) {
+                found.push((key.to_string(), expiry));
+            }
+        }
+        let mut index = self.cache_index.lock().unwrap();
+        index.listings += 1;
+        for (key, expiry) in found {
+            index.insert(key, expiry);
+        }
+        true
     }
 
     /// Caches a response that has already arrived. A write that fails is logged rather than
@@ -588,6 +610,10 @@ impl EsiClient {
         tokio::fs::write(&temp_path, content).await.map_err(EsiError::Io)?;
         tokio::fs::rename(&temp_path, &filepath).await.map_err(EsiError::Io)?;
         self.stats.lock().unwrap().cache_writes += 1;
+        self.cache_index
+            .lock()
+            .unwrap()
+            .insert(format!("{}_{}", entry_type, entry_id), expiry);
 
         if self.config.verbose {
             let now = SystemTime::now()
@@ -716,6 +742,59 @@ impl EsiClient {
             });
         }
     }
+}
+
+/// The cache directory's files by entry: the file name without its `_{expiry}.json` ending, mapped
+/// to the expiries on disk for it. A lookup reads from here, so a hit costs no directory listing.
+/// It is filled by listing the directory on a miss and by the client's own writes.
+#[derive(Debug, Default)]
+struct CacheIndex {
+    entries: HashMap<String, BTreeSet<u64>>,
+    /// How many times the directory has been listed, which is what the tests count.
+    listings: u64,
+}
+
+impl CacheIndex {
+    fn insert(&mut self, key: String, expiry: u64) {
+        self.entries.entry(key).or_default().insert(expiry);
+    }
+
+    fn remove(&mut self, key: &str, expiry: u64) {
+        if let Some(expiries) = self.entries.get_mut(key) {
+            expiries.remove(&expiry);
+            if expiries.is_empty() {
+                self.entries.remove(key);
+            }
+        }
+    }
+
+    /// The expiries on disk for `key`, latest first, so the newest response is read first.
+    fn expiries(&self, key: &str) -> Vec<u64> {
+        self.entries
+            .get(key)
+            .map(|expiries| expiries.iter().rev().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
+/// Why a lookup found nothing usable, for the verbose miss line.
+#[derive(Debug, Default)]
+struct MissReasons {
+    expired: bool,
+    corrupt: bool,
+}
+
+/// The name a cached response is written under.
+fn cache_file_name(key: &str, expiry: u64) -> String {
+    format!("{}_{}.json", key, expiry)
+}
+
+/// Splits a cache file name into its entry and its expiry, or `None` for a file that is not a
+/// cached response, such as the temporary file of a write in progress. A sibling such as page 2
+/// keeps its own entry, `..._page_2`, so it never answers for page 1.
+fn parse_cache_file_name(name: &str) -> Option<(&str, u64)> {
+    let (key, expiry) = name.strip_suffix(".json")?.rsplit_once('_')?;
+    Some((key, expiry.parse().ok()?))
 }
 
 /// `url` asking for `page`, with any page it already named replaced.
@@ -891,6 +970,149 @@ mod tests {
             with_page(&url, 3).as_str(),
             "https://esi.evetech.net/x/?datasource=t&page=3"
         );
+    }
+
+    fn listings(client: &EsiClient) -> u64 {
+        client.cache_index.lock().unwrap().listings
+    }
+
+    fn orders_url(client: &EsiClient, type_id: i32) -> url::Url {
+        client
+            .build_url(
+                "markets/10000002/orders/",
+                &[("type_id", type_id.to_string())],
+            )
+            .unwrap()
+    }
+
+    /// The file name a cached order lookup for `type_id` is written under.
+    fn orders_file(type_id: i32, expiry: u64) -> String {
+        format!("{ORDERS}_type_id_{type_id}_{expiry}.json")
+    }
+
+    #[tokio::test]
+    async fn a_hit_after_the_first_lookup_lists_nothing() {
+        // The cost this index removes: every lookup used to read the whole directory.
+        let dir = scratch_dir("index_hits");
+        let expiry = in_an_hour();
+        for type_id in [34, 35, 36] {
+            std::fs::write(dir.join(orders_file(type_id, expiry)), "[1]").unwrap();
+        }
+        let client = offline_client(&dir);
+        for type_id in [34, 35, 36, 34] {
+            let url = orders_url(&client, type_id);
+            assert!(client.check_cache(&url).await.is_some(), "{type_id}");
+        }
+        assert_eq!(
+            listings(&client),
+            1,
+            "only the first lookup listed the directory"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_file_another_process_writes_is_found_on_the_next_miss() {
+        let dir = scratch_dir("index_other_process");
+        let client = offline_client(&dir);
+        let url = orders_url(&client, 34);
+        assert_eq!(client.check_cache(&url).await, None);
+        // Written behind the client's back, as a second view or a CLI run would.
+        std::fs::write(dir.join(orders_file(34, in_an_hour())), "[7]").unwrap();
+        assert_eq!(
+            client.check_cache(&url).await,
+            Some((serde_json::json!([7]), Some(1)))
+        );
+        assert_eq!(listings(&client), 2, "the miss listed again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_clients_own_write_is_found_without_a_listing() {
+        let dir = scratch_dir("index_own_write");
+        let client = offline_client(&dir);
+        let url = orders_url(&client, 34);
+        client
+            .write_cache(&url, &serde_json::json!([3]), Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.check_cache(&url).await,
+            Some((serde_json::json!([3]), Some(1)))
+        );
+        assert_eq!(listings(&client), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_file_removed_by_something_else_is_a_miss_and_leaves_the_index() {
+        let dir = scratch_dir("index_removed");
+        let file = dir.join(orders_file(34, in_an_hour()));
+        std::fs::write(&file, "[1]").unwrap();
+        let client = offline_client(&dir);
+        let url = orders_url(&client, 34);
+        assert!(client.check_cache(&url).await.is_some());
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(client.check_cache(&url).await, None);
+        assert!(
+            client
+                .cache_index
+                .lock()
+                .unwrap()
+                .expiries(&format!("{ORDERS}_type_id_34"))
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_newest_file_answers_and_expired_ones_are_deleted() {
+        let dir = scratch_dir("index_newest");
+        let now = in_an_hour() - 3600;
+        let expired = dir.join(orders_file(34, now - 10));
+        let older = dir.join(orders_file(34, now + 600));
+        let newer = dir.join(orders_file(34, now + 1200));
+        std::fs::write(&expired, "[0]").unwrap();
+        std::fs::write(&older, "[1]").unwrap();
+        std::fs::write(&newer, "[2]").unwrap();
+        let client = offline_client(&dir);
+        let url = orders_url(&client, 34);
+        assert_eq!(
+            client.check_cache(&url).await,
+            Some((serde_json::json!([2]), Some(1)))
+        );
+        assert!(!expired.exists(), "the expired file is deleted");
+        assert!(older.exists(), "a usable older file is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_missing_cache_directory_is_a_miss() {
+        let dir =
+            std::env::temp_dir().join(format!("eve_lpstore_no_cache_dir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let client = offline_client(&dir);
+        assert_eq!(client.check_cache(&orders_url(&client, 34)).await, None);
+        assert_eq!(listings(&client), 0, "nothing could be listed");
+    }
+
+    #[test]
+    fn only_response_files_name_an_entry() {
+        assert_eq!(
+            parse_cache_file_name("markets_1_orders_datasource_t_1700000000.json"),
+            Some(("markets_1_orders_datasource_t", 1700000000))
+        );
+        assert_eq!(
+            parse_cache_file_name("markets_1_orders_page_2_1700000000.json"),
+            Some(("markets_1_orders_page_2", 1700000000)),
+            "page 2 is its own entry"
+        );
+        assert_eq!(
+            parse_cache_file_name(".markets_1_orders_1700000000.json.4242.tmp"),
+            None
+        );
+        assert_eq!(parse_cache_file_name("notes.txt"), None);
+        assert_eq!(parse_cache_file_name("markets_1_orders_soon.json"), None);
     }
 
     #[tokio::test]

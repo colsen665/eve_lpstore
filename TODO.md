@@ -784,10 +784,11 @@ leave the program doing what it did.
 - [x] Checked by output: `--lpstores` over all 283 corporations, run by the binary from before
       this review and by this one against the same copied cache with `--cache-minutes 1000000`,
       printed the same 2,499 lines apart from the timings, from 24,233 cache hits and no misses.
-- [ ] Observed during that check, and not in any piece: pricing took 78 to 81 seconds in a debug
+- [x] Observed during that check, and not in any piece: pricing took 78 to 81 seconds in a debug
       build with every lookup a cache hit. Each lookup reads the whole cache directory, 3,734
       files at the time, which is the likely cost but was not profiled. Indexing the directory
-      once per client was offered with the ESI piece and not chosen.
+      once per client was offered with the ESI piece and not chosen. Done afterwards; see *The
+      ESI cache index* below.
 
 #### One table for the options that take a value
 
@@ -940,6 +941,45 @@ leave the program doing what it did.
       across all agent systems by the review's measurement; the run and download results arrive
       by `oneshot` polled beside the event channel; the export prompt and the form edit text with
       two copies of the same key handling; and `Session.sdata` is an `Arc` nothing clones.
+
+#### The ESI cache index
+
+- [x] `check_cache` listed the whole cache directory on every lookup, because a cache file's name
+      ends in its expiry and cannot be opened without knowing it. It built a prefix string for
+      every entry it passed and stopped only at a match, so a hit read about half the directory
+      and a miss all of it. A full listing of 2,808 entries measured 3.85 ms in a release build
+      and 8.00 ms in debug, in a scratch crate using the same `tokio::fs::read_dir` loop.
+- [x] Each `EsiClient` now keeps a `CacheIndex`, a map from the file name without its
+      `_{expiry}.json` ending to the expiries on disk for it. A lookup reads from the index, so a
+      hit lists nothing. A miss lists the directory once more before going to the network, which
+      is how a file another process wrote is still found, and every write adds its file. The
+      view builds one client per run, so each run starts from a fresh listing.
+- [x] Chosen over a lock file in the data directory, which was proposed and checked first. The
+      cache directory, not the data directory, is what two processes share and what
+      `--cache-dir` moves. A check at startup only tells the second process about the first. A
+      lock file left by a crash or a Ctrl-C on `--lpstores` would warn and re-list on every later
+      run, unless it were an OS lock, which needs Rust 1.89 against the current 1.88 floor. And
+      the saving is small: the listing on a miss is a few percent of the ESI request after it,
+      about 120 ms in the 54-page live check, and missing another process's file only costs a
+      duplicate request.
+- [x] Behaviour that changed beside the speed: when two usable files exist for one entry, the
+      newest expiry answers, where directory order used to decide; every expired file for the
+      looked-up entry is deleted, not only those the scan passed before a match; and a file that
+      vanished from disk since the index saw it is dropped from the index and counted as a miss
+      rather than as corrupt. The verbose `[CACHE HIT]`, `[CACHE MISS]`, and `[CACHE WRITE]` lines
+      read as before, including `(cache dir not found)` before the first write.
+- [x] Measured on one copied, warm cache of 3,734 files with `--cache-minutes 1000000`, both
+      binaries making 24,233 lookups that all hit: release went from 46.7 s to 2.0 s wall (pricing
+      45.96 s to 1.90 s) and debug from 88.9 s to 9.3 s (87.06 s to 8.58 s), with the same output
+      apart from timings. No profiler is installed, so this attributes the time by before and
+      after rather than by a profile. A cold single-corporation run into an empty directory
+      logged one `cache dir not found`, 205 misses and 206 writes, and 119 hits on files it had
+      just written; the second run hit all 325 lookups.
+- [x] Tests: 7 added, for a hit listing nothing after the first lookup, a file another process
+      wrote being found on the next miss, the client's own write found without a listing, a
+      removed file being a miss that leaves the index, the newest file answering while expired
+      ones are deleted, a missing cache directory, and which file names are entries. The first
+      fails when every lookup is made to list again: 4 listings against 1.
 
 ## Done
 
