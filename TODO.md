@@ -1288,6 +1288,24 @@ leave the program doing what it did.
       stores are now one group, so each holds one offer without a value instead. Keying the join
       on the whole ranked list fails 4 of them.
 
+#### Required-item prices kept for the run
+
+- [x] Observed: a reward lookup and a required-item lookup read the same market orders URL, but a
+      required item is the same lookup for every offer that needs it, and many offers share a few
+      items. Each was a cache file read after the first.
+- [x] `ItemPrices` keeps each required item type's best sell price for one run, in the run's
+      region and stations, which it holds so it cannot be asked for another market. An answer is
+      kept, including that nothing sells the type; a failed request is not, so the next offer
+      that needs the type asks again. Offers asking at the same moment share one lookup, through
+      a `OnceCell` per type. It holds one number per type, so it costs next to no memory; reward
+      lookups keep both sides of the book and are not kept, as offered.
+- [x] Measured fully cached, three runs each on one warm copy: 5,823 cache hits and 0.38 to 0.39 s
+      of pricing before, 3,755 and 0.17 to 0.18 s after. The 1,629 printed lines are the same
+      apart from timings and hit counts.
+- [x] Tests: 3 added, for one lookup per type including an answer that nothing sells it, offers
+      asking at once sharing a lookup, and a failed lookup not being kept. With the memo bypassed
+      the first two fail.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

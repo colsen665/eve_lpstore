@@ -2,7 +2,7 @@ use super::options::Resolved;
 use super::{CacheCounts, Event, FetchSummary, PricingSummary, Report, RunEvent, Store};
 use crate::esi::loyalty::LoyaltyOffer;
 use crate::esi::{ClientStats, EsiClient};
-use crate::expenses::PricingError;
+use crate::expenses::{ItemPrices, PricingError};
 use crate::lpstore::{LpStore, OfferError, OfferResult};
 use crate::tasks::TaskPool;
 use std::collections::{HashMap, HashSet};
@@ -99,6 +99,10 @@ pub async fn run(
 
     let offers = distinct_offers(&stores);
     let offer_count = offers.len();
+    let prices = Arc::new(ItemPrices::new(
+        resolved.region_id,
+        resolved.locations.clone(),
+    ));
     let mut tasks = JoinSet::new();
     let mut task_offers = HashMap::new();
     let price_start = Instant::now();
@@ -108,7 +112,7 @@ pub async fn run(
     });
     for offer in offers {
         let offer_id = offer.offer_id;
-        let lp = LpStore::new(client.clone());
+        let lp = LpStore::new(client.clone(), prices.clone());
         let locations = resolved.locations.clone();
         let region_id = resolved.region_id;
         let task = pool

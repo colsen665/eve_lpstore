@@ -1,7 +1,9 @@
 use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
 use crate::esi::EsiClient;
-use crate::expenses::{ExpenseBreakdown, ItemExpense, MarketQuote, PricingError, breakdown_from};
+use crate::expenses::{
+    ExpenseBreakdown, ItemExpense, ItemPrices, MarketQuote, PricingError, breakdown_from,
+};
 use crate::tasks::Slot;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -47,11 +49,13 @@ pub struct OfferError {
 /// pipeline task that calls it.
 pub(crate) struct LpStore {
     client: Arc<EsiClient>,
+    /// The run's required-item prices, shared by every offer it prices.
+    prices: Arc<ItemPrices>,
 }
 
 impl LpStore {
-    pub(crate) fn new(client: Arc<EsiClient>) -> Self {
-        Self { client }
+    pub(crate) fn new(client: Arc<EsiClient>, prices: Arc<ItemPrices>) -> Self {
+        Self { client, prices }
     }
 
     /// Prices `offer` in the given region, with its reward and each required item as children of
@@ -63,7 +67,15 @@ impl LpStore {
         region_id: i32,
         locations: Option<Arc<HashSet<i64>>>,
     ) -> Result<OfferResult, OfferError> {
-        price_offer(self.client.clone(), slot, offer, region_id, locations).await
+        price_offer(
+            self.client.clone(),
+            self.prices.clone(),
+            slot,
+            offer,
+            region_id,
+            locations,
+        )
+        .await
     }
 }
 
@@ -81,6 +93,7 @@ enum Priced {
 
 async fn price_offer(
     client: Arc<EsiClient>,
+    prices: Arc<ItemPrices>,
     slot: &Slot,
     offer: LoyaltyOffer,
     region_id: i32,
@@ -96,15 +109,13 @@ async fn price_offer(
     let priced = slot
         .run_children(children, move |_slot, child| {
             let client = run_client.clone();
+            let prices = prices.clone();
             let locations = locations.clone();
             async move {
                 match child {
-                    Child::Item(item) => Priced::Item(
-                        client
-                            .expenses()
-                            .item_expense(&item, region_id, locations.as_deref())
-                            .await,
-                    ),
+                    Child::Item(item) => {
+                        Priced::Item(client.expenses().item_expense(&item, &prices).await)
+                    }
                     Child::Reward => Priced::Reward(
                         client
                             .expenses()
