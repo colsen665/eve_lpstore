@@ -24,7 +24,7 @@ pub async fn run(
     };
 
     // One shared pool bounds the offer fetches, the groups, and their offer subtasks together
-    let pool = Arc::new(Semaphore::new(resolved.concurrency));
+    let pool = Arc::new(Semaphore::new(resolved.tasks));
 
     let corp_count = resolved.corp_ids.len();
     let mut fetches = JoinSet::new();

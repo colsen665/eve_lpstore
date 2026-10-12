@@ -1077,10 +1077,8 @@ mod tests {
         );
     }
 
-    /// The re-resolve goes through `resolve`, which reads the runtime's worker count for the
-    /// concurrency default, so this one needs a runtime rather than a plain test.
-    #[tokio::test]
-    async fn a_moved_region_clears_the_leftover_system_and_rebuilds_the_run() {
+    #[test]
+    fn a_moved_region_clears_the_leftover_system_and_rebuilds_the_run() {
         let mut app = App::new(LpStoreOptions {
             system: Some("Jita".to_string()),
             ..Default::default()
@@ -1282,7 +1280,7 @@ mod tests {
             system: None,
             locations: None,
             cache_offset: Duration::from_secs(60),
-            concurrency: 2,
+            tasks: 2,
             max_inflight: 4,
             depth: 10,
             expire: false,

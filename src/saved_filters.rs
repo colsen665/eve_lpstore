@@ -332,20 +332,14 @@ mod tests {
             expire: true,
             verbose: true,
             cache_minutes: Some("90".to_string()),
-            concurrency: Some("8".to_string()),
+            tasks: Some("8".to_string()),
             max_inflight: Some("6".to_string()),
             cache_dir: Some("/tmp/elsewhere".to_string()),
             region: Some("Domain".to_string()),
             ..Default::default()
         };
         let text = serde_json::to_string_pretty(&SavedFilters::from(&options)).unwrap();
-        for name in [
-            "expire",
-            "verbose",
-            "concurrency",
-            "max_inflight",
-            "cache_dir",
-        ] {
+        for name in ["expire", "verbose", "tasks", "max_inflight", "cache_dir"] {
             assert!(!text.contains(name), "{} reached the file: {}", name, text);
         }
         assert!(
@@ -404,7 +398,7 @@ mod tests {
             expire: true,
             verbose: true,
             cache_minutes: Some("90".to_string()),
-            concurrency: Some("8".to_string()),
+            tasks: Some("8".to_string()),
             max_inflight: Some("6".to_string()),
             cache_dir: Some("/tmp/elsewhere".to_string()),
             ..Default::default()
@@ -416,7 +410,7 @@ mod tests {
         );
         assert!(merged.verbose);
         assert_eq!(merged.cache_minutes.as_deref(), Some("90"));
-        assert_eq!(merged.concurrency.as_deref(), Some("8"));
+        assert_eq!(merged.tasks.as_deref(), Some("8"));
         assert_eq!(merged.max_inflight.as_deref(), Some("6"));
         assert_eq!(merged.cache_dir.as_deref(), Some("/tmp/elsewhere"));
     }
@@ -474,9 +468,9 @@ mod tests {
 
     #[test]
     fn a_command_line_only_key_in_the_file_is_ignored() {
-        // Hand-editing `concurrency` into the file must not make it a remembered setting.
-        let filters: SavedFilters = serde_json::from_str("{\"concurrency\": \"8\"}").unwrap();
-        assert_eq!(*filters.value(Field::Concurrency), None);
+        // Hand-editing `tasks` into the file must not make it a remembered setting.
+        let filters: SavedFilters = serde_json::from_str("{\"tasks\": \"8\"}").unwrap();
+        assert_eq!(*filters.value(Field::Tasks), None);
         assert_eq!(filters, SavedFilters::default());
     }
 

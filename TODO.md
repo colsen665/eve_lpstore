@@ -1099,13 +1099,31 @@ leave the program doing what it did.
       which fails with spawning limited to the start (one running at a time against four). One for
       `pricing_order`.
 
+#### Tasks instead of concurrency
+
+- [x] `--concurrency` is `--tasks`, and its default is a fixed 64 instead of twice the tokio
+      worker threads, which was 8 on this four-core machine. The pool it sets bounds every fetch
+      and pricing task together: corporation fetches, groups, offers, and each offer's lookups.
+      The help used to say "corporation groups priced at once", which described only one of
+      those; it now says "Fetch and pricing tasks that run at once", and that ESI requests are
+      capped separately by `--max-inflight`. 64 lets all 71 groups of a full run start at once
+      bar seven, with the rest of the pool for their offers.
+- [x] `--concurrency` is not kept as an alias, as chosen, so it is now refused as an unknown
+      argument. The renamed field runs through the option table: `Field::Tasks`, and `tasks` in
+      `LpStoreOptions`, `Parsed`, and `Resolved`.
+- [x] With a fixed default, `resolve` no longer reads the tokio runtime's worker count, so it no
+      longer has to be called inside a runtime. The five tests that started one for that are plain
+      tests now.
+- [x] Tests: 1 added, for `--concurrency` being refused. The option table's tests pick up the
+      renamed flag on their own, including its line in the help and the usage line.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.
 - [x] Run `--lpstores` across all corporations end to end and check the output and runtime.
 - [x] Make `check_cache` use `tokio::fs` (or `spawn_blocking`) instead of blocking `std::fs` calls inside an async fn.
 - [x] Separate parallelization from the number of in-flight ESI requests:
-  - [x] Parallelization (groups priced at once, `--concurrency`) defaults to 2x the number of tokio runtime worker threads.
+  - [x] Parallelization (groups priced at once, `--concurrency`) defaults to 2x the number of tokio runtime worker threads. Superseded on 2026-10-12: the flag is `--tasks`, with a fixed default of 64; see *Tasks instead of concurrency*.
   - [x] In-flight ESI requests default to 4, set by a separate command line argument (`--max-inflight`).
   - [x] Throttle in-flight requests with an awaitable tokio primitive, such as a `tokio::sync::Semaphore`, if it fits.
 - [x] Corporation and type name lookups from static data.

@@ -45,7 +45,7 @@ Options:
   --expire               Ignore cached responses and call the API again.
   --cache-minutes <n>    Extend how long cached responses are reused, by n minutes past their Expires time. Default 0 for --example, and the number of corporations for --lpstores. Use 0 to turn it off.
   --cache-dir <path>     Where to keep ESI responses, instead of the platform cache directory. The static data does not move with it.
-  --concurrency <n>      Corporation groups priced at once with --lpstores. Default 2x the tokio worker threads.
+  --tasks <n>            Fetch and pricing tasks that run at once with --lpstores. Default 64. The ESI requests they make are capped separately, by --max-inflight.
   --max-inflight <n>     Maximum ESI requests in flight at once across all groups. Default 4.
   --depth <n>            Offers printed per corporation group with --lpstores. Default 10.
   --verbose              Print cache hits, misses, and writes, with reasons and file names, and the cache and data directories. In the full-screen view, the default when no mode is given, they go to the log, which names the two directories with or without this flag.
@@ -74,8 +74,8 @@ Examples:
   eve_lpstore --lpstores --expire --verbose
       Refresh cached responses and show cache activity.
 
-  eve_lpstore --lpstores --concurrency 8
-      Price up to 8 corporation groups at once.
+  eve_lpstore --lpstores --tasks 16
+      Run up to 16 fetch and pricing tasks at once.
 
   eve_lpstore --lpstores --max-inflight 8
       Allow up to 8 ESI requests in flight at once.
@@ -651,6 +651,17 @@ mod tests {
     fn a_value_with_one_leading_dash_is_still_a_value() {
         let options = parse_options(&args("--security -0.5..-0.1")[1..]).unwrap();
         assert_eq!(options.security.as_deref(), Some("-0.5..-0.1"));
+    }
+
+    #[test]
+    fn the_old_concurrency_flag_is_refused() {
+        // Renamed to --tasks without an alias, so a script that still passes it is told.
+        assert_eq!(
+            parse_options(&args("--lpstores --concurrency 8")[1..]),
+            Err("Unknown argument '--concurrency'".to_string())
+        );
+        let options = parse_options(&args("--tasks 8")[1..]).unwrap();
+        assert_eq!(options.tasks.as_deref(), Some("8"));
     }
 
     #[test]

@@ -258,16 +258,16 @@ mod tests {
         // An option the form has no box for comes from the base on apply, whatever the form was
         // built from.
         let built_from = LpStoreOptions {
-            concurrency: Some("8".to_string()),
+            tasks: Some("8".to_string()),
             cache_dir: Some("/tmp/a".to_string()),
             ..Default::default()
         };
         let base = LpStoreOptions {
-            concurrency: Some("2".to_string()),
+            tasks: Some("2".to_string()),
             ..Default::default()
         };
         let options = FilterForm::from_options(&built_from).to_options(&base);
-        assert_eq!(options.concurrency.as_deref(), Some("2"));
+        assert_eq!(options.tasks.as_deref(), Some("2"));
         assert_eq!(options.cache_dir, None);
         for field in FormField::all() {
             assert_ne!(field.label(), "", "{field:?} has a label");

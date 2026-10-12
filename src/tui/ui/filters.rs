@@ -156,7 +156,7 @@ pub(super) fn hint(field: FormField, sdata: &StaticData) -> String {
             "Space toggles. Ignore cached responses and call the API again.".to_string()
         }
         // Set on the command line only, so the form never shows them.
-        FormField::Text(Field::Concurrency | Field::MaxInflight | Field::CacheDir) => String::new(),
+        FormField::Text(Field::Tasks | Field::MaxInflight | Field::CacheDir) => String::new(),
     }
 }
 

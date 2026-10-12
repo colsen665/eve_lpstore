@@ -9,6 +9,10 @@ use tokio::sync::mpsc::UnboundedSender;
 /// The region prices come from when `--region` is not given.
 pub const DEFAULT_REGION_ID: i32 = 10000002;
 const DEFAULT_MAX_INFLIGHT: usize = 4;
+/// Fetch and pricing tasks that run at once when `--tasks` is not given. Enough for every group
+/// of a full run to be priced at once with room left for their offers; the ESI requests they make
+/// are bounded separately, by `--max-inflight`.
+const DEFAULT_TASKS: usize = 64;
 /// The offers printed per corporation group when `--depth` is not given.
 pub const DEFAULT_DEPTH: usize = 10;
 
@@ -33,7 +37,7 @@ pub enum Field {
     AgentSystem,
     System,
     CacheMinutes,
-    Concurrency,
+    Tasks,
     MaxInflight,
     Depth,
     CacheDir,
@@ -69,7 +73,7 @@ impl Field {
         Field::System,
         Field::Depth,
         Field::CacheMinutes,
-        Field::Concurrency,
+        Field::Tasks,
         Field::MaxInflight,
         Field::CacheDir,
     ];
@@ -177,13 +181,13 @@ impl Field {
                 get: |options| &options.cache_minutes,
                 get_mut: |options| &mut options.cache_minutes,
             },
-            Field::Concurrency => FieldSpec {
-                flag: "--concurrency",
+            Field::Tasks => FieldSpec {
+                flag: "--tasks",
                 value_name: "<n>",
                 form_label: None,
-                key: "concurrency",
-                get: |options| &options.concurrency,
-                get_mut: |options| &mut options.concurrency,
+                key: "tasks",
+                get: |options| &options.tasks,
+                get_mut: |options| &mut options.tasks,
             },
             Field::MaxInflight => FieldSpec {
                 flag: "--max-inflight",
@@ -252,7 +256,7 @@ pub struct LpStoreOptions {
     /// defaults to the number of corporations that remain after filtering; zero disables the
     /// extension. The TUI remembers this value in `filters.json` along with its other form fields.
     pub cache_minutes: Option<String>,
-    pub concurrency: Option<String>,
+    pub tasks: Option<String>,
     pub max_inflight: Option<String>,
     pub depth: Option<String>,
     /// Where to keep ESI responses instead of the platform cache directory. The static data does
@@ -269,8 +273,7 @@ pub struct Parsed {
     pub security: Option<SecurityFilter>,
     pub agent_level: Option<i32>,
     pub cache_minutes: Option<u64>,
-    /// `None` means twice the number of tokio worker threads.
-    pub concurrency: Option<usize>,
+    pub tasks: usize,
     pub max_inflight: usize,
     pub depth: usize,
 }
@@ -293,7 +296,7 @@ pub struct Resolved {
     /// Stations that prices come from, when a system is set.
     pub locations: Option<Arc<HashSet<i64>>>,
     pub cache_offset: Duration,
-    pub concurrency: usize,
+    pub tasks: usize,
     pub max_inflight: usize,
     pub depth: usize,
     pub expire: bool,
@@ -349,8 +352,6 @@ impl LpStoreOptions {
     }
 
     /// Checks every option and resolves names to IDs. Returns every problem found.
-    ///
-    /// Must be called inside a tokio runtime, which supplies the default concurrency.
     pub fn resolve(&self, sdata: &StaticData) -> Result<Resolved, Vec<OptionError>> {
         let mut errors = Vec::new();
         let parsed = self.parse_values(&mut errors);
@@ -525,10 +526,6 @@ impl LpStoreOptions {
 
         let cache_offset =
             Duration::from_secs(parsed.cache_minutes.unwrap_or(corp_ids.len() as u64) * 60);
-        let concurrency = parsed
-            .concurrency
-            .unwrap_or_else(|| 2 * tokio::runtime::Handle::current().metrics().num_workers());
-
         Ok(Resolved {
             corp_ids,
             filter_summary,
@@ -540,7 +537,7 @@ impl LpStoreOptions {
             system,
             locations,
             cache_offset,
-            concurrency,
+            tasks: parsed.tasks,
             max_inflight: parsed.max_inflight,
             depth: parsed.depth,
             expire: self.expire,
@@ -568,12 +565,8 @@ impl LpStoreOptions {
                 errors,
                 parse_minutes,
             ),
-            concurrency: parse_option(
-                self.concurrency.as_deref(),
-                Field::Concurrency,
-                errors,
-                parse_count,
-            ),
+            tasks: parse_option(self.tasks.as_deref(), Field::Tasks, errors, parse_count)
+                .unwrap_or(DEFAULT_TASKS),
             max_inflight: parse_option(
                 self.max_inflight.as_deref(),
                 Field::MaxInflight,
@@ -685,9 +678,8 @@ mod tests {
         assert_eq!(fields, [Field::Security, Field::AgentLevel, Field::Depth]);
     }
 
-    // `resolve` asks the runtime for its worker count, so these run inside one.
-    #[tokio::test]
-    async fn an_agent_region_written_as_an_id_needs_no_static_data() {
+    #[test]
+    fn an_agent_region_written_as_an_id_needs_no_static_data() {
         // A numeric region is taken as an ID without checking it exists, exactly as `--region`
         // behaves, so a typo in a number names a region nothing stands in rather than failing to
         // parse. An empty `StaticData` is the state before the archive is fetched.
@@ -714,9 +706,8 @@ mod tests {
         );
     }
 
-    // `resolve` asks the runtime for its worker count, so these run inside one.
-    #[tokio::test]
-    async fn an_agent_region_name_no_data_names_is_refused_on_its_own_field() {
+    #[test]
+    fn an_agent_region_name_no_data_names_is_refused_on_its_own_field() {
         let sdata = StaticData::default();
         let options = LpStoreOptions {
             agent_region: Some("Black Rise".to_string()),
@@ -730,9 +721,8 @@ mod tests {
         assert_eq!(errors[0].message, "Region 'Black Rise' not found");
     }
 
-    // `resolve` asks the runtime for its worker count, so these run inside one.
-    #[tokio::test]
-    async fn an_agent_system_no_data_names_is_refused_with_its_flag() {
+    #[test]
+    fn an_agent_system_no_data_names_is_refused_with_its_flag() {
         // `--agent-system` must name a system the static data holds, as `--system` must, because a
         // name is looked up rather than trusted.
         let sdata = StaticData::default();
@@ -773,7 +763,7 @@ mod tests {
             agent_system: Some("agent_system".to_string()),
             system: Some("system".to_string()),
             cache_minutes: Some("cache_minutes".to_string()),
-            concurrency: Some("concurrency".to_string()),
+            tasks: Some("tasks".to_string()),
             max_inflight: Some("max_inflight".to_string()),
             depth: Some("depth".to_string()),
             cache_dir: Some("cache_dir".to_string()),
@@ -798,9 +788,8 @@ mod tests {
         assert_eq!(Field::from_flag("--tui"), None);
     }
 
-    // `resolve` asks the runtime for its worker count, so these run inside one.
-    #[tokio::test]
-    async fn an_agent_place_filter_narrows_the_corporations_even_on_an_empty_cache() {
+    #[test]
+    fn an_agent_place_filter_narrows_the_corporations_even_on_an_empty_cache() {
         // With no agent rows at all, a corporation list that would otherwise stand is filtered to
         // nothing, which is the honest answer on a cache that cannot confirm an agent stands there.
         let sdata = StaticData::default();
@@ -853,7 +842,7 @@ mod tests {
     fn parse_uses_defaults_when_values_are_missing() {
         let parsed = LpStoreOptions::default().parse().unwrap();
         assert_eq!((parsed.max_inflight, parsed.depth), (4, 10));
-        assert!(parsed.concurrency.is_none());
+        assert_eq!(parsed.tasks, 64);
         assert!(parsed.cache_minutes.is_none());
     }
 }
