@@ -81,6 +81,16 @@ impl Drop for InFlightGuard {
 }
 
 const DEFAULT_BASE_URL: &str = "https://esi.evetech.net";
+
+/// What the program tells ESI and CCP's static data server it is: its name and version, and where
+/// to find whoever runs it, which ESI asks every client to give.
+pub const DEFAULT_USER_AGENT: &str = concat!(
+    "eve_lpstore/",
+    env!("CARGO_PKG_VERSION"),
+    " (+",
+    env!("CARGO_PKG_REPOSITORY"),
+    ")"
+);
 const DEFAULT_DATASOURCE: &str = "tranquility";
 const DEFAULT_LANGUAGE: &str = "en";
 
@@ -124,7 +134,7 @@ impl Default for EsiConfig {
             datasource: DEFAULT_DATASOURCE.to_string(),
             language: DEFAULT_LANGUAGE.to_string(),
             token: None,
-            user_agent: "eve_lpstore/0.1.0".to_string(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
             timeout: Duration::from_secs(30),
             cache_dir: None,
             expire: false,
@@ -1763,6 +1773,48 @@ mod tests {
         for gap in gaps(&arrivals) {
             assert!(gap < Duration::from_millis(100), "{gap:?}");
         }
+    }
+
+    #[test]
+    fn the_user_agent_names_the_version_and_where_to_reach_the_project() {
+        assert_eq!(
+            DEFAULT_USER_AGENT,
+            format!(
+                "eve_lpstore/{} (+{})",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_REPOSITORY")
+            )
+        );
+        assert!(DEFAULT_USER_AGENT.contains("(+https://github.com/"));
+        assert_eq!(EsiConfig::default().user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[tokio::test]
+    async fn every_request_carries_the_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let head = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = "[1]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap().to_ascii_lowercase()
+        });
+        let (client, _) = logged_client(&base);
+        let _: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
+        let head = head.await.unwrap();
+        let expected = format!("user-agent: {}", DEFAULT_USER_AGENT.to_ascii_lowercase());
+        assert!(head.contains(&expected), "{head}");
     }
 
     #[test]

@@ -156,7 +156,13 @@ impl StaticData {
                 source,
             })?;
 
-        let response = reqwest::get(SDE_ZIP_URL).await?.error_for_status()?;
+        let response = reqwest::Client::builder()
+            .user_agent(crate::esi::DEFAULT_USER_AGENT)
+            .build()?
+            .get(SDE_ZIP_URL)
+            .send()
+            .await?
+            .error_for_status()?;
         let bytes = response.bytes().await?;
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..]))?;
 

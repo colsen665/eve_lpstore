@@ -26,6 +26,7 @@ Modes:
                          This is the default when no mode is given and standard output is a terminal;
                          with no terminal it prints the usage line instead.
   --help                 Show this help and exit.
+  --version              Show the version and exit.
 
 Filters (apply to --lpstores):
   --lpstore <id|name,...> Corporations to process, as a comma-separated list of IDs or names. Without it, all corporations are processed.
@@ -105,6 +106,10 @@ async fn main() {
 
     if args.iter().any(|a| a == "--help") {
         print!("{}", HELP_TEXT);
+        return;
+    }
+    if args.iter().any(|a| a == "--version") {
+        println!("{}", version_line());
         return;
     }
 
@@ -215,7 +220,13 @@ const FLAGS: &[&str] = &[
     "--verbose",
     "--clear-cache",
     "--help",
+    "--version",
 ];
+
+/// What `--version` prints, so a bug report can name the release it is against.
+fn version_line() -> String {
+    format!("eve_lpstore {}", env!("CARGO_PKG_VERSION"))
+}
 
 /// Reads the arguments after the program name into options, and refuses one it does not know.
 ///
@@ -633,6 +644,16 @@ mod tests {
                 spec.flag
             );
         }
+    }
+
+    #[test]
+    fn the_version_is_the_packages() {
+        assert_eq!(
+            version_line(),
+            concat!("eve_lpstore ", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(HELP_TEXT.contains("--version"));
+        assert!(parse_options(&args("--lpstores --version")[1..]).is_ok());
     }
 
     #[test]

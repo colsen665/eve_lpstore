@@ -1306,6 +1306,20 @@ leave the program doing what it did.
       asking at once sharing a lookup, and a failed lookup not being kept. With the memo bypassed
       the first two fail.
 
+#### Publishing on GitHub
+
+- [ ] The GitHub location is a placeholder, `OWNER/eve_lpstore`, as chosen. Replace `OWNER` in
+      `Cargo.toml`'s `repository` and in `README.md` once the repository exists; the User-Agent
+      reads the URL from `Cargo.toml`.
+- [x] `cargo fmt` run once over the tree, alone in its commit: 11 hunks in 6 files that predated
+      it. Stable rustfmt 1.10.0 and the nightly one agree, so CI can check `cargo fmt --check`.
+- [x] The User-Agent was a hard-coded `eve_lpstore/0.1.0` with no contact, which ESI asks for, and
+      the static data download sent none at all. Both now send `DEFAULT_USER_AGENT`,
+      `eve_lpstore/<version> (+<repository>)`, built from `Cargo.toml`. A test reads the header
+      off a request to a local server. The download is not covered by a test, since it fetches
+      CCP's whole archive.
+- [x] `--version` prints `eve_lpstore <version>` and exits, after `--help` if both are given.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.
