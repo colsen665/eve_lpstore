@@ -1216,6 +1216,44 @@ leave the program doing what it did.
       checks: freeing the slot before the work runs fails all five, spawning children without a
       slot fails four, and spawning only before the first input fails the freed-slots test.
 
+#### Pricing each offer once
+
+- [x] Observed: each group was priced on its own, so an offer several groups hold was priced once
+      per group. The repeats came from the cache, and every cache hit reads and parses the file:
+      the client keeps no response bodies in memory, and its in-flight map only shares requests
+      running at the same moment. A fully cached run made 24,233 cache hits pricing 71 groups.
+- [x] Corporations whose offers are identical still share a store, but each distinct offer is now
+      priced once, as its own task through `TaskPool::spawn`, with its reward and required items
+      as its children. The results stay in memory as `Arc<OfferResult>`, and each store ranks its
+      offers from them. `Report` holds the stores, the errors, and the groups `Report::regroup`
+      builds for a depth, for now one per store. The view regroups from memory on a depth change,
+      and when a report arrives, since its depth may have changed while the run went on.
+- [x] Ranking: ISK per LP, best first, then offers without a value, with ties to the lower offer
+      ID. Ties used to keep the order of the first corporation's list from ESI. A total order is
+      what lets stores holding the same offers rank them alike, which top-n grouping needs.
+- [x] Errors once per offer, as chosen: the CLI prints them before the groups, the view logs each
+      once, and the JSON export lists them after the groups with the corporations whose stores
+      hold the offer; groups no longer carry `errors`. A pricing task that panics is an offer
+      error now, `pricing task failed: ..`, found by task ID through `join_next_with_id`, as
+      chosen; a panicked group used to drop the whole group. The `GroupFailed` event and the
+      group-failure count are gone.
+- [x] Progress counts offers: `Pricing 3222 offers...`, `Priced 3222 offers in ..`, and in the
+      view `Pricing offers: x / y` and `Finished: N offers priced, G groups`. Largest groups first
+      (`pricing_order`) is removed, since the tasks are offers. The `DEFAULT_TASKS` comment said
+      the first 64 groups take every slot; it now says offers do.
+- [x] Measured fully cached, on one warm copy of the cache: before, 71 groups, 24,233 cache hits,
+      pricing 1.77 s; after, 3,222 offers, 5,823 cache hits, 0.40 s. Reading the cache files
+      beforehand had counted 3,074 distinct offers; the difference was not traced. The same 71
+      groups print in the same order with the same corporations, offer counts, and ISK per LP
+      sequence. Offer order differs only within ties, in 3 groups: two whose ten listed offers
+      have no value, and one with three pairs of equal values; in 2 of them the tie at the end
+      crosses the top-10 cut, so different tied offers are listed. The 50 error lines were 11
+      distinct errors, and the 11 lines now are the same 11. No cold run, as chosen.
+- [x] Tests: 5 added, for each offer priced once in the order first listed, the ranking's
+      tie-break, an offer counted once with every corporation that holds it, a report grouped for
+      the view's depth on arrival, and a failed join naming the ID `spawn` returned. The fixtures
+      build stores through `Report::new` and `Store::new`.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

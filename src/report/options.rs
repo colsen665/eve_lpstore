@@ -11,8 +11,9 @@ pub const DEFAULT_REGION_ID: i32 = 10000002;
 const DEFAULT_MAX_INFLIGHT: usize = 4;
 /// Fetch and pricing tasks that run at once when `--tasks` is not given. High, so that work is
 /// ready whenever one of the `--max-inflight` ESI request slots frees, while still bounding the
-/// work in progress. A full run has more groups than this, 71 on 2026-10-12, so the first 64 take
-/// every slot, and offers get spare slots only once the rest have started and groups finish.
+/// work in progress. A full run prices more offers than this, 3,222 different ones on 2026-10-12,
+/// so offers take every slot while any are left to start, and an offer's own lookups get spare
+/// slots only near the end.
 const DEFAULT_TASKS: usize = 64;
 /// The offers printed per corporation group when `--depth` is not given.
 pub const DEFAULT_DEPTH: usize = 10;

@@ -1,7 +1,7 @@
 use super::*;
 use crate::tui::form::FilterForm;
-use crate::tui::test_support::{forge_run, press, priced_offer, results_app};
-use eve_lpstore::report::{Field, LpStoreOptions, OptionError, Report};
+use crate::tui::test_support::{forge_run, press, priced_offer, report_of, results_app};
+use eve_lpstore::report::{Field, LpStoreOptions, OptionError};
 
 #[test]
 fn wrapping_keeps_the_indent_on_every_row() {
@@ -948,7 +948,7 @@ fn a_re_run_shows_the_progress_popup_over_the_results() {
         "the stage line is in it: {text}"
     );
     assert!(
-        text.contains("Pricing groups") && text.contains("waiting"),
+        text.contains("Pricing offers") && text.contains("waiting"),
         "both bars show, the idle one reading waiting: {text}"
     );
 }
@@ -974,17 +974,11 @@ fn the_first_run_keeps_its_bars_inline() {
 #[test]
 fn the_end_of_a_re_run_waits_for_a_key() {
     let mut app = rerun_app(12, 12);
-    app.finish(Report {
-        groups: vec![Group {
-            corp_ids: vec![1000002],
-            offer_count: 1,
-            results: one_priced_offer(),
-            errors: Vec::new(),
-        }],
-    });
+    app.finish(report_of(one_priced_offer()));
     let text = view_text(&app, 120, 40);
     assert!(
-        text.contains("Finished: 1 groups priced") && text.contains("any key closes this"),
+        text.contains("Finished: 1 offers priced, 1 groups")
+            && text.contains("any key closes this"),
         "the summary is shown, and says how it goes away: {text}"
     );
     // The same state at the smallest size the view accepts. The summary popup is ten rows, so a

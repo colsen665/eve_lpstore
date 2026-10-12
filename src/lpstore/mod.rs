@@ -54,41 +54,16 @@ impl LpStore {
         Self { client }
     }
 
-    /// Price each offer in the given region.
-    ///
-    /// Returns the successful results sorted by ISK per LP descending, with offers
-    /// lacking a value last, and the offers that failed to price.
-    pub(crate) async fn offer_results(
+    /// Prices `offer` in the given region, with its reward and each required item as children of
+    /// `slot`.
+    pub(crate) async fn price(
         &self,
         slot: &Slot,
-        offers: Vec<LoyaltyOffer>,
+        offer: LoyaltyOffer,
         region_id: i32,
         locations: Option<Arc<HashSet<i64>>>,
-    ) -> (Vec<OfferResult>, Vec<OfferError>) {
-        let client = self.client.clone();
-        let outcomes = slot
-            .run_children(offers, move |slot, offer| {
-                price_offer(client.clone(), slot, offer, region_id, locations.clone())
-            })
-            .await;
-
-        let mut results = Vec::new();
-        let mut errors = Vec::new();
-        for outcome in outcomes {
-            match outcome {
-                Ok(result) => results.push(result),
-                Err(error) => errors.push(error),
-            }
-        }
-
-        results.sort_by(|a, b| {
-            b.isk_per_lp
-                .unwrap_or(f64::NEG_INFINITY)
-                .partial_cmp(&a.isk_per_lp.unwrap_or(f64::NEG_INFINITY))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        (results, errors)
+    ) -> Result<OfferResult, OfferError> {
+        price_offer(self.client.clone(), slot, offer, region_id, locations).await
     }
 }
 
@@ -106,7 +81,7 @@ enum Priced {
 
 async fn price_offer(
     client: Arc<EsiClient>,
-    slot: Slot,
+    slot: &Slot,
     offer: LoyaltyOffer,
     region_id: i32,
     locations: Option<Arc<HashSet<i64>>>,

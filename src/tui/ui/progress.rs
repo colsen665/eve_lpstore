@@ -26,7 +26,7 @@ pub(super) fn draw_progress(frame: &mut Frame, area: Rect, app: &App) {
             fetch_done,
             fetch_total,
         );
-        gauge(frame, pricing, "Pricing groups", price_done, price_total);
+        gauge(frame, pricing, "Pricing offers", price_done, price_total);
         (stage, log)
     };
     let style = if app.stage == Stage::Failed {

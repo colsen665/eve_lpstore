@@ -19,6 +19,10 @@ pub enum PricingError {
     /// offer without a cost. This is an answer from the market, not a failed request.
     #[error("no sell orders found for type_id {type_id} in region {region_id}")]
     NoSellOrders { type_id: i32, region_id: i32 },
+
+    /// The task pricing the offer ended without a result, such as by a panic.
+    #[error("pricing task failed: {0}")]
+    TaskFailed(String),
 }
 
 /// One order on either side of the market for an item in a region.

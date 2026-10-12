@@ -7,8 +7,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use eve_lpstore::OfferResult;
 use eve_lpstore::esi::loyalty::LoyaltyOffer;
 use eve_lpstore::expenses::ExpenseBreakdown;
-use eve_lpstore::report::{Group, LpStoreOptions, Report};
+use eve_lpstore::report::{LpStoreOptions, Report, Store};
 use eve_lpstore::static_data::AgentFilter;
+use std::sync::Arc;
 
 /// A key press with no modifiers.
 pub fn press(code: KeyCode) -> KeyEvent {
@@ -65,19 +66,23 @@ pub fn priced_offer(
     }
 }
 
+/// A report whose only store is corporation 1000002's, holding `offers`.
+pub fn report_of(offers: Vec<OfferResult>) -> Report {
+    let offer_ids = offers.iter().map(|result| result.offer.offer_id).collect();
+    let results = offers.into_iter().map(Arc::new).collect();
+    Report::new(
+        vec![Store::new(vec![1000002], offer_ids, results)],
+        Vec::new(),
+        10,
+    )
+}
+
 /// An app on the results view of one finished run, with `offers` as the only group, which is
 /// corporation 1000002.
 pub fn results_app(offers: Vec<OfferResult>, depth: usize) -> App {
     let mut app = App::new(LpStoreOptions::default());
     app.begin_run(forge_run(1), "none".to_string(), depth);
-    app.finish(Report {
-        groups: vec![Group {
-            corp_ids: vec![1000002],
-            offer_count: offers.len(),
-            results: offers,
-            errors: Vec::new(),
-        }],
-    });
+    app.finish(report_of(offers));
     app
 }
 

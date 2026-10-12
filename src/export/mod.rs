@@ -96,6 +96,7 @@ struct ExportFile<'a> {
     filters: &'a str,
     depth: usize,
     groups: Vec<ExportGroup<'a>>,
+    errors: Vec<ExportError<'a>>,
 }
 
 /// One corporation group, as the groups pane lists it.
@@ -106,7 +107,6 @@ struct ExportGroup<'a> {
     offer_count: usize,
     corporations: Vec<ExportCorp<'a>>,
     offers: Vec<ExportOffer<'a>>,
-    errors: Vec<ExportError>,
 }
 
 /// A corporation in the group. The name is `None` when static data does not know the id.
@@ -148,11 +148,13 @@ struct ExportItem<'a> {
     cost: f64,
 }
 
-/// An offer the run could not price.
+/// An offer the run could not price, once however many stores hold it, with the corporations
+/// whose stores do.
 #[derive(Serialize)]
-struct ExportError {
+struct ExportError<'a> {
     offer_id: i32,
     error: String,
+    corporations: Vec<ExportCorp<'a>>,
 }
 
 /// The report as a CSV document, one row per offer, with its group repeated on every row so the
@@ -170,8 +172,8 @@ pub fn csv(report: &Report, context: &ExportContext, sdata: &StaticData) -> Stri
     out
 }
 
-/// The report as a JSON document, in the same order, with the required items and the offers that
-/// failed to price alongside their group.
+/// The report as a JSON document, in the same order, with the required items, and the offers that
+/// failed to price listed once each after the groups.
 pub fn json(report: &Report, context: &ExportContext, sdata: &StaticData) -> String {
     let file = build(report, context, sdata);
     // Every field is a string, a number, a sequence, or an option of those, so this cannot fail.
@@ -202,7 +204,26 @@ fn build<'a>(
             .enumerate()
             .map(|(index, group)| export_group(group, index + 1, context.depth, sdata))
             .collect(),
+        errors: report
+            .errors
+            .iter()
+            .map(|error| ExportError {
+                offer_id: error.offer_id,
+                error: error.error.to_string(),
+                corporations: corporations(&report.corporations_with(error.offer_id), sdata),
+            })
+            .collect(),
     }
+}
+
+fn corporations<'a>(corp_ids: &[i32], sdata: &'a StaticData) -> Vec<ExportCorp<'a>> {
+    corp_ids
+        .iter()
+        .map(|&id| ExportCorp {
+            id,
+            name: sdata.corporation_name(id).map(String::as_str),
+        })
+        .collect()
 }
 
 /// ISK and percentages carry two decimals in practice, and a mean of them is not exact in binary
@@ -225,28 +246,13 @@ fn export_group<'a>(
         rank,
         average_isk_per_lp: money(group.average_isk_per_lp(depth)),
         offer_count: group.offer_count,
-        corporations: group
-            .corp_ids
-            .iter()
-            .map(|&id| ExportCorp {
-                id,
-                name: sdata.corporation_name(id).map(String::as_str),
-            })
-            .collect(),
+        corporations: corporations(&group.corp_ids, sdata),
         offers: group
             .results
             .iter()
             .take(depth)
             .enumerate()
             .map(|(index, result)| export_offer(result, index + 1, sdata))
-            .collect(),
-        errors: group
-            .errors
-            .iter()
-            .map(|error| ExportError {
-                offer_id: error.offer_id,
-                error: error.error.to_string(),
-            })
             .collect(),
     }
 }
@@ -350,40 +356,47 @@ fn csv_field(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
+    use crate::report::Store;
     use crate::{ExpenseBreakdown, ItemExpense, OfferError, PricingError};
+    use std::sync::Arc;
 
-    /// A run over one group of two corporations, with two priced offers and one that failed.
+    /// A run over two stores. The first, of two corporations, has two priced offers and offer 42,
+    /// which failed; the second has one.
     fn report() -> Report {
-        Report {
-            groups: vec![
-                Group {
-                    corp_ids: vec![1000002, 999999],
-                    offer_count: 3,
-                    results: vec![offer(30486, 1627.78, true), offer(1, 900.0, false)],
-                    errors: vec![OfferError {
-                        offer_id: 42,
-                        error: PricingError::NoSellOrders {
-                            type_id: 34,
-                            region_id: 10000002,
-                        },
-                    }],
-                },
-                Group {
-                    corp_ids: vec![1000001],
-                    offer_count: 1,
-                    results: vec![offer(30486, 500.0, false)],
-                    errors: Vec::new(),
-                },
+        let failed = OfferError {
+            offer_id: 42,
+            error: PricingError::NoSellOrders {
+                type_id: 34,
+                region_id: 10000002,
+            },
+        };
+        Report::new(
+            vec![
+                Store::new(
+                    vec![1000002, 999999],
+                    vec![1, 2, 42],
+                    vec![
+                        Arc::new(offer(1, 30486, 1627.78, true)),
+                        Arc::new(offer(2, 1, 900.0, false)),
+                    ],
+                ),
+                Store::new(
+                    vec![1000001],
+                    vec![3],
+                    vec![Arc::new(offer(3, 30486, 500.0, false))],
+                ),
             ],
-        }
+            vec![failed],
+            10,
+        )
     }
 
     /// One priced offer. With `full`, every figure has a value; without it, the market side is
     /// missing, the way it is for a reward nobody sells.
-    fn offer(type_id: i32, isk_per_lp: f64, full: bool) -> OfferResult {
+    fn offer(offer_id: i32, type_id: i32, isk_per_lp: f64, full: bool) -> OfferResult {
         OfferResult {
             offer: LoyaltyOffer {
-                offer_id: 1,
+                offer_id,
                 type_id,
                 quantity: 10,
                 lp_cost: 1800,
@@ -394,7 +407,7 @@ mod tests {
                 }],
             },
             breakdown: ExpenseBreakdown {
-                offer_id: 1,
+                offer_id,
                 lp_cost: 1800,
                 isk_cost: 1_200_000.0,
                 item_expenses: vec![ItemExpense {
@@ -624,19 +637,24 @@ mod tests {
         let context = context(10);
         let parsed: serde_json::Value =
             serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
-        assert_eq!(parsed["groups"][0]["errors"][0]["offer_id"], 42);
+        // Once for the run, not under each group, with the corporations whose store holds it.
+        let errors = parsed["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["offer_id"], 42);
         assert!(
-            parsed["groups"][0]["errors"][0]["error"]
+            errors[0]["error"]
                 .as_str()
                 .unwrap()
                 .contains("no sell orders")
         );
-        assert!(parsed["groups"][1]["errors"].as_array().unwrap().is_empty());
+        assert_eq!(errors[0]["corporations"][0]["id"], 1000002);
+        assert_eq!(errors[0]["corporations"][1]["id"], 999999);
+        assert!(parsed["groups"][0].get("errors").is_none());
     }
 
     #[test]
     fn an_empty_report_still_writes_a_valid_file() {
-        let report = Report { groups: vec![] };
+        let report = Report::new(Vec::new(), Vec::new(), 10);
         let context = context(10);
         assert_eq!(
             csv(&report, &context, &no_names()),

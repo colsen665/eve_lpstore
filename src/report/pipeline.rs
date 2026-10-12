@@ -1,16 +1,19 @@
 use super::options::Resolved;
-use super::{CacheCounts, Event, FetchSummary, Group, PricingSummary, Report, RunEvent};
+use super::{CacheCounts, Event, FetchSummary, PricingSummary, Report, RunEvent, Store};
 use crate::esi::loyalty::LoyaltyOffer;
 use crate::esi::{ClientStats, EsiClient};
-use crate::lpstore::LpStore;
+use crate::expenses::PricingError;
+use crate::lpstore::{LpStore, OfferError, OfferResult};
 use crate::tasks::TaskPool;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 
-/// Fetches the loyalty offers of every corporation in `resolved`, groups the corporations
-/// whose offers are identical, and prices each group.
+/// Fetches the loyalty offers of every corporation in `resolved`, puts the corporations whose
+/// offers are identical in one store, prices each distinct offer once, and groups the stores for
+/// `resolved.depth`.
 ///
 /// Progress goes to `events` as it happens, tagged with `run_id`.
 pub async fn run(
@@ -23,7 +26,7 @@ pub async fn run(
         let _ = events.send(RunEvent { run: run_id, event });
     };
 
-    // One shared pool bounds the offer fetches, the groups, and their offer subtasks together
+    // One shared pool bounds the store fetches, the offers, and their lookups together
     let pool = TaskPool::new(resolved.tasks);
 
     let corp_count = resolved.corp_ids.len();
@@ -65,8 +68,8 @@ pub async fn run(
     }
     fetched.sort_by_key(|(index, _, _)| *index);
 
-    // Group corporations whose offers are identical
-    let mut groups: Vec<PendingGroup> = Vec::new();
+    // Corporations whose offers are identical share one store
+    let mut stores: Vec<PendingStore> = Vec::new();
     for (_, corp_id, result) in fetched {
         let offers = match result {
             Ok(offers) => offers,
@@ -81,9 +84,9 @@ pub async fn run(
         };
         let mut key: Vec<i32> = offers.iter().map(|o| o.offer_id).collect();
         key.sort_unstable();
-        match groups.iter_mut().find(|(k, _, _)| *k == key) {
+        match stores.iter_mut().find(|(k, _, _)| *k == key) {
             Some((_, corps, _)) => corps.push(corp_id),
-            None => groups.push((key, vec![corp_id], offers)),
+            None => stores.push((key, vec![corp_id], offers)),
         }
     }
     let fetch_after = client.status();
@@ -94,80 +97,86 @@ pub async fn run(
         cache: cache_delta(&fetch_before, &fetch_after),
     }));
 
-    pricing_order(&mut groups);
-    let group_count = groups.len();
+    let offers = distinct_offers(&stores);
+    let offer_count = offers.len();
     let mut tasks = JoinSet::new();
+    let mut task_offers = HashMap::new();
     let price_start = Instant::now();
     let price_before = client.status();
     send(Event::PricingStarted {
-        groups: group_count,
+        offers: offer_count,
     });
-    for (_, corp_ids, offers) in groups {
+    for offer in offers {
+        let offer_id = offer.offer_id;
         let lp = LpStore::new(client.clone());
         let locations = resolved.locations.clone();
         let region_id = resolved.region_id;
-        let offer_count = offers.len();
-        pool.spawn(&mut tasks, move |slot| async move {
-            let (results, errors) = lp.offer_results(&slot, offers, region_id, locations).await;
-            Group {
-                corp_ids,
-                offer_count,
-                results,
-                errors,
-            }
-        })
-        .await;
+        let task = pool
+            .spawn(&mut tasks, move |slot| async move {
+                lp.price(&slot, offer, region_id, locations).await
+            })
+            .await;
+        task_offers.insert(task, offer_id);
     }
     send(Event::PricingQueued { tasks: tasks.len() });
 
-    let mut priced = Vec::new();
-    let mut group_failures = 0usize;
+    let mut priced: HashMap<i32, Arc<OfferResult>> = HashMap::new();
+    let mut errors = Vec::new();
     let mut price_done = 0usize;
-    while let Some(joined) = tasks.join_next().await {
+    while let Some(joined) = tasks.join_next_with_id().await {
         price_done += 1;
         match joined {
-            Ok(group) => priced.push(group),
-            Err(e) => {
-                group_failures += 1;
-                send(Event::GroupFailed {
-                    error: e.to_string(),
-                });
+            Ok((_, Ok(result))) => {
+                priced.insert(result.offer.offer_id, Arc::new(result));
             }
+            Ok((_, Err(error))) => errors.push(error),
+            Err(failure) => errors.push(OfferError {
+                offer_id: task_offers[&failure.id()],
+                error: PricingError::TaskFailed(failure.to_string()),
+            }),
         }
         send(Event::PricingProgress {
             done: price_done,
-            total: group_count,
+            total: offer_count,
         });
     }
-    let offer_errors: usize = priced.iter().map(|group| group.errors.len()).sum();
+    errors.sort_by_key(|error| error.offer_id);
     let price_after = client.status();
     send(Event::PricingFinished(PricingSummary {
-        groups: group_count,
+        offers: offer_count,
         elapsed: price_start.elapsed(),
-        offer_errors,
-        group_failures,
+        offer_errors: errors.len(),
         cache: cache_delta(&price_before, &price_after),
     }));
 
-    let mut report = Report { groups: priced };
-    report.sort_by_depth(resolved.depth);
-    report
+    let stores = stores
+        .into_iter()
+        .map(|(offer_ids, corp_ids, _)| {
+            let results = offer_ids
+                .iter()
+                .filter_map(|offer_id| priced.get(offer_id).cloned())
+                .collect();
+            Store::new(corp_ids, offer_ids, results)
+        })
+        .collect();
+    Report::new(stores, errors, resolved.depth)
 }
 
-/// A group waiting to be priced: its offer ids, sorted, which is what makes two corporations one
-/// group; its corporations; and its offers.
-type PendingGroup = (Vec<i32>, Vec<i32>, Vec<LoyaltyOffer>);
+/// A store waiting for its offers to be priced: its offer ids, sorted, which is what makes two
+/// corporations one store; its corporations; and its offers.
+type PendingStore = (Vec<i32>, Vec<i32>, Vec<LoyaltyOffer>);
 
-/// Puts the groups with the most offers first, so the longest lists are started early instead of
-/// being the last work left running. Ties go to the lower first corporation ID, so the order is
-/// the same on every run. The report is sorted by ISK per LP afterwards, so this order is not seen.
-fn pricing_order(groups: &mut [PendingGroup]) {
-    groups.sort_by(|(_, a_corps, a_offers), (_, b_corps, b_offers)| {
-        b_offers
-            .len()
-            .cmp(&a_offers.len())
-            .then_with(|| a_corps[0].cmp(&b_corps[0]))
-    });
+/// Every offer the stores hold, each once, in the order the stores first list them. Pricing
+/// depends only on the offer, the region, and the stations, so an offer many stores hold is still
+/// priced once.
+fn distinct_offers(stores: &[PendingStore]) -> Vec<LoyaltyOffer> {
+    let mut seen = HashSet::new();
+    stores
+        .iter()
+        .flat_map(|(_, _, offers)| offers)
+        .filter(|offer| seen.insert(offer.offer_id))
+        .cloned()
+        .collect()
 }
 
 fn cache_delta(before: &ClientStats, after: &ClientStats) -> CacheCounts {
@@ -182,10 +191,11 @@ fn cache_delta(before: &ClientStats, after: &ClientStats) -> CacheCounts {
 mod tests {
     use super::*;
 
-    fn pending(first_corp: i32, offers: usize) -> PendingGroup {
-        let offers = (0..offers)
-            .map(|offer_id| LoyaltyOffer {
-                offer_id: offer_id as i32,
+    fn store(first_corp: i32, offer_ids: &[i32]) -> PendingStore {
+        let offers = offer_ids
+            .iter()
+            .map(|&offer_id| LoyaltyOffer {
+                offer_id,
                 ..Default::default()
             })
             .collect();
@@ -193,18 +203,16 @@ mod tests {
     }
 
     #[test]
-    fn the_groups_with_the_most_offers_are_priced_first() {
-        let mut groups = vec![
-            pending(30, 3),
-            pending(20, 120),
-            pending(40, 40),
-            pending(10, 120),
+    fn an_offer_several_stores_hold_is_priced_once() {
+        let stores = vec![
+            store(10, &[3, 1, 2]),
+            store(20, &[2, 4]),
+            store(30, &[1, 4, 5]),
         ];
-        pricing_order(&mut groups);
-        let order: Vec<(i32, usize)> = groups
+        let ids: Vec<i32> = distinct_offers(&stores)
             .iter()
-            .map(|(_, corps, offers)| (corps[0], offers.len()))
+            .map(|offer| offer.offer_id)
             .collect();
-        assert_eq!(order, [(10, 120), (20, 120), (40, 40), (30, 3)]);
+        assert_eq!(ids, [3, 1, 2, 4, 5], "each once, in the order first listed");
     }
 }

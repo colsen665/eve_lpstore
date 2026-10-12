@@ -28,6 +28,7 @@ pub enum Stage {
         total: usize,
     },
     Finished {
+        offers: usize,
         groups: usize,
     },
     Failed,
@@ -222,10 +223,10 @@ impl App {
                     total: *total,
                 };
             }
-            Event::PricingStarted { groups } => {
+            Event::PricingStarted { offers } => {
                 self.stage = Stage::Pricing {
                     done: 0,
-                    total: *groups,
+                    total: *offers,
                 };
             }
             Event::PricingProgress { done, total } => {
@@ -241,20 +242,22 @@ impl App {
         }
     }
 
-    /// Stores the finished report and logs its offer errors, as the CLI prints them.
-    pub fn finish(&mut self, report: Report) {
+    /// Stores the finished report and logs its offer errors, as the CLI prints them. The report
+    /// is regrouped for the view's depth, which a depth change during the run may have moved
+    /// away from the run's own.
+    pub fn finish(&mut self, mut report: Report) {
         // Read before `stale` is cleared below: a run that left no earlier results behind had the
         // progress view to itself, and needs no summary over the pane it just filled.
         let superseded = self.stale;
-        for group in &report.groups {
-            for error in &group.errors {
-                self.push_log(LogLine {
-                    text: format!("Failed to price offer {}: {}", error.offer_id, error.error),
-                    is_error: true,
-                });
-            }
+        for error in &report.errors {
+            self.push_log(LogLine {
+                text: format!("Failed to price offer {}: {}", error.offer_id, error.error),
+                is_error: true,
+            });
         }
+        report.regroup(self.depth);
         self.stage = Stage::Finished {
+            offers: report.offer_count(),
             groups: report.groups.len(),
         };
         self.stale = false;
@@ -304,7 +307,7 @@ impl App {
         let selected = self.selected_group().map(|group| group.corp_ids.clone());
         self.depth = depth;
         if let Some(report) = &mut self.report {
-            report.sort_by_depth(depth);
+            report.regroup(depth);
             if let Some(selected) = selected
                 && let Some(index) = report.groups.iter().position(|g| g.corp_ids == selected)
             {
@@ -462,8 +465,10 @@ impl App {
             Stage::Fetching { done, total } => {
                 format!("Fetching loyalty offers: {} / {} corporations", done, total)
             }
-            Stage::Pricing { done, total } => format!("Pricing groups: {} / {}", done, total),
-            Stage::Finished { groups } => format!("Finished: {} groups priced", groups),
+            Stage::Pricing { done, total } => format!("Pricing offers: {} / {}", done, total),
+            Stage::Finished { offers, groups } => {
+                format!("Finished: {} offers priced, {} groups", offers, groups)
+            }
             Stage::Failed => "The run stopped unexpectedly".to_string(),
         }
     }
@@ -477,9 +482,9 @@ impl App {
                 let corporations = self.corporations();
                 ((corporations, corporations), (done, total))
             }
-            Stage::Finished { groups } => {
+            Stage::Finished { offers, .. } => {
                 let corporations = self.corporations();
-                ((corporations, corporations), (groups, groups))
+                ((corporations, corporations), (offers, offers))
             }
         }
     }
@@ -501,6 +506,7 @@ impl App {
             .results
             .get(self.offer)
             .filter(|_| self.offer < self.depth)
+            .map(|result| &**result)
     }
 
     /// The number of offers the offers pane lists for the selected group.
@@ -742,8 +748,9 @@ mod tests {
     use super::*;
     use crate::tui::test_support::{dialog, forge_run, open_prompt, open_prompt_mut, press};
     use crossterm::event::KeyEventState;
-    use eve_lpstore::report::Field;
+    use eve_lpstore::report::{Field, Store};
     use eve_lpstore::{OfferError, PricingError};
+    use std::sync::Arc;
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
@@ -763,19 +770,29 @@ mod tests {
         }
     }
 
-    fn group(corp_id: i32, isk_values: &[f64]) -> Group {
-        let results: Vec<OfferResult> = isk_values.iter().map(|&value| offer(value)).collect();
-        Group {
-            corp_ids: vec![corp_id],
-            offer_count: results.len(),
-            results,
-            errors: Vec::new(),
-        }
+    /// The store of `corp_id`, whose offers have these ISK per LP values. Offer IDs are the
+    /// corporation's times a hundred plus the offer's place, so no two stores share an offer.
+    fn group(corp_id: i32, isk_values: &[f64]) -> Store {
+        let results: Vec<Arc<OfferResult>> = isk_values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let mut result = offer(value);
+                result.offer.offer_id = corp_id * 100 + index as i32;
+                Arc::new(result)
+            })
+            .collect();
+        let offer_ids = results.iter().map(|result| result.offer.offer_id).collect();
+        Store::new(vec![corp_id], offer_ids, results)
     }
 
-    fn app_with(groups: Vec<Group>, depth: usize) -> App {
+    fn report(stores: Vec<Store>, errors: Vec<OfferError>) -> Report {
+        Report::new(stores, errors, 10)
+    }
+
+    fn app_with(stores: Vec<Store>, depth: usize) -> App {
         let mut app = new_app(depth);
-        app.finish(Report { groups });
+        app.finish(report(stores, Vec::new()));
         app
     }
 
@@ -850,7 +867,7 @@ mod tests {
         assert_eq!(app.stage, Stage::Fetching { done: 0, total: 3 });
         app.on_event(&Event::FetchProgress { done: 2, total: 3 }, None);
         assert_eq!(app.stage, Stage::Fetching { done: 2, total: 3 });
-        app.on_event(&Event::PricingStarted { groups: 2 }, None);
+        app.on_event(&Event::PricingStarted { offers: 2 }, None);
         assert_eq!(app.stage, Stage::Pricing { done: 0, total: 2 });
         assert_eq!(app.gauges(), ((3, 3), (0, 2)));
     }
@@ -881,16 +898,22 @@ mod tests {
 
     #[test]
     fn finish_stores_the_report_and_logs_offer_errors() {
-        let mut failing = group(1, &[5.0]);
-        failing.errors.push(OfferError {
+        let error = OfferError {
             offer_id: 7,
             error: PricingError::NoSellOrders {
                 type_id: 34,
                 region_id: 10000002,
             },
-        });
-        let app = app_with(vec![failing], 10);
-        assert_eq!(app.stage, Stage::Finished { groups: 1 });
+        };
+        let mut app = new_app(10);
+        app.finish(report(vec![group(1, &[5.0])], vec![error]));
+        assert_eq!(
+            app.stage,
+            Stage::Finished {
+                offers: 1,
+                groups: 1
+            }
+        );
         assert_eq!(app.groups().len(), 1);
         let last = app.log.back().expect("the offer error is logged");
         assert!(last.is_error);
@@ -976,7 +999,7 @@ mod tests {
         let mut app = new_app(10);
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Groups);
-        app.finish(Report { groups: Vec::new() });
+        app.finish(report(Vec::new(), Vec::new()));
         app.on_key(press(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Offers);
     }
@@ -1372,7 +1395,7 @@ mod tests {
     fn finishing_a_re_run_leaves_the_summary_and_a_key_clears_it() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.start_run(forge_run(3), "none".to_string(), 10);
-        app.finish(Report { groups: vec![] });
+        app.finish(report(Vec::new(), Vec::new()));
         assert!(app.awaiting_run_summary, "the run ended over a report");
         app.on_key(press(KeyCode::Esc));
         assert!(!app.awaiting_run_summary, "any key acknowledged it");
@@ -1400,7 +1423,7 @@ mod tests {
     fn a_newer_run_replaces_the_summary_it_was_given() {
         let mut app = app_with(vec![group(1, &[5.0])], 10);
         app.start_run(forge_run(3), "none".to_string(), 10);
-        app.finish(Report { groups: vec![] });
+        app.finish(report(Vec::new(), Vec::new()));
         assert!(app.awaiting_run_summary);
         app.start_run(forge_run(3), "none".to_string(), 10);
         assert!(
@@ -1416,10 +1439,21 @@ mod tests {
         assert!(app.stale);
         assert_eq!(app.stage, Stage::Starting);
         assert_eq!(app.groups().len(), 1, "the old results stay on screen");
-        app.finish(Report {
-            groups: vec![group(2, &[3.0])],
-        });
+        app.finish(report(vec![group(2, &[3.0])], Vec::new()));
         assert!(!app.stale);
+        assert_eq!(app.groups()[0].corp_ids, vec![2]);
+    }
+
+    #[test]
+    fn a_report_is_grouped_for_the_views_depth_when_it_arrives() {
+        // The run was resolved at depth 1, where corp 1 averages 10 and sorts first, but the view
+        // moved to depth 2 while it ran, where corp 2's 6 beats corp 1's 5.
+        let mut app = new_app(2);
+        app.finish(Report::new(
+            vec![group(1, &[10.0, 0.0]), group(2, &[6.0, 6.0])],
+            Vec::new(),
+            1,
+        ));
         assert_eq!(app.groups()[0].corp_ids, vec![2]);
     }
 

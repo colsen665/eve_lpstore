@@ -4,6 +4,9 @@ mod options;
 mod pipeline;
 
 use crate::lpstore::{OfferError, OfferResult};
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use options::{
@@ -12,35 +15,118 @@ pub use options::{
 };
 pub use pipeline::run;
 
-/// The priced offers for each corporation group, best first.
+/// The priced offers of a run, and the corporation groups they are shown in.
 #[derive(Debug)]
 pub struct Report {
+    /// Corporations whose loyalty stores hold the same offers, each with its offers ranked. The
+    /// groups are built from these, so a new depth regroups without pricing anything again.
+    pub stores: Vec<Store>,
+    /// The offers that failed to price, each once, in offer ID order.
+    pub errors: Vec<OfferError>,
+    /// The groups for the depth last given to [`Report::regroup`], best first.
     pub groups: Vec<Group>,
 }
 
 impl Report {
-    /// Orders the groups by the average ISK per LP over the top `depth` offers, best first,
-    /// with ties broken by the lower first corporation ID.
-    pub fn sort_by_depth(&mut self, depth: usize) {
+    /// A report of `stores` and the offers that failed, grouped for `depth`.
+    pub fn new(stores: Vec<Store>, errors: Vec<OfferError>, depth: usize) -> Self {
+        let mut report = Self {
+            stores,
+            errors,
+            groups: Vec::new(),
+        };
+        report.regroup(depth);
+        report
+    }
+
+    /// Builds the groups for `depth`, one per store, and orders them by the average ISK per LP
+    /// over their top `depth` offers, best first, with ties broken by the lower first
+    /// corporation ID.
+    pub fn regroup(&mut self, depth: usize) {
+        let mut groups: Vec<Group> = self.stores.iter().map(Group::of_store).collect();
         let key = |group: &Group| group.average_isk_per_lp(depth).unwrap_or(f64::NEG_INFINITY);
-        self.groups.sort_by(|a, b| {
+        groups.sort_by(|a, b| {
             key(b)
                 .total_cmp(&key(a))
                 .then_with(|| a.corp_ids[0].cmp(&b.corp_ids[0]))
         });
+        self.groups = groups;
+    }
+
+    /// How many different offers the stores hold, priced or not, which is how many were priced.
+    pub fn offer_count(&self) -> usize {
+        let offers: HashSet<i32> = self
+            .stores
+            .iter()
+            .flat_map(|store| store.offer_ids.iter().copied())
+            .collect();
+        offers.len()
+    }
+
+    /// The corporations whose stores hold `offer_id`, in store order.
+    pub fn corporations_with(&self, offer_id: i32) -> Vec<i32> {
+        self.stores
+            .iter()
+            .filter(|store| store.offer_ids.binary_search(&offer_id).is_ok())
+            .flat_map(|store| store.corp_ids.iter().copied())
+            .collect()
     }
 }
 
-/// Corporations whose loyalty offers are identical, with those offers priced.
+/// Corporations whose loyalty stores hold the same offers, with the priced ones ranked.
+#[derive(Debug, Clone)]
+pub struct Store {
+    pub corp_ids: Vec<i32>,
+    /// Every offer in the store, priced or not, sorted. Equal lists make corporations one store.
+    pub offer_ids: Vec<i32>,
+    /// The offers that priced, in [`ranking`] order.
+    pub results: Vec<Arc<OfferResult>>,
+}
+
+impl Store {
+    /// A store of `corp_ids` holding `offer_ids`, with `results` ranked.
+    pub fn new(
+        corp_ids: Vec<i32>,
+        mut offer_ids: Vec<i32>,
+        mut results: Vec<Arc<OfferResult>>,
+    ) -> Self {
+        offer_ids.sort_unstable();
+        results.sort_by(|a, b| ranking(a, b));
+        Self {
+            corp_ids,
+            offer_ids,
+            results,
+        }
+    }
+}
+
+/// The order offers are listed in: ISK per LP, best first, then offers without a value, with ties
+/// going to the lower offer ID. The tie-break makes it a total order, so the same offers rank the
+/// same way in every store that holds them.
+fn ranking(a: &OfferResult, b: &OfferResult) -> Ordering {
+    let value = |result: &OfferResult| result.isk_per_lp.unwrap_or(f64::NEG_INFINITY);
+    value(b)
+        .total_cmp(&value(a))
+        .then_with(|| a.offer.offer_id.cmp(&b.offer.offer_id))
+}
+
+/// Corporations listed together, with their offers best first.
 #[derive(Debug)]
 pub struct Group {
     pub corp_ids: Vec<i32>,
     pub offer_count: usize,
-    pub results: Vec<OfferResult>,
-    pub errors: Vec<OfferError>,
+    pub results: Vec<Arc<OfferResult>>,
 }
 
 impl Group {
+    fn of_store(store: &Store) -> Self {
+        Self {
+            corp_ids: store.corp_ids.clone(),
+            offer_count: store.offer_ids.len(),
+            results: store.results.clone(),
+        }
+    }
+
     /// The average ISK per LP over the top `depth` priced offers, or `None` when none of them
     /// have a value. Offers without one are left out of the average.
     pub fn average_isk_per_lp(&self, depth: usize) -> Option<f64> {
@@ -87,8 +173,9 @@ pub enum Event {
         error: String,
     },
     FetchFinished(FetchSummary),
+    /// Pricing has started on this many offers, each priced once however many stores hold it.
     PricingStarted {
-        groups: usize,
+        offers: usize,
     },
     /// Every pricing task is queued; this many have not finished yet.
     PricingQueued {
@@ -97,10 +184,6 @@ pub enum Event {
     PricingProgress {
         done: usize,
         total: usize,
-    },
-    /// A pricing task ended without a result, such as a panic.
-    GroupFailed {
-        error: String,
     },
     PricingFinished(PricingSummary),
 }
@@ -123,10 +206,9 @@ pub struct FetchSummary {
 
 #[derive(Debug, Clone)]
 pub struct PricingSummary {
-    pub groups: usize,
+    pub offers: usize,
     pub elapsed: Duration,
     pub offer_errors: usize,
-    pub group_failures: usize,
     pub cache: CacheCounts,
 }
 
@@ -134,21 +216,38 @@ pub struct PricingSummary {
 mod tests {
     use super::*;
 
-    /// A group of `corp_ids` whose offers have these ISK per LP values, in order.
-    fn group(corp_ids: &[i32], isk_per_lp: &[Option<f64>]) -> Group {
-        let results: Vec<OfferResult> = isk_per_lp
+    /// Results with these ISK per LP values, in this order. Offer IDs are `first_id` and up.
+    fn results(first_id: i32, isk_per_lp: &[Option<f64>]) -> Vec<Arc<OfferResult>> {
+        isk_per_lp
             .iter()
-            .map(|&isk_per_lp| OfferResult {
-                isk_per_lp,
-                ..Default::default()
+            .enumerate()
+            .map(|(index, &isk_per_lp)| {
+                let mut result = OfferResult {
+                    isk_per_lp,
+                    ..Default::default()
+                };
+                result.offer.offer_id = first_id + index as i32;
+                Arc::new(result)
             })
-            .collect();
+            .collect()
+    }
+
+    /// A group of `corp_ids` whose offers have these ISK per LP values, in this order.
+    fn group(corp_ids: &[i32], isk_per_lp: &[Option<f64>]) -> Group {
+        let results = results(1, isk_per_lp);
         Group {
             corp_ids: corp_ids.to_vec(),
             offer_count: results.len(),
             results,
-            errors: Vec::new(),
         }
+    }
+
+    /// The store of `corp_ids`, whose offers have these ISK per LP values. Offer IDs start at the
+    /// first corporation's times a hundred, so no two stores share an offer.
+    fn store(corp_ids: &[i32], isk_per_lp: &[Option<f64>]) -> Store {
+        let results = results(corp_ids[0] * 100, isk_per_lp);
+        let offer_ids = results.iter().map(|result| result.offer.offer_id).collect();
+        Store::new(corp_ids.to_vec(), offer_ids, results)
     }
 
     #[test]
@@ -165,10 +264,9 @@ mod tests {
         assert_eq!(group(&[1], &[]).average_isk_per_lp(10), None);
     }
 
-    /// Sorts `groups` with `Report::sort_by_depth` and returns their first corporation IDs.
-    fn sorted_corp_ids(groups: Vec<Group>, depth: usize) -> Vec<i32> {
-        let mut report = Report { groups };
-        report.sort_by_depth(depth);
+    /// Groups `stores` for `depth` and returns the groups' first corporation IDs, in order.
+    fn sorted_corp_ids(stores: Vec<Store>, depth: usize) -> Vec<i32> {
+        let report = Report::new(stores, Vec::new(), depth);
         report.groups.iter().map(|g| g.corp_ids[0]).collect()
     }
 
@@ -176,11 +274,11 @@ mod tests {
     fn groups_sort_best_first_with_ties_by_first_corporation() {
         let order = sorted_corp_ids(
             vec![
-                group(&[30], &[Some(1.0)]),
-                group(&[20], &[]),
-                group(&[10], &[]),
-                group(&[40], &[Some(5.0)]),
-                group(&[15], &[Some(5.0)]),
+                store(&[30], &[Some(1.0)]),
+                store(&[20], &[]),
+                store(&[10], &[]),
+                store(&[40], &[Some(5.0)]),
+                store(&[15], &[Some(5.0)]),
             ],
             10,
         );
@@ -192,8 +290,8 @@ mod tests {
         // [10, 2, 2] averages 4.67 over three offers, while [6, 6, 6] averages 6.
         let order = sorted_corp_ids(
             vec![
-                group(&[30], &[Some(10.0), Some(2.0), Some(2.0)]),
-                group(&[10], &[Some(6.0), Some(6.0), Some(6.0)]),
+                store(&[30], &[Some(10.0), Some(2.0), Some(2.0)]),
+                store(&[10], &[Some(6.0), Some(6.0), Some(6.0)]),
             ],
             3,
         );
@@ -206,8 +304,8 @@ mod tests {
         // corporation ID wins. Their third offers are far apart and must not matter.
         let order = sorted_corp_ids(
             vec![
-                group(&[40], &[Some(10.0), Some(2.0), Some(2.0)]),
-                group(&[15], &[Some(6.0), Some(6.0), Some(0.0)]),
+                store(&[40], &[Some(10.0), Some(2.0), Some(2.0)]),
+                store(&[15], &[Some(6.0), Some(6.0), Some(0.0)]),
             ],
             2,
         );
@@ -219,14 +317,58 @@ mod tests {
         // Only the first offer has a value, so both groups average it alone.
         let order = sorted_corp_ids(
             vec![
-                group(&[40], &[Some(5.0), None, None]),
-                group(&[15], &[Some(5.0), None, None]),
+                store(&[40], &[Some(5.0), None, None]),
+                store(&[15], &[Some(5.0), None, None]),
             ],
             10,
         );
         assert_eq!(order, [15, 40]);
 
-        let order = sorted_corp_ids(vec![group(&[40], &[None, None]), group(&[15], &[None])], 10);
+        let order = sorted_corp_ids(vec![store(&[40], &[None, None]), store(&[15], &[None])], 10);
         assert_eq!(order, [15, 40], "groups with no valued offers sort last");
+    }
+
+    #[test]
+    fn offers_rank_by_isk_per_lp_then_by_offer_id() {
+        // Equal values, and offers without one, keep no order of their own: ties go to the lower
+        // offer ID, so two stores holding the same offers rank them the same way.
+        let value = |offer_id: i32, isk_per_lp: Option<f64>| {
+            let mut result = OfferResult {
+                isk_per_lp,
+                ..Default::default()
+            };
+            result.offer.offer_id = offer_id;
+            Arc::new(result)
+        };
+        let results = vec![
+            value(5, Some(2.0)),
+            value(3, None),
+            value(1, Some(2.0)),
+            value(4, Some(9.0)),
+            value(2, None),
+        ];
+        let store = Store::new(vec![1], vec![5, 3, 1, 4, 2], results);
+        let order: Vec<i32> = store
+            .results
+            .iter()
+            .map(|result| result.offer.offer_id)
+            .collect();
+        assert_eq!(order, [4, 1, 5, 2, 3]);
+        assert_eq!(store.offer_ids, [1, 2, 3, 4, 5], "sorted");
+    }
+
+    #[test]
+    fn an_offer_two_stores_hold_counts_once_and_names_both() {
+        let mut first = store(&[10, 11], &[Some(1.0)]);
+        let mut second = store(&[20], &[Some(1.0)]);
+        // Offer 7 failed to price, so neither store has a result for it.
+        first.offer_ids.push(7);
+        second.offer_ids.push(7);
+        first.offer_ids.sort_unstable();
+        second.offer_ids.sort_unstable();
+        let report = Report::new(vec![first, second], Vec::new(), 10);
+        assert_eq!(report.offer_count(), 3, "1000, 2000, and 7 once");
+        assert_eq!(report.corporations_with(7), [10, 11, 20]);
+        assert_eq!(report.corporations_with(2000), [20]);
     }
 }

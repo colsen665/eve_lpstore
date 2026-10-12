@@ -110,19 +110,17 @@ pub fn message(event: &Event, sdata: &StaticData) -> Option<Message> {
             ),
             false,
         ),
-        Event::PricingStarted { groups } => (format!("Pricing {} groups...", groups), false),
+        Event::PricingStarted { offers } => (format!("Pricing {} offers...", offers), false),
         Event::PricingQueued { tasks } => (
-            format!("Waiting for {} groups to finish pricing...", tasks),
+            format!("Waiting for {} offers to finish pricing...", tasks),
             false,
         ),
-        Event::GroupFailed { error } => (format!("Failed to price a group: {}", error), true),
         Event::PricingFinished(summary) => (
             format!(
-                "Priced {} groups in {:.2}s, {} offer errors, {} group failures, {} cache hits, {} cache misses, {} cache writes",
-                summary.groups,
+                "Priced {} offers in {:.2}s, {} offer errors, {} cache hits, {} cache misses, {} cache writes",
+                summary.offers,
                 summary.elapsed.as_secs_f64(),
                 summary.offer_errors,
-                summary.group_failures,
                 summary.cache.hits,
                 summary.cache.misses,
                 summary.cache.writes
@@ -181,8 +179,12 @@ pub fn status_text(s: &ClientStats) -> String {
     )
 }
 
-/// Prints the groups with up to `depth` offers each. The best group prints last.
+/// Prints the offers that failed, each once, then the groups with up to `depth` offers each. The
+/// best group prints last.
 pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
+    for e in &report.errors {
+        eprintln!("Failed to price offer {}: {}", e.offer_id, e.error);
+    }
     let multiple = resolved.corp_ids.len() > 1;
     let depth = resolved.depth;
     for group in report.groups.iter().rev() {
@@ -193,9 +195,6 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
             }
         }
         println!("Loyalty offers: {} found", group.offer_count);
-        for e in &group.errors {
-            eprintln!("Failed to price offer {}: {}", e.offer_id, e.error);
-        }
 
         println!(
             "Top {} offers by ISK per LP (descending):",

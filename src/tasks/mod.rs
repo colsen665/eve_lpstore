@@ -23,9 +23,10 @@ impl TaskPool {
         }
     }
 
-    /// Waits for a free slot, then spawns `work` on `set`. The task holds the slot until `work`
-    /// finishes, whether or not `work` keeps the [`Slot`] it is given.
-    pub(crate) async fn spawn<T, F, Fut>(&self, set: &mut JoinSet<T>, work: F)
+    /// Waits for a free slot, then spawns `work` on `set`, and returns the task's ID, which a
+    /// failed join names. The task holds the slot until `work` finishes, whether or not `work`
+    /// keeps the [`Slot`] it is given.
+    pub(crate) async fn spawn<T, F, Fut>(&self, set: &mut JoinSet<T>, work: F) -> tokio::task::Id
     where
         T: Send + 'static,
         F: FnOnce(Slot) -> Fut,
@@ -41,7 +42,8 @@ impl TaskPool {
         set.spawn(async move {
             let _permit = permit;
             work.await
-        });
+        })
+        .id()
     }
 
     fn slot(&self) -> Slot {
@@ -220,6 +222,25 @@ mod tests {
         }
         while set.join_next().await.is_some() {}
         assert_eq!(running.most(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_join_names_the_id_spawn_returned() {
+        // The pipeline maps that id back to the offer whose task panicked.
+        let pool = TaskPool::new(2);
+        let mut set = JoinSet::new();
+        let fine = pool.spawn(&mut set, |_slot| async { 1 }).await;
+        let failing = pool
+            .spawn(&mut set, |_slot| async { panic!("pricing went wrong") })
+            .await;
+        assert_ne!(fine, failing);
+        let mut failed = Vec::new();
+        while let Some(joined) = set.join_next_with_id().await {
+            if let Err(error) = joined {
+                failed.push(error.id());
+            }
+        }
+        assert_eq!(failed, [failing]);
     }
 
     #[tokio::test]
