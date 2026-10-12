@@ -214,6 +214,9 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
         download: None,
         paths,
     };
+    // The loop has to stay on a blocking thread. It blocks while it waits for keys, so on a runtime
+    // thread it would hold up the pipeline's tasks, and with --single-thread stop them entirely;
+    // and `take_finished` uses `Handle::block_on`, which panics inside an async context.
     let ui = tokio::task::spawn_blocking(move || {
         let result =
             ratatui::run(|terminal| ui_loop(terminal, &mut app, &mut received, &mut session));
