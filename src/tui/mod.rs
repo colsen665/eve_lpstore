@@ -24,31 +24,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 
 const TICK: Duration = Duration::from_millis(250);
 
-/// One run of the pipeline: its id, its client, the task running it, and the channel that
-/// receives its report.
+/// One run of the pipeline: its id, its client, and the task running it, which returns the
+/// report. The task is taken when its report is read, so it is read once.
 struct Run {
     id: u64,
     client: Arc<EsiClient>,
-    pipeline: JoinHandle<()>,
-    done: Option<oneshot::Receiver<Report>>,
+    pipeline: Option<JoinHandle<Report>>,
 }
 
-/// A static data download in progress, and how it ended.
-struct Download {
-    task: JoinHandle<()>,
-    done: oneshot::Receiver<Result<StaticData, String>>,
-}
+/// A static data download in progress, which returns the data or why it could not be loaded.
+type Download = JoinHandle<Result<StaticData, String>>;
 
 /// What the UI thread needs to start runs. `current` is `None` until the first run is applied, so
 /// the view can open on the filters dialog without having fetched anything.
 struct Session {
     handle: Handle,
-    sdata: Arc<StaticData>,
+    sdata: StaticData,
     paths: Paths,
     events: UnboundedSender<RunEvent>,
     next_id: u64,
@@ -77,18 +72,14 @@ fn spawn_run(
     id: u64,
 ) -> Run {
     let client = Arc::new(resolved.client(cache, id, events.clone()));
-    let (done_tx, done_rx) = oneshot::channel();
     let task_client = client.clone();
     let task_events = events.clone();
-    let pipeline = handle.spawn(async move {
-        let report = report::run(&resolved, task_client, id, task_events).await;
-        let _ = done_tx.send(report);
-    });
+    let pipeline =
+        handle.spawn(async move { report::run(&resolved, task_client, id, task_events).await });
     Run {
         id,
         client,
-        pipeline,
-        done: Some(done_rx),
+        pipeline: Some(pipeline),
     }
 }
 
@@ -96,18 +87,30 @@ fn spawn_run(
 /// rather than on the UI thread because `StaticData::download` is async and `ui_loop` is sync inside
 /// `spawn_blocking`.
 fn spawn_download(session: &mut Session) {
-    let (done_tx, done_rx) = oneshot::channel();
     let data = session.paths.data.clone();
     let task = session.handle.spawn(async move {
-        let result = StaticData::download(&data)
+        StaticData::download(&data)
             .await
-            .map_err(|error| error.to_string());
-        let _ = done_tx.send(result);
+            .map_err(|error| error.to_string())
     });
-    session.download = Some(Download {
-        task,
-        done: done_rx,
-    });
+    session.download = Some(task);
+}
+
+/// What `task` returned, once it has finished, taking it so it is read only once. `None` while it
+/// is still running, or after it was taken. `Err` when the task panicked or was aborted.
+///
+/// The UI loop is not async, so a finished task's output is collected with `block_on`, which
+/// returns at once because the task is done. That is allowed here because the loop runs on a
+/// blocking thread, outside any async context.
+fn take_finished<T>(
+    handle: &Handle,
+    task: &mut Option<JoinHandle<T>>,
+) -> Option<Result<T, JoinError>> {
+    if !task.as_ref()?.is_finished() {
+        return None;
+    }
+    let finished = task.take()?;
+    Some(handle.block_on(finished))
 }
 
 /// The region name the default region id stands for, or the id itself when the static data does not
@@ -187,8 +190,8 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
         .map_err(|error| error.to_string())
         .transpose();
     let (sdata, ask) = match opening(loaded) {
-        Opening::Filters(data) => (Arc::new(*data), None),
-        Opening::Ask { reason } => (Arc::new(StaticData::default()), Some(reason)),
+        Opening::Filters(data) => (*data, None),
+        Opening::Ask { reason } => (StaticData::default(), Some(reason)),
     };
     match ask {
         None => {
@@ -214,11 +217,11 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
     let ui = tokio::task::spawn_blocking(move || {
         let result =
             ratatui::run(|terminal| ui_loop(terminal, &mut app, &mut received, &mut session));
-        if let Some(run) = session.current.take() {
-            run.pipeline.abort();
+        if let Some(pipeline) = session.current.take().and_then(|run| run.pipeline) {
+            pipeline.abort();
         }
         if let Some(download) = session.download.take() {
-            download.task.abort();
+            download.abort();
         }
         result
     });
@@ -250,40 +253,24 @@ fn ui_loop(
             });
             app.on_event(&run_event.event, line);
         }
-        if let Some(receiver) = session.current.as_mut().and_then(|run| run.done.as_mut()) {
-            match receiver.try_recv() {
-                Ok(report) => {
-                    app.finish(report);
-                    if let Some(run) = session.current.as_mut() {
-                        run.done = None;
-                    }
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    app.fail();
-                    if let Some(run) = session.current.as_mut() {
-                        run.done = None;
-                    }
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
+        if let Some(run) = session.current.as_mut()
+            && let Some(finished) = take_finished(&session.handle, &mut run.pipeline)
+        {
+            match finished {
+                Ok(report) => app.finish(report),
+                // The pipeline panicked. A replaced run is aborted, but it is no longer current.
+                Err(_) => app.fail(),
             }
         }
-        if let Some(receiver) = session.download.as_mut().map(|download| &mut download.done) {
-            match receiver.try_recv() {
+        if let Some(finished) = take_finished(&session.handle, &mut session.download) {
+            match finished {
                 Ok(Ok(data)) => {
-                    session.download = None;
-                    session.sdata = Arc::new(data);
+                    session.sdata = data;
                     let form = startup_form(app, &session.sdata);
                     app.download_finished(form);
                 }
-                Ok(Err(reason)) => {
-                    session.download = None;
-                    app.download_failed(reason);
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    session.download = None;
-                    app.download_failed("the download was stopped".to_string());
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
+                Ok(Err(reason)) => app.download_failed(reason),
+                Err(_) => app.download_failed("the download was stopped".to_string()),
             }
         }
 
@@ -519,8 +506,8 @@ fn apply(app: &mut App, session: &mut Session) {
             resolved,
             id,
         );
-        if let Some(previous) = session.current.replace(next) {
-            previous.pipeline.abort();
+        if let Some(pipeline) = session.current.replace(next).and_then(|run| run.pipeline) {
+            pipeline.abort();
         }
         app.start_run(info, filter_summary(&options), depth);
     }
@@ -828,6 +815,49 @@ mod tests {
             "neither root line is an error"
         );
         assert_eq!(app.data_dir, "/home/user/.local/share/eve_lpstore");
+    }
+
+    #[test]
+    fn a_finished_task_is_read_once_and_a_panic_reads_as_an_error() {
+        // `take_finished` is what replaced the oneshot channels, and it runs outside any async
+        // context, as the UI loop does.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let handle = runtime.handle().clone();
+        fn wait<T>(task: &Option<JoinHandle<T>>) {
+            while !task.as_ref().unwrap().is_finished() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let mut done = Some(handle.spawn(async { 5 }));
+        wait(&done);
+        assert!(matches!(take_finished(&handle, &mut done), Some(Ok(5))));
+        assert!(done.is_none(), "taken");
+        assert!(
+            take_finished(&handle, &mut done).is_none(),
+            "and read only once"
+        );
+
+        let mut panicked = Some(handle.spawn(async {
+            if true {
+                panic!("a pipeline that panics, on purpose");
+            }
+        }));
+        wait(&panicked);
+        assert!(matches!(
+            take_finished(&handle, &mut panicked),
+            Some(Err(_))
+        ));
+
+        let mut running = Some(handle.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+        assert!(
+            take_finished(&handle, &mut running).is_none(),
+            "still running"
+        );
+        assert!(running.is_some(), "and not taken");
+        running.unwrap().abort();
     }
 
     #[test]

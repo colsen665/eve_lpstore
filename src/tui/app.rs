@@ -566,10 +566,14 @@ impl App {
         if is_ctrl_c(&key) {
             return Action::Quit;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if let Some(edit) = Edit::of(&key) {
+            match edit {
+                Edit::Type(c) => self.form.type_char(c),
+                Edit::Backspace => self.form.backspace(),
+                Edit::Clear => self.form.clear_focused(),
+            }
+            return Action::Continue;
+        }
         match key.code {
             KeyCode::Esc => {
                 // The form the view opens on is the only thing between the user and a run, so
@@ -583,9 +587,6 @@ impl App {
             KeyCode::Enter => return Action::Apply,
             KeyCode::Tab | KeyCode::Down => self.form.next_field(),
             KeyCode::BackTab | KeyCode::Up => self.form.previous_field(),
-            KeyCode::Backspace => self.form.backspace(),
-            KeyCode::Char('u') if ctrl => self.form.clear_focused(),
-            KeyCode::Char(c) if plain => self.form.type_char(c),
             _ => {}
         }
         Action::Continue
@@ -603,30 +604,15 @@ impl App {
         let Overlay::Export(prompt) = &mut self.overlay else {
             return Action::Continue;
         };
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        match key.code {
-            KeyCode::Enter => {
-                if ExportRequest::parse(&prompt.path).is_some() {
-                    prompt.error = None;
-                    return Action::Export;
-                }
-                prompt.error = Some("Use a file name ending in .csv or .json".to_string());
-            }
-            KeyCode::Backspace => {
-                prompt.path.pop();
+        if let Some(edit) = Edit::of(&key) {
+            edit.apply(&mut prompt.path);
+            prompt.error = None;
+        } else if key.code == KeyCode::Enter {
+            if ExportRequest::parse(&prompt.path).is_some() {
                 prompt.error = None;
+                return Action::Export;
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                prompt.path.clear();
-                prompt.error = None;
-            }
-            KeyCode::Char(c) if plain => {
-                prompt.path.push(c);
-                prompt.error = None;
-            }
-            _ => {}
+            prompt.error = Some("Use a file name ending in .csv or .json".to_string());
         }
         Action::Continue
     }
@@ -682,6 +668,41 @@ impl App {
                 let max = self.detail_rows.saturating_sub(self.detail_visible);
                 self.detail_scroll = shift(self.detail_scroll, delta, max);
             }
+        }
+    }
+}
+
+/// What a key does to a line of text being typed, shared by the filter form and the export prompt:
+/// Backspace removes the last character, Ctrl+U clears the line, and a character typed without
+/// Ctrl or Alt is added. `None` for every other key, which the prompt handles itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Type(char),
+    Backspace,
+    Clear,
+}
+
+impl Edit {
+    fn of(key: &KeyEvent) -> Option<Edit> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Backspace => Some(Edit::Backspace),
+            KeyCode::Char('u') if ctrl => Some(Edit::Clear),
+            KeyCode::Char(c) if plain => Some(Edit::Type(c)),
+            _ => None,
+        }
+    }
+
+    fn apply(self, text: &mut String) {
+        match self {
+            Edit::Type(c) => text.push(c),
+            Edit::Backspace => {
+                text.pop();
+            }
+            Edit::Clear => text.clear(),
         }
     }
 }
@@ -757,6 +778,44 @@ mod tests {
         let mut app = new_app(depth);
         app.finish(Report { groups });
         app
+    }
+
+    #[test]
+    fn the_editing_keys_are_read_the_same_way_in_both_prompts() {
+        let with = |code, modifiers| Edit::of(&KeyEvent::new(code, modifiers));
+        assert_eq!(
+            with(KeyCode::Char('q'), KeyModifiers::NONE),
+            Some(Edit::Type('q'))
+        );
+        assert_eq!(
+            with(KeyCode::Char('Q'), KeyModifiers::SHIFT),
+            Some(Edit::Type('Q')),
+            "Shift still types"
+        );
+        assert_eq!(
+            with(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            Some(Edit::Clear)
+        );
+        assert_eq!(
+            with(KeyCode::Backspace, KeyModifiers::NONE),
+            Some(Edit::Backspace)
+        );
+        assert_eq!(
+            with(KeyCode::Char('x'), KeyModifiers::ALT),
+            None,
+            "Alt types nothing"
+        );
+        assert_eq!(
+            with(KeyCode::Enter, KeyModifiers::NONE),
+            None,
+            "Enter is the prompt's own"
+        );
+        let mut text = "Jita".to_string();
+        Edit::Backspace.apply(&mut text);
+        Edit::Type('x').apply(&mut text);
+        assert_eq!(text, "Jitx");
+        Edit::Clear.apply(&mut text);
+        assert_eq!(text, "");
     }
 
     #[test]

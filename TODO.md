@@ -937,10 +937,11 @@ leave the program doing what it did.
 - [x] Tests: 3 added and 1 replaced, for each pair reading its own fields, each layout's column
       titles and widths, and only the spread and imbalance cells being coloured; the length check
       between the three old lists is gone with the lists.
-- [ ] Not done here, and noted by the review: `mission_spread` runs on every redraw, 6.9 ms
+- [x] Not done here, and noted by the review: `mission_spread` runs on every redraw, 6.9 ms
       across all agent systems by the review's measurement; the run and download results arrive
       by `oneshot` polled beside the event channel; the export prompt and the form edit text with
-      two copies of the same key handling; and `Session.sdata` is an `Arc` nothing clones.
+      two copies of the same key handling; and `Session.sdata` is an `Arc` nothing clones. Done or
+      closed afterwards; see *TUI follow-ups* below.
 
 #### The ESI cache index
 
@@ -1016,6 +1017,27 @@ leave the program doing what it did.
       removed; the three cache tests moved from `is_cached` and `agent_cache_version` to
       `load_cached` and the parse of the text, and the damaged-file test no longer has a path to a
       download.
+
+#### TUI follow-ups
+
+- [x] A run and a download each return their result from the task, and the UI loop reads it with
+      `take_finished` once the `JoinHandle` reports it is finished: `block_on` on a finished task
+      returns at once, and is allowed because the loop runs on a blocking thread. This replaces a
+      `oneshot` channel per task beside its handle, and the two `run.done = None` writes through a
+      second borrow. A task that panicked still reads as a failure, through the `JoinError`.
+- [x] `Edit` decodes Backspace, Ctrl+U, and a character typed without Ctrl or Alt once, for both
+      the filter form and the export prompt, which had each written the same three arms and the
+      same modifier test.
+- [x] `Session.sdata` is a plain `StaticData`. The `Arc` around it was never cloned.
+- [x] Closed without a change: caching `mission_spread`. The review measured 6.9 ms across all
+      1,239 agent systems, a few microseconds each, so a cache would save microseconds per
+      redraw.
+- [x] Checked in a pseudo-terminal at 120x40 against temporary homes: a one-corporation run against
+      a copied cache drew its results, and `e` then Enter wrote the export, which needs the report
+      the run handed over; with no static data, Enter in the dialog showed the download, then the
+      filters dialog, and wrote the four files. Both sessions exited 0.
+- [x] Tests: 2 added, for a finished task being read once with a panic reading as an error and a
+      running one left alone, and for the editing keys.
 
 ## Done
 
