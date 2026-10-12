@@ -12,7 +12,7 @@ mod tasks;
 pub use esi::error::EsiError;
 pub use esi::{EsiClient, EsiClientBuilder, EsiConfig};
 pub use expenses::{ExpenseBreakdown, ExpensesEndpoint, ItemExpense, PricingError};
-pub use lpstore::{LpStore, OfferError, OfferResult};
+pub use lpstore::{OfferError, OfferResult};
 pub use paths::Paths;
 pub use saved_filters::{Loaded, SavedFilters};
 pub use static_data::StaticData;

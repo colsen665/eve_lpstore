@@ -2,10 +2,9 @@ use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
 use crate::esi::EsiClient;
 use crate::expenses::{ExpenseBreakdown, ItemExpense, MarketQuote, PricingError, breakdown_from};
-use crate::tasks::run_children;
+use crate::tasks::Slot;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 
 /// The calculated expenses, reward, and profit for a loyalty offer.
 ///
@@ -44,33 +43,34 @@ pub struct OfferError {
     pub error: PricingError,
 }
 
-/// Endpoint for evaluating loyalty store offers.
-pub struct LpStore {
+/// Endpoint for evaluating loyalty store offers. Crate-only, since it prices on the slot of the
+/// pipeline task that calls it.
+pub(crate) struct LpStore {
     client: Arc<EsiClient>,
-    pool: Arc<Semaphore>,
 }
 
 impl LpStore {
-    pub fn new(client: Arc<EsiClient>, pool: Arc<Semaphore>) -> Self {
-        Self { client, pool }
+    pub(crate) fn new(client: Arc<EsiClient>) -> Self {
+        Self { client }
     }
 
     /// Price each offer in the given region.
     ///
     /// Returns the successful results sorted by ISK per LP descending, with offers
     /// lacking a value last, and the offers that failed to price.
-    pub async fn offer_results(
+    pub(crate) async fn offer_results(
         &self,
+        slot: &Slot,
         offers: Vec<LoyaltyOffer>,
         region_id: i32,
         locations: Option<Arc<HashSet<i64>>>,
     ) -> (Vec<OfferResult>, Vec<OfferError>) {
         let client = self.client.clone();
-        let pool = self.pool.clone();
-        let outcomes = run_children(&self.pool, offers, move |offer| {
-            price_offer(client.clone(), pool.clone(), offer, region_id, locations.clone())
-        })
-        .await;
+        let outcomes = slot
+            .run_children(offers, move |slot, offer| {
+                price_offer(client.clone(), slot, offer, region_id, locations.clone())
+            })
+            .await;
 
         let mut results = Vec::new();
         let mut errors = Vec::new();
@@ -106,7 +106,7 @@ enum Priced {
 
 async fn price_offer(
     client: Arc<EsiClient>,
-    pool: Arc<Semaphore>,
+    slot: Slot,
     offer: LoyaltyOffer,
     region_id: i32,
     locations: Option<Arc<HashSet<i64>>>,
@@ -118,27 +118,28 @@ async fn price_offer(
     children.extend(offer.required_items.iter().cloned().map(Child::Item));
 
     let run_client = client.clone();
-    let priced = run_children(&pool, children, move |child| {
-        let client = run_client.clone();
-        let locations = locations.clone();
-        async move {
-            match child {
-                Child::Item(item) => Priced::Item(
-                    client
-                        .expenses()
-                        .item_expense(&item, region_id, locations.as_deref())
-                        .await,
-                ),
-                Child::Reward => Priced::Reward(
-                    client
-                        .expenses()
-                        .reward_quote(type_id, region_id, locations.as_deref())
-                        .await,
-                ),
+    let priced = slot
+        .run_children(children, move |_slot, child| {
+            let client = run_client.clone();
+            let locations = locations.clone();
+            async move {
+                match child {
+                    Child::Item(item) => Priced::Item(
+                        client
+                            .expenses()
+                            .item_expense(&item, region_id, locations.as_deref())
+                            .await,
+                    ),
+                    Child::Reward => Priced::Reward(
+                        client
+                            .expenses()
+                            .reward_quote(type_id, region_id, locations.as_deref())
+                            .await,
+                    ),
+                }
             }
-        }
-    })
-    .await;
+        })
+        .await;
 
     let mut item_expenses = Vec::with_capacity(offer.required_items.len());
     let mut quote = None;

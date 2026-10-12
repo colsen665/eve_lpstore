@@ -1183,6 +1183,39 @@ leave the program doing what it did.
       the 429 branch removed both 429 tests fail, with the pacing removed the spacing test fails,
       and with the gate removed the one-in-flight test fails.
 
+#### The task pool's type
+
+- [x] Observed: the `--tasks` pool was a bare `Arc<Semaphore>`, passed from the pipeline through
+      `LpStore` to `run_children` and `price_offer`. Anything holding it could wait on it, close
+      it, or add permits, and `run_children`'s need for its caller to hold a permit was a doc
+      comment. The hazard that matters is a waiting acquire below the top level: every slot can
+      be held by a parent waiting for a slot for its children, with nothing left to free one. The
+      ESI client's `request_permits` had the same type for a different budget.
+- [x] `TaskPool` in `tasks` is not `Clone` and has `new` and `spawn(&mut JoinSet, FnOnce(Slot))`,
+      the only call that waits for a slot. `Slot` is a handle only that module makes, and
+      `run_children` is now `Slot::run_children(inputs, Fn(Slot, I))`, which never waits. In both,
+      the task that runs the work holds the permit, not the `Slot`, so a task written
+      `move |_slot| async move { .. }` keeps its slot after dropping the handle. The plan had the
+      `Slot` hold the permit, which would have freed the slot before such a task's work ran.
+- [x] `LpStore` is `pub(crate)`, keeps only the client, and is no longer re-exported from
+      `lib.rs`; `offer_results` takes the group's `&Slot`. This removes `LpStore` and
+      `LpStore::new(client, Arc<Semaphore>)` from the library's public API, which nothing outside
+      the crate used here. `OfferResult` and `OfferError` stay public.
+- [x] What the types enforce: only the pool's owner, the pipeline's top level, can wait for a
+      slot; a task cannot reach the pool, since it is not `Clone` and tasks are `'static`, so it
+      would need an `Arc` around it that review would see; `run_children` needs a `Slot`; and the
+      raw semaphore API is unreachable outside `tasks`. What they do not: a `Slot` moved into a
+      bare `tokio::spawn` runs that work without a slot. No test shows the compile-time part,
+      since a `compile_fail` doctest cannot reach the private `tasks` module and would fail for
+      that reason instead.
+- [x] `request_permits` is left as it is, as chosen: private to `EsiClient`, with one use.
+- [x] Checked on a fully cached `--lpstores` run: the same 2,468 lines as before, apart from
+      timings. No cold run, as chosen, since the scheduling logic moved without changing.
+- [x] Tests: 2 added, a task keeping its slot after dropping the handle, and three nested levels
+      staying within four slots; the 3 existing ones now go through `TaskPool::spawn`. Mutation
+      checks: freeing the slot before the work runs fails all five, spawning children without a
+      slot fails four, and spawning only before the first input fails the freed-slots test.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

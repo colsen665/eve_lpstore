@@ -3,9 +3,9 @@ use super::{CacheCounts, Event, FetchSummary, Group, PricingSummary, Report, Run
 use crate::esi::loyalty::LoyaltyOffer;
 use crate::esi::{ClientStats, EsiClient};
 use crate::lpstore::LpStore;
+use crate::tasks::TaskPool;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 
@@ -24,7 +24,7 @@ pub async fn run(
     };
 
     // One shared pool bounds the offer fetches, the groups, and their offer subtasks together
-    let pool = Arc::new(Semaphore::new(resolved.tasks));
+    let pool = TaskPool::new(resolved.tasks);
 
     let corp_count = resolved.corp_ids.len();
     let mut fetches = JoinSet::new();
@@ -34,16 +34,11 @@ pub async fn run(
         corporations: corp_count,
     });
     for (index, &corp_id) in resolved.corp_ids.iter().enumerate() {
-        let permit = pool
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore is never closed");
         let esi = client.clone();
-        fetches.spawn(async move {
-            let _permit = permit;
+        pool.spawn(&mut fetches, move |_slot| async move {
             (index, corp_id, esi.loyalty().offers(corp_id).await)
-        });
+        })
+        .await;
     }
     send(Event::FetchQueued {
         tasks: fetches.len(),
@@ -108,25 +103,20 @@ pub async fn run(
         groups: group_count,
     });
     for (_, corp_ids, offers) in groups {
-        let permit = pool
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore is never closed");
-        let lp = LpStore::new(client.clone(), pool.clone());
+        let lp = LpStore::new(client.clone());
         let locations = resolved.locations.clone();
         let region_id = resolved.region_id;
         let offer_count = offers.len();
-        tasks.spawn(async move {
-            let _permit = permit;
-            let (results, errors) = lp.offer_results(offers, region_id, locations).await;
+        pool.spawn(&mut tasks, move |slot| async move {
+            let (results, errors) = lp.offer_results(&slot, offers, region_id, locations).await;
             Group {
                 corp_ids,
                 offer_count,
                 results,
                 errors,
             }
-        });
+        })
+        .await;
     }
     send(Event::PricingQueued { tasks: tasks.len() });
 
