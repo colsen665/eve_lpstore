@@ -2,7 +2,12 @@
 name = "eve_lpstore"
 version = "0.1.0"
 edition = "2024"
+description = "Ranks EVE Online loyalty point store offers by ISK per LP, from live ESI market data."
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/OWNER/eve_lpstore"
+readme = "README.md"
+keywords = ["eve-online", "esi", "loyalty-points", "market", "tui"]
+categories = ["command-line-utilities", "games"]
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

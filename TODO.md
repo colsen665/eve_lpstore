@@ -1319,6 +1319,15 @@ leave the program doing what it did.
       off a request to a local server. The download is not covered by a test, since it fetches
       CCP's whole archive.
 - [x] `--version` prints `eve_lpstore <version>` and exits, after `--help` if both are given.
+- [x] Licensed `MIT OR Apache-2.0`, as chosen. `LICENSE-MIT` names colsen665, the git
+      author, for 2026; `LICENSE-APACHE` is the text from apache.org, 202 lines. `Cargo.toml` has
+      a description, the license, the README, keywords, and categories.
+- [x] `README.md` says what the program does, how to install it from a release or with
+      `cargo install`, how to run it, which files it keeps where, how it uses ESI, how to test and
+      release it, and the license. It ends with the notice section 7.1 of CCP's Developer License
+      Agreement asks for, quoted from developers.eveonline.com/license-agreement. The paths are the
+      Linux ones `paths.rs` documents; the Windows and macOS ones are left to `--verbose` rather
+      than written down unchecked.
 
 ## Done
 
