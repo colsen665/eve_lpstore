@@ -10,3 +10,8 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 
 /// Maximum number of retry attempts for transient failures.
 pub const MAX_RETRIES: u32 = 5;
+
+/// Maximum number of times one request is sent again after a 429. Each waits the Retry-After ESI
+/// gave, which is when enough budget is back, so running out of these means something other than
+/// a spent budget is refusing the request.
+pub const MAX_RATE_LIMIT_RETRIES: u32 = 10;

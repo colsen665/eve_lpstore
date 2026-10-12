@@ -14,8 +14,10 @@ pub enum EsiError {
     #[error("Deserialization error: {0}")]
     Deserialize(#[from] serde_json::Error),
 
-    #[error("Max retries exceeded")]
-    Throttle,
+    /// Retries of a 420 or a 5xx ran out. `status` is the last one, which says whether ESI was
+    /// failing or limiting.
+    #[error("Max retries exceeded (last status {status})")]
+    Throttle { status: u16 },
 
     #[error("Invalid URL: {0}")]
     Url(#[from] url::ParseError),
@@ -41,8 +43,8 @@ pub enum SharedError {
     #[error("Rate limit exceeded: {remain} errors remain, reset in {reset}s")]
     RateLimit { remain: u32, reset: u32 },
 
-    #[error("Max retries exceeded")]
-    Throttle,
+    #[error("Max retries exceeded (last status {status})")]
+    Throttle { status: u16 },
 
     #[error("{0}")]
     Other(String),
@@ -59,7 +61,7 @@ impl From<&EsiError> for SharedError {
                 remain: *remain,
                 reset: *reset,
             },
-            EsiError::Throttle => Self::Throttle,
+            EsiError::Throttle { status } => Self::Throttle { status: *status },
             other => Self::Other(other.to_string()),
         }
     }
@@ -76,6 +78,16 @@ mod tests {
             SharedError::RateLimit { remain, reset } => assert_eq!((remain, reset), (0, 42)),
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn running_out_of_retries_names_the_last_status() {
+        let error = EsiError::Throttle { status: 503 };
+        assert_eq!(error.to_string(), "Max retries exceeded (last status 503)");
+        assert_eq!(
+            SharedError::from(&error).to_string(),
+            "Max retries exceeded (last status 503)"
+        );
     }
 
     #[test]

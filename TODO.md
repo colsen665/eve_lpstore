@@ -1117,6 +1117,58 @@ leave the program doing what it did.
 - [x] Tests: 1 added, for `--concurrency` being refused. The option table's tests pick up the
       renamed flag on their own, including its line in the help and the usage line.
 
+#### ESI rate limiting
+
+- [x] ESI now limits most routes with a token bucket per rate-limit group over a 15-minute
+      sliding window, reported in `X-Ratelimit-Group`, `-Limit`, and `-Remaining`, and answers
+      429 with `Retry-After` once the bucket is spent; a successful request costs two tokens.
+      Market orders are the `market-order` group at `12000/15m`, checked with one request; the
+      loyalty route still reports the older error limit instead. A cold full run spends about
+      7,000 of the 12,000, so a second one inside the window runs out. The client retried only
+      420 and 5xx, so every 429 was a lost offer, and the status line showed only the error limit,
+      written as out of 200 where ESI documents 100 non-2xx/3xx responses a minute.
+- [x] A 429 with `Retry-After` holds every request not yet sent for that long plus one second,
+      logs `[RATE LIMIT] ESI answered 429 on <path>` once per hold, and sends the request again,
+      up to ten times. A 429 without the header, which ESI says comes from the game server with
+      no rate-limit headers, backs off that request alone. This shares the hold the error limit
+      already used.
+- [x] Below a tenth of a group's budget its requests are spaced at the window's average rate, two
+      tokens per request, 150 ms apart for `market-order`, and only one of them is in flight at a
+      time: each takes the group's gate until its answer is in, so the end of a hold releases one
+      request rather than every one waiting. A request that was already waiting for a permit when
+      the budget turned low goes round again for the gate. Pacing is logged once per client and
+      group.
+- [x] The status line reads `Budget: 4,940/12,000 per 15m | Error limit: 100 left, resets in
+      50s`, the group with the least left and the older limit, each once reported. The footer
+      puts the error count before them, so a narrow terminal cuts the limits rather than the
+      errors. Running out of 420 or 5xx retries now says which status it ended on: `Max retries
+      exceeded (last status 503)`.
+- [x] Measured on back-to-back cold runs with `--tasks 64`, each on a copied cache. With the
+      hold, the retry, and the pacing but before the gate, the first run priced in 128.9 s and the
+      second, started straight after, lost no offer to 429, against 766 before this work, but
+      took 21.5 minutes and lost 77 to `Max retries exceeded`. The status line's error count went
+      from 0 to 95 between 13:06:13 and 13:07:33, near the end of the run and about six minutes
+      after the last 429, while the budget was rising. Their status is not known, since
+      the error did not say. The rising budget fits 5xx, which costs no tokens by ESI's
+      documentation, where a 4xx costs five; that is an inference. With the gate, a second pair:
+      127.7 s for the first run, 524.4 s for the second, no offer lost to anything but no sell
+      orders, and no 429 at all; the budget stayed between 864 and 4,168 and was below a tenth
+      for 412 s.
+- [x] Corrected after the first pair. Pacing at the window's average rate was meant to keep a
+      long session from reaching 429s, and did not: tokens come back 15 minutes after they were
+      spent, so after a burst there is little to pace against, and the budget reached 0. And the
+      burst after a hold was overstated at first as every waiting request at once; the pacing
+      already spaced them 150 ms apart, so it was more likely one or two, plus up to four in
+      flight, which is an inference, since the log does not show it. Not understood: the second
+      pair's budget held up better than a strict 15-minute return predicts, so the difference
+      between the pairs is not attributed to the gate.
+- [x] Tests: 8 added. Five against local HTTP servers: a 429 with `Retry-After` held and then
+      retried, a 429 without it backing off alone, a low budget spacing requests, a budget above
+      a tenth left alone, and one request in flight at a time while low. Three plain: reading
+      `12000/15m`, the status text, and the retry error naming its status. Mutation checks: with
+      the 429 branch removed both 429 tests fail, with the pacing removed the spacing test fails,
+      and with the gate removed the one-in-flight test fails.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

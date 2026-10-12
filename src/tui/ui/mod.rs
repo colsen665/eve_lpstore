@@ -201,12 +201,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, app: &App) {
         }
     };
     let lines = vec![
+        // The errors come before the limits, so a narrow footer cuts the limits, not the errors.
         Line::from(format!(
-            "In-flight: {} | Waiting: {} | Rate limit: {} | Errors: {}",
+            "In-flight: {} | Waiting: {} | Errors: {} | {}",
             stats.in_flight,
             stats.waiting,
-            output::rate_limit_text(stats),
-            stats.total_errors
+            stats.total_errors,
+            output::rate_limit_text(stats)
         )),
         Line::from(format!(
             "Cache: {} hits, {} misses, {} writes",

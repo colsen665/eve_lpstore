@@ -1,6 +1,6 @@
 use eve_lpstore::StaticData;
 use eve_lpstore::esi::ClientStats;
-use eve_lpstore::format::{format_isk, format_number, format_optional};
+use eve_lpstore::format::{format_isk, format_number, format_optional, group_digits};
 use eve_lpstore::report::{Event, Report, Resolved};
 use eve_lpstore::static_data::AgentFilter;
 
@@ -146,11 +146,25 @@ pub fn print_event(event: &Event, sdata: &StaticData) {
     }
 }
 
-/// The rate limit as the CLI and the TUI show it.
+/// ESI's limits as the CLI and the TUI show them: the token budget of the route group with the
+/// least left, and the older error limit, each once a response has reported it.
 pub fn rate_limit_text(s: &ClientStats) -> String {
-    match (s.rate_limit_remain, s.rate_limit_reset) {
-        (Some(remain), Some(reset)) => format!("{}/200 (resets in {}s)", remain, reset),
-        _ => "unknown".to_string(),
+    let mut parts = Vec::new();
+    if let Some(budget) = &s.budget {
+        parts.push(format!(
+            "Budget: {}/{} per {}",
+            group_digits(&budget.remaining.to_string()),
+            group_digits(&budget.limit.to_string()),
+            budget.window
+        ));
+    }
+    if let (Some(remain), Some(reset)) = (s.rate_limit_remain, s.rate_limit_reset) {
+        parts.push(format!("Error limit: {remain} left, resets in {reset}s"));
+    }
+    if parts.is_empty() {
+        "Rate limit: unknown".to_string()
+    } else {
+        parts.join(" | ")
     }
 }
 
@@ -158,7 +172,7 @@ pub fn rate_limit_text(s: &ClientStats) -> String {
 /// shorter line, sharing only [`rate_limit_text`].
 pub fn status_text(s: &ClientStats) -> String {
     format!(
-        "In-flight: {} | Waiting: {} | Rate limit: {} | Total: {} | Errors: {}",
+        "In-flight: {} | Waiting: {} | {} | Total: {} | Errors: {}",
         s.in_flight,
         s.waiting,
         rate_limit_text(s),
@@ -239,5 +253,38 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eve_lpstore::esi::Budget;
+
+    #[test]
+    fn the_limits_read_as_the_budget_and_the_error_limit() {
+        let mut stats = ClientStats::default();
+        assert_eq!(rate_limit_text(&stats), "Rate limit: unknown");
+        stats.rate_limit_remain = Some(100);
+        stats.rate_limit_reset = Some(50);
+        assert_eq!(
+            rate_limit_text(&stats),
+            "Error limit: 100 left, resets in 50s"
+        );
+        stats.budget = Some(Budget {
+            group: "market-order".to_string(),
+            remaining: 4940,
+            limit: 12000,
+            window: "15m".to_string(),
+        });
+        assert_eq!(
+            rate_limit_text(&stats),
+            "Budget: 4,940/12,000 per 15m | Error limit: 100 left, resets in 50s"
+        );
+        assert!(
+            status_text(&stats).contains("| Budget: 4,940/12,000 per 15m |"),
+            "{}",
+            status_text(&stats)
+        );
     }
 }

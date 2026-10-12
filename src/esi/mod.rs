@@ -23,13 +23,29 @@ type PageResult = Result<(serde_json::Value, Option<u32>), EsiError>;
 pub struct ClientStats {
     pub in_flight: usize,
     pub waiting: usize,
+    /// The older error limit, from `X-Esi-Error-Limit-*`: errors left in the window, and seconds
+    /// until it resets. Routes without the newer rate limit report it.
     pub rate_limit_remain: Option<u32>,
     pub rate_limit_reset: Option<u32>,
+    /// The rate-limit group with the least of its budget left, from `X-Ratelimit-*`.
+    pub budget: Option<Budget>,
     pub total_requests: u64,
     pub total_errors: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_writes: u64,
+}
+
+/// What ESI's rate limit allows one route group, from the `X-Ratelimit-*` headers of its last
+/// response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Budget {
+    pub group: String,
+    /// Tokens left in the window. A successful request costs two.
+    pub remaining: u32,
+    pub limit: u32,
+    /// The window as ESI writes it, such as `15m`.
+    pub window: String,
 }
 
 /// Counts a request as waiting for a permit until it is dropped.
@@ -213,8 +229,10 @@ pub struct EsiClient {
     inflight: Mutex<HashMap<String, Arc<OnceCell<Arc<PageResult>>>>>,
     request_permits: Semaphore,
     cache_index: Mutex<CacheIndex>,
-    /// When requests may be sent again after ESI's error limit was spent, or `None`.
-    error_limit_until: Mutex<Option<tokio::time::Instant>>,
+    /// When requests may be sent again after ESI said to stop, by a spent error limit or a 429,
+    /// or `None`.
+    hold_until: Mutex<Option<tokio::time::Instant>>,
+    rate_limits: Mutex<RateLimits>,
 }
 
 impl EsiClient {
@@ -235,7 +253,8 @@ impl EsiClient {
             inflight: Mutex::new(HashMap::new()),
             request_permits,
             cache_index: Mutex::new(CacheIndex::default()),
-            error_limit_until: Mutex::new(None),
+            hold_until: Mutex::new(None),
+            rate_limits: Mutex::new(RateLimits::default()),
         }
     }
 
@@ -246,26 +265,26 @@ impl EsiClient {
         }
     }
 
-    /// When requests may be sent again, if the error limit is spent and has not yet reset.
-    fn error_limit_hold(&self) -> Option<tokio::time::Instant> {
-        let until = (*self.error_limit_until.lock().unwrap())?;
+    /// When requests may be sent again, if ESI said to stop and the time it gave has not passed.
+    fn held_until(&self) -> Option<tokio::time::Instant> {
+        let until = (*self.hold_until.lock().unwrap())?;
         (until > tokio::time::Instant::now()).then_some(until)
     }
 
-    /// Waits until the error limit has reset, if it is spent.
-    async fn wait_for_error_limit(&self) {
-        while let Some(until) = self.error_limit_hold() {
+    /// Waits out a hold, if one is in force.
+    async fn wait_for_hold(&self) {
+        while let Some(until) = self.held_until() {
             tokio::time::sleep_until(until).await;
         }
     }
 
-    /// Holds every request not yet sent for `reset` seconds, the time ESI gave until the error
-    /// window resets, plus one: the header is whole seconds, so the window can end up to a second
-    /// after it says.
-    fn hold_requests(&self, reset: u32) {
-        let until = tokio::time::Instant::now() + Duration::from_secs(u64::from(reset) + 1);
+    /// Holds every request not yet sent for `seconds`, the time ESI gave, plus one: its headers
+    /// are whole seconds, so the wait can end up to a second after they say. `why` starts the log
+    /// line, which is written once per hold rather than once per request that sees it.
+    fn hold_requests(&self, seconds: u64, why: &str) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(seconds + 1);
         let extended = {
-            let mut slot = self.error_limit_until.lock().unwrap();
+            let mut slot = self.hold_until.lock().unwrap();
             let extends = slot.is_none_or(|current| current < until);
             if extends {
                 *slot = Some(until);
@@ -273,11 +292,100 @@ impl EsiClient {
             extends
         };
         if extended {
-            self.verbose_log(format!(
-                "[ERROR LIMIT] no errors left in ESI's window; holding requests for {}s",
-                u64::from(reset) + 1
-            ));
+            self.verbose_log(format!("{why}; holding requests for {}s", seconds + 1));
         }
+    }
+
+    /// Waits for this request's turn when its route group is low on budget: below a tenth of the
+    /// limit, requests in the group are spaced at the window's average rate, two tokens per
+    /// successful request, so the budget is spent no faster than it comes back instead of running
+    /// out. ESI asks clients not to operate at the limit.
+    async fn pace(&self, route: &str) {
+        let (turn, started) = {
+            let mut limits = self.rate_limits.lock().unwrap();
+            let Some(group) = limits.route_groups.get(route).cloned() else {
+                return;
+            };
+            let Some(budget) = limits.budgets.get(&group).cloned() else {
+                return;
+            };
+            if !budget.is_low() {
+                return;
+            }
+            let interval = budget.window * 2 / budget.limit.max(1);
+            let now = tokio::time::Instant::now();
+            let turn = limits
+                .next_turn
+                .get(&group)
+                .copied()
+                .filter(|turn| *turn > now)
+                .unwrap_or(now);
+            limits.next_turn.insert(group.clone(), turn + interval);
+            let started = limits.pacing.insert(group.clone()).then(|| {
+                format!(
+                    "[RATE LIMIT] {} has {} of {} tokens left; spacing its requests {}ms apart",
+                    group,
+                    budget.remaining,
+                    budget.limit,
+                    interval.as_millis()
+                )
+            });
+            (turn, started)
+        };
+        if let Some(line) = started {
+            self.verbose_log(line);
+        }
+        tokio::time::sleep_until(turn).await;
+    }
+
+    /// The gate of `route`'s rate-limit group while its budget is low, which lets one of its
+    /// requests be in flight at a time. `None` when the group has enough left, or is not known yet.
+    fn low_budget_gate(&self, route: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let mut limits = self.rate_limits.lock().unwrap();
+        let group = limits.route_groups.get(route)?.clone();
+        if !limits.budgets.get(&group)?.is_low() {
+            return None;
+        }
+        Some(limits.gates.entry(group).or_default().clone())
+    }
+
+    /// Records the `X-Ratelimit-*` headers of a response to `route`, and puts the tightest group
+    /// in the stats.
+    fn record_budget(&self, route: Option<&str>, headers: &HeaderMap) {
+        let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+        let (Some(group), Some(limit), Some(remaining)) = (
+            text("x-ratelimit-group"),
+            text("x-ratelimit-limit"),
+            text("x-ratelimit-remaining").and_then(|value| value.trim().parse::<u32>().ok()),
+        ) else {
+            return;
+        };
+        let Some((tokens, window)) = parse_rate_limit(limit) else {
+            return;
+        };
+        let tightest = {
+            let mut limits = self.rate_limits.lock().unwrap();
+            if let Some(route) = route {
+                limits
+                    .route_groups
+                    .insert(route.to_string(), group.to_string());
+            }
+            limits.budgets.insert(
+                group.to_string(),
+                GroupBudget {
+                    remaining,
+                    limit: tokens,
+                    window,
+                    window_text: limit
+                        .split_once('/')
+                        .map_or("", |(_, w)| w)
+                        .trim()
+                        .to_string(),
+                },
+            );
+            limits.tightest()
+        };
+        self.stats.lock().unwrap().budget = tightest;
     }
 
     /// Returns a snapshot of the current API call statistics.
@@ -679,6 +787,11 @@ impl EsiClient {
         url: &url::Url,
     ) -> Result<(serde_json::Value, Option<u32>), EsiError> {
         let mut attempt = 0u32;
+        let mut rate_limited = 0u32;
+        let route = url
+            .path_segments()
+            .and_then(|mut segments| segments.find(|segment| !segment.is_empty()))
+            .map(str::to_string);
         loop {
             let mut headers = HeaderMap::new();
             headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -691,17 +804,43 @@ impl EsiClient {
             }
 
             let waiting = WaitingGuard::new(self.stats.clone());
-            // Checked again once a permit is held, since another response may have spent the
-            // error limit while this request waited for one.
-            let permit = loop {
-                self.wait_for_error_limit().await;
+            // While the route group is low on budget, its requests go one at a time: each holds
+            // the group's gate until its response is in, so when a hold ends one request finds out
+            // whether the budget is back, instead of every waiting request at once. The hold is
+            // checked again once the gate and a permit are held, since another response may have
+            // started one while this request waited for them.
+            let (permit, _gate) = loop {
+                self.wait_for_hold().await;
+                let gate = match route
+                    .as_deref()
+                    .and_then(|route| self.low_budget_gate(route))
+                {
+                    Some(gate) => Some(gate.lock_owned().await),
+                    None => None,
+                };
+                if self.held_until().is_some() {
+                    continue;
+                }
+                if let Some(route) = &route {
+                    self.pace(route).await;
+                }
                 let permit = self
                     .request_permits
                     .acquire()
                     .await
                     .expect("request semaphore is never closed");
-                if self.error_limit_hold().is_none() {
-                    break permit;
+                if self.held_until().is_some() {
+                    continue;
+                }
+                // The budget can turn low while this request waits for a permit, as the first
+                // answers of a run come in. A request that has no gate then goes round again to
+                // take one, rather than adding to the requests in flight.
+                let turned_low = gate.is_none()
+                    && route
+                        .as_deref()
+                        .is_some_and(|route| self.low_budget_gate(route).is_some());
+                if !turned_low {
+                    break (permit, gate);
                 }
             };
             drop(waiting);
@@ -715,6 +854,7 @@ impl EsiClient {
             let response = response.map_err(EsiError::Http)?;
 
             let status = response.status();
+            self.record_budget(route.as_deref(), response.headers());
 
             // Track rate limit headers
             let remain = response
@@ -740,11 +880,44 @@ impl EsiClient {
                 // yet is held until then. This response is kept when it succeeded, since its body
                 // is valid; an error at the limit is reported as the limit, as before.
                 if remain == 0 {
-                    self.hold_requests(reset);
+                    self.hold_requests(
+                        u64::from(reset),
+                        "[ERROR LIMIT] no errors left in ESI's window",
+                    );
                     if !status.is_success() {
                         return Err(EsiError::RateLimit { remain, reset });
                     }
                 }
+            }
+
+            // The route group's budget is spent. ESI says when enough of it is back in
+            // Retry-After, so every request not yet sent waits that long and this one is sent
+            // again. A 429 without the header comes from deeper in the game server, by ESI's
+            // documentation, and only this request backs off.
+            if status.as_u16() == 429 {
+                if rate_limited >= retry::MAX_RATE_LIMIT_RETRIES {
+                    let message = response.text().await.unwrap_or_default();
+                    return Err(EsiError::Esi {
+                        status: 429,
+                        message,
+                    });
+                }
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                drop(in_flight);
+                drop(permit);
+                match retry_after {
+                    Some(seconds) => self.hold_requests(
+                        seconds,
+                        &format!("[RATE LIMIT] ESI answered 429 on {}", url.path()),
+                    ),
+                    None => tokio::time::sleep(retry::backoff_delay(rate_limited)).await,
+                }
+                rate_limited += 1;
+                continue;
             }
 
             // Success
@@ -773,7 +946,9 @@ impl EsiClient {
             // Retryable: 420 (error limit) or 5xx
             if status.as_u16() == 420 || status.is_server_error() {
                 if attempt >= retry::MAX_RETRIES {
-                    return Err(EsiError::Throttle);
+                    return Err(EsiError::Throttle {
+                        status: status.as_u16(),
+                    });
                 }
                 drop(in_flight);
                 drop(permit);
@@ -796,6 +971,71 @@ impl EsiClient {
             });
         }
     }
+}
+
+/// What the client knows about ESI's rate-limit groups: which group each route belongs to, each
+/// group's budget as last reported, and, for a group being paced, when its next request may go.
+#[derive(Debug, Default)]
+struct RateLimits {
+    route_groups: HashMap<String, String>,
+    budgets: HashMap<String, GroupBudget>,
+    next_turn: HashMap<String, tokio::time::Instant>,
+    /// The groups that have been paced, so pacing is logged once per client and group even when
+    /// the budget goes back and forth across the line.
+    pacing: std::collections::HashSet<String>,
+    /// One gate per group, held by its one request in flight while the group is low.
+    gates: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupBudget {
+    remaining: u32,
+    limit: u32,
+    window: Duration,
+    window_text: String,
+}
+
+impl GroupBudget {
+    /// Under a tenth of the limit left, which a 429 also reports, with nothing left.
+    fn is_low(&self) -> bool {
+        u64::from(self.remaining) * 10 < u64::from(self.limit)
+    }
+}
+
+impl RateLimits {
+    /// The group with the smallest share of its budget left.
+    fn tightest(&self) -> Option<Budget> {
+        self.budgets
+            .iter()
+            .min_by(|(_, a), (_, b)| {
+                // remaining/limit compared without division: a.r / a.l < b.r / b.l.
+                let left = u64::from(a.remaining) * u64::from(b.limit);
+                let right = u64::from(b.remaining) * u64::from(a.limit);
+                left.cmp(&right)
+            })
+            .map(|(group, budget)| Budget {
+                group: group.clone(),
+                remaining: budget.remaining,
+                limit: budget.limit,
+                window: budget.window_text.clone(),
+            })
+    }
+}
+
+/// Reads an `X-Ratelimit-Limit` value such as `12000/15m` into its tokens and its window.
+fn parse_rate_limit(text: &str) -> Option<(u32, Duration)> {
+    let (tokens, window) = text.split_once('/')?;
+    let tokens = tokens.trim().parse().ok()?;
+    let window = window.trim();
+    let unit = window.chars().last()?;
+    let count: u64 = window[..window.len() - unit.len_utf8()].parse().ok()?;
+    let seconds = match unit {
+        's' => count,
+        'm' => count * 60,
+        'h' => count * 3600,
+        _ => return None,
+    };
+    Some((tokens, Duration::from_secs(seconds)))
 }
 
 /// The cache directory's files by entry: the file name without its `_{expiry}.json` ending, mapped
@@ -1169,14 +1409,46 @@ mod tests {
         assert_eq!(parse_cache_file_name("markets_1_orders_soon.json"), None);
     }
 
-    /// A local HTTP server that answers every request with `status`, the two error-limit headers,
-    /// and `body`, and records when each request arrived.
-    async fn serve(
+    /// One canned answer of the test server: a status line, extra headers, and a JSON body.
+    struct Canned {
         status: &'static str,
-        remain: u32,
-        reset: u32,
+        headers: Vec<(&'static str, String)>,
         body: &'static str,
-    ) -> (String, Arc<Mutex<Vec<std::time::Instant>>>) {
+    }
+
+    /// A response with the older error-limit headers.
+    fn error_limited(status: &'static str, remain: u32, reset: u32, body: &'static str) -> Canned {
+        Canned {
+            status,
+            headers: vec![
+                ("x-esi-error-limit-remain", remain.to_string()),
+                ("x-esi-error-limit-reset", reset.to_string()),
+            ],
+            body,
+        }
+    }
+
+    /// A response with the newer rate-limit headers for the group `test`.
+    fn rate_limited(
+        status: &'static str,
+        limit: &str,
+        remaining: u32,
+        body: &'static str,
+    ) -> Canned {
+        Canned {
+            status,
+            headers: vec![
+                ("x-ratelimit-group", "test".to_string()),
+                ("x-ratelimit-limit", limit.to_string()),
+                ("x-ratelimit-remaining", remaining.to_string()),
+            ],
+            body,
+        }
+    }
+
+    /// A local HTTP server that answers the n-th request with the n-th of `answers`, and the last
+    /// one from then on, and records when each request arrived.
+    async fn serve(answers: Vec<Canned>) -> (String, Arc<Mutex<Vec<std::time::Instant>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1195,13 +1467,23 @@ mod tests {
                         Ok(read) => request.extend_from_slice(&buffer[..read]),
                     }
                 }
-                seen.lock().unwrap().push(std::time::Instant::now());
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
-                     x-esi-error-limit-remain: {remain}\r\nx-esi-error-limit-reset: {reset}\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
+                let answer = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(std::time::Instant::now());
+                    &answers[(seen.len() - 1).min(answers.len() - 1)]
+                };
+                let mut response = format!(
+                    "HTTP/1.1 {}\r\ncontent-type: application/json\r\n",
+                    answer.status
                 );
+                for (name, value) in &answer.headers {
+                    response.push_str(&format!("{name}: {value}\r\n"));
+                }
+                response.push_str(&format!(
+                    "content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    answer.body.len(),
+                    answer.body
+                ));
                 let _ = socket.write_all(response.as_bytes()).await;
                 let _ = socket.shutdown().await;
             }
@@ -1222,7 +1504,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_success_at_the_error_limit_keeps_its_body_and_holds_the_next_request() {
-        let (base, arrivals) = serve("200 OK", 0, 1, "[1]").await;
+        let (base, arrivals) = serve(vec![error_limited("200 OK", 0, 1, "[1]")]).await;
         let (client, lines) = logged_client(&base);
         let first: Vec<i32> = client
             .get("universe/types/", &[])
@@ -1248,7 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_at_the_error_limit_is_reported_as_the_limit() {
-        let (base, _) = serve("404 Not Found", 0, 1, "{}").await;
+        let (base, _) = serve(vec![error_limited("404 Not Found", 0, 1, "{}")]).await;
         let (client, _) = logged_client(&base);
         let error = client
             .get::<Vec<i32>>("universe/types/", &[])
@@ -1262,7 +1544,7 @@ mod tests {
 
     #[tokio::test]
     async fn requests_are_not_held_while_errors_remain() {
-        let (base, arrivals) = serve("200 OK", 50, 30, "[1]").await;
+        let (base, arrivals) = serve(vec![error_limited("200 OK", 50, 30, "[1]")]).await;
         let (client, lines) = logged_client(&base);
         for _ in 0..2 {
             let _: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
@@ -1270,6 +1552,233 @@ mod tests {
         let arrivals = arrivals.lock().unwrap().clone();
         assert!(arrivals[1] - arrivals[0] < Duration::from_millis(500));
         assert!(lines.lock().unwrap().is_empty(), "nothing was held");
+    }
+
+    /// A local HTTP server that answers every request with `answer` after `delay`, serving
+    /// connections at the same time, and records when each request arrived and was answered.
+    async fn serve_slowly(
+        answer: Canned,
+        delay: Duration,
+    ) -> (
+        String,
+        Arc<Mutex<Vec<(std::time::Instant, std::time::Instant)>>>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let log = served.clone();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let log = log.clone();
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    let arrived = std::time::Instant::now();
+                    tokio::time::sleep(delay).await;
+                    let mut response = format!(
+                        "HTTP/1.1 {}\r\ncontent-type: application/json\r\n",
+                        answer.status
+                    );
+                    for (name, value) in &answer.headers {
+                        response.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    response.push_str(&format!(
+                        "content-length: {}\r\nconnection: close\r\n\r\n{}",
+                        answer.body.len(),
+                        answer.body
+                    ));
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    log.lock()
+                        .unwrap()
+                        .push((arrived, std::time::Instant::now()));
+                });
+            }
+        });
+        (base, served)
+    }
+
+    #[tokio::test]
+    async fn a_low_budget_lets_one_request_be_in_flight_at_a_time() {
+        // Answers take 0.3 s, longer than the 0.2 s pacing interval of 100 tokens per 10 s, so
+        // paced requests alone would overlap. Once the first answer says the budget is low, the
+        // gate keeps every later request until the one before it is answered.
+        let (base, served) = serve_slowly(
+            rate_limited("200 OK", "100/10s", 1, "[1]"),
+            Duration::from_millis(300),
+        )
+        .await;
+        let (client, _) = logged_client(&base);
+        let client = Arc::new(client);
+        let mut lookups = tokio::task::JoinSet::new();
+        for type_id in 0..8 {
+            let client = client.clone();
+            lookups.spawn(async move {
+                client
+                    .get::<Vec<i32>>(
+                        "markets/10000002/orders/",
+                        &[("type_id", type_id.to_string())],
+                    )
+                    .await
+            });
+        }
+        while let Some(done) = lookups.join_next().await {
+            assert_eq!(done.unwrap().unwrap(), [1]);
+        }
+        let mut served = served.lock().unwrap().clone();
+        served.sort_by_key(|(arrived, _)| *arrived);
+        let first_answer = served.iter().map(|(_, answered)| *answered).min().unwrap();
+        let after: Vec<_> = served
+            .iter()
+            .filter(|(arrived, _)| *arrived >= first_answer)
+            .collect();
+        assert!(
+            after.len() >= 4,
+            "most requests came after the budget was known: {}",
+            after.len()
+        );
+        for pair in after.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].1,
+                "a request arrived before the one before it was answered"
+            );
+        }
+    }
+
+    /// The gap between consecutive requests the server saw.
+    fn gaps(arrivals: &Arc<Mutex<Vec<std::time::Instant>>>) -> Vec<Duration> {
+        let arrivals = arrivals.lock().unwrap();
+        arrivals.windows(2).map(|pair| pair[1] - pair[0]).collect()
+    }
+
+    #[tokio::test]
+    async fn a_429_with_retry_after_holds_and_then_retries() {
+        let mut refused = rate_limited("429 Too Many Requests", "100/10s", 0, "{}");
+        refused.headers.push(("retry-after", "1".to_string()));
+        let (base, arrivals) =
+            serve(vec![refused, rate_limited("200 OK", "100/10s", 50, "[7]")]).await;
+        let (client, lines) = logged_client(&base);
+        let types: Vec<i32> = client
+            .get("universe/types/", &[])
+            .await
+            .expect("the retry after the hold succeeds");
+        assert_eq!(types, [7]);
+        let gaps = gaps(&arrivals);
+        assert_eq!(gaps.len(), 1, "sent twice");
+        assert!(
+            gaps[0] >= Duration::from_millis(1900),
+            "held for Retry-After and its extra second: {:?}",
+            gaps[0]
+        );
+        let lines = lines.lock().unwrap().clone();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("[RATE LIMIT] ESI answered 429")),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_without_retry_after_backs_off_without_a_hold() {
+        // ESI documents these as coming from the game server, with no rate-limit headers.
+        let bare = |status, body| Canned {
+            status,
+            headers: Vec::new(),
+            body,
+        };
+        let (base, arrivals) = serve(vec![
+            bare("429 Too Many Requests", "{}"),
+            bare("200 OK", "[7]"),
+        ])
+        .await;
+        let (client, lines) = logged_client(&base);
+        let types: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
+        assert_eq!(types, [7]);
+        let gaps = gaps(&arrivals);
+        assert!(
+            gaps[0] >= Duration::from_millis(450),
+            "the first backoff step: {:?}",
+            gaps[0]
+        );
+        assert!(
+            client.held_until().is_none() && lines.lock().unwrap().is_empty(),
+            "nothing else was held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_low_budget_spaces_requests_at_the_windows_rate() {
+        // 100 tokens per 10 s is one successful request every 0.2 s on average, and 5 left is
+        // under a tenth, so after the first response says so the rest are spaced.
+        let (base, arrivals) = serve(vec![rate_limited("200 OK", "100/10s", 5, "[1]")]).await;
+        let (client, lines) = logged_client(&base);
+        for _ in 0..4 {
+            let _: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
+        }
+        let gaps = gaps(&arrivals);
+        assert_eq!(gaps.len(), 3);
+        for gap in &gaps[1..] {
+            assert!(*gap >= Duration::from_millis(180), "{gaps:?}");
+        }
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("spacing its requests"))
+                .count(),
+            1,
+            "pacing is logged once: {lines:?}"
+        );
+        assert_eq!(
+            client.status().budget,
+            Some(Budget {
+                group: "test".to_string(),
+                remaining: 5,
+                limit: 100,
+                window: "10s".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_budget_above_a_tenth_is_not_paced() {
+        let (base, arrivals) = serve(vec![rate_limited("200 OK", "100/10s", 50, "[1]")]).await;
+        let (client, _) = logged_client(&base);
+        for _ in 0..3 {
+            let _: Vec<i32> = client.get("universe/types/", &[]).await.unwrap();
+        }
+        for gap in gaps(&arrivals) {
+            assert!(gap < Duration::from_millis(100), "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_reads_as_tokens_per_window() {
+        assert_eq!(
+            parse_rate_limit("12000/15m"),
+            Some((12000, Duration::from_secs(900)))
+        );
+        assert_eq!(
+            parse_rate_limit("150/1h"),
+            Some((150, Duration::from_secs(3600)))
+        );
+        assert_eq!(
+            parse_rate_limit("10/30s"),
+            Some((10, Duration::from_secs(30)))
+        );
+        assert_eq!(parse_rate_limit("10/30d"), None);
+        assert_eq!(parse_rate_limit("ten/15m"), None);
+        assert_eq!(parse_rate_limit("12000"), None);
     }
 
     #[tokio::test]
