@@ -120,6 +120,9 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
             PaneLayout::default()
         }
     };
+    // The footer before the popups, so one tall enough to reach it covers it, rather than the
+    // footer being drawn over the popup's last rows.
+    draw_footer(frame, footer, stats, app);
     match &app.overlay {
         Overlay::Help => draw_help(frame, area),
         Overlay::Donate => draw_donate(frame, area),
@@ -131,7 +134,6 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
     if app.overlay == Overlay::None && (app.awaiting_run_summary || in_flight_run(app)) {
         draw_run_progress(frame, area, app);
     }
-    draw_footer(frame, footer, stats, app);
     layout
 }
 

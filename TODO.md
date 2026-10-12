@@ -1387,6 +1387,14 @@ leave the program doing what it did.
       the runtime's own thread instead of a blocking one makes the second fail: the task never
       runs.
 
+#### Popups over the footer
+
+- [x] Observed while adding figures to the help: the footer was drawn after every popup, so a
+      popup reaching the bottom three rows lost them. At 80x24 the donation popup's QR code does,
+      and its address, the line saying how to close it, and its bottom border were drawn over.
+      The footer is drawn before the popups now. A test of the whole view at 80x24 with the
+      donation popup open, which fails with the old order, checks both lines show.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

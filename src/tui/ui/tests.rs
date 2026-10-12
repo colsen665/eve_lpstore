@@ -1273,3 +1273,14 @@ fn notes_past_the_room_are_cut_with_an_ellipsis() {
     assert_eq!(fit(vec![note("one")], 2, 10), vec![note("one")]);
     assert!(fit(vec![note("one")], 0, 10).is_empty());
 }
+
+#[test]
+fn a_popup_reaching_the_footer_keeps_its_last_rows() {
+    // At the smallest size the donation popup's QR code reaches the footer's rows. The address and
+    // the line saying how to close it are its last rows, and the footer used to be drawn over them.
+    let mut app = results_app(one_priced_offer(), 10);
+    app.on_key(press(crossterm::event::KeyCode::Char('d')));
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains(DONATION_ADDRESS), "{text}");
+    assert!(text.contains("Esc or d closes this"), "{text}");
+}
