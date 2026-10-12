@@ -1066,6 +1066,39 @@ leave the program doing what it did.
       error fixtures in the export and the view tests use the new case, and the view's test now
       pins the logged text.
 
+#### The pricing schedule
+
+- [x] Observed: while pricing, the status line could sit at one request in flight for minutes.
+      Checked against the code and two cold runs. `run_children` decided spawn or inline once per
+      input, when a group started, and the inputs that got no permit then ran one at a time on the
+      group's own permit for the rest of the phase; a permit freed later was never offered to
+      them. While groups were still waiting to start, the pricing loop's pending `acquire_owned`
+      also took every freed permit, since tokio 1.53.2 gives a released permit to a queued waiter
+      before `try_acquire` can see it (`add_permits_locked`). So each group ran its offers almost
+      entirely in sequence, and the largest group, 127 offers for CBD Corporation, was left
+      running alone at the end.
+- [x] Measured on cold runs (`--cache-minutes 0`, copied cache, full ESI budget): at the default
+      of 8 tasks, pricing took 317.0 s, 65% of seconds had one request in flight, and the last
+      210 s never had more than one. `--concurrency 80` took 256.7 s with a 164 s tail of the
+      same kind, since 71 groups took 71 of its permits at once. A first run at 80 looked twice as
+      fast, but started inside the 15-minute window the previous run had nearly emptied, and lost
+      766 offers to HTTP 429; see *ESI rate limiting* below.
+- [x] `run_children` now keeps its inputs in a queue and, before each one it runs itself, hands
+      every permit free at that moment to an input still waiting. It still never waits for a
+      permit, so a parent can always make progress.
+- [x] Groups are priced largest first, by offer count with ties to the lower first corporation
+      ID (`pricing_order`), so the longest lists start early rather than being what is left at
+      the end. The report is sorted by ISK per LP afterwards, so the order is not visible: a fully
+      cached `--lpstores` run printed the same 2,480 lines before and after, apart from timings.
+- [x] Measured the same way at the same default of 8: pricing took 144.0 s instead of 317.0 s,
+      81% of seconds had four requests in flight, which is `--max-inflight`'s cap, and no stretch
+      at the end had one or fewer. Same 50 offer errors, all no sell orders, and 3,504 cache writes
+      against 3,518, so the same work was done. The cap of four is now what bounds a cold run.
+- [x] Tests: 4 added. Three for `run_children`: with no free permit every input runs in turn,
+      free permits at the start are used, and permits released partway through are taken up,
+      which fails with spawning limited to the start (one running at a time against four). One for
+      `pricing_order`.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

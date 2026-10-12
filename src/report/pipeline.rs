@@ -71,7 +71,7 @@ pub async fn run(
     fetched.sort_by_key(|(index, _, _)| *index);
 
     // Group corporations whose offers are identical
-    let mut groups: Vec<(Vec<i32>, Vec<i32>, Vec<LoyaltyOffer>)> = Vec::new();
+    let mut groups: Vec<PendingGroup> = Vec::new();
     for (_, corp_id, result) in fetched {
         let offers = match result {
             Ok(offers) => offers,
@@ -99,6 +99,7 @@ pub async fn run(
         cache: cache_delta(&fetch_before, &fetch_after),
     }));
 
+    pricing_order(&mut groups);
     let group_count = groups.len();
     let mut tasks = JoinSet::new();
     let price_start = Instant::now();
@@ -163,10 +164,57 @@ pub async fn run(
     report
 }
 
+/// A group waiting to be priced: its offer ids, sorted, which is what makes two corporations one
+/// group; its corporations; and its offers.
+type PendingGroup = (Vec<i32>, Vec<i32>, Vec<LoyaltyOffer>);
+
+/// Puts the groups with the most offers first, so the longest lists are started early instead of
+/// being the last work left running. Ties go to the lower first corporation ID, so the order is
+/// the same on every run. The report is sorted by ISK per LP afterwards, so this order is not seen.
+fn pricing_order(groups: &mut [PendingGroup]) {
+    groups.sort_by(|(_, a_corps, a_offers), (_, b_corps, b_offers)| {
+        b_offers
+            .len()
+            .cmp(&a_offers.len())
+            .then_with(|| a_corps[0].cmp(&b_corps[0]))
+    });
+}
+
 fn cache_delta(before: &ClientStats, after: &ClientStats) -> CacheCounts {
     CacheCounts {
         hits: after.cache_hits.saturating_sub(before.cache_hits),
         misses: after.cache_misses.saturating_sub(before.cache_misses),
         writes: after.cache_writes.saturating_sub(before.cache_writes),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(first_corp: i32, offers: usize) -> PendingGroup {
+        let offers = (0..offers)
+            .map(|offer_id| LoyaltyOffer {
+                offer_id: offer_id as i32,
+                ..Default::default()
+            })
+            .collect();
+        (Vec::new(), vec![first_corp], offers)
+    }
+
+    #[test]
+    fn the_groups_with_the_most_offers_are_priced_first() {
+        let mut groups = vec![
+            pending(30, 3),
+            pending(20, 120),
+            pending(40, 40),
+            pending(10, 120),
+        ];
+        pricing_order(&mut groups);
+        let order: Vec<(i32, usize)> = groups
+            .iter()
+            .map(|(_, corps, offers)| (corps[0], offers.len()))
+            .collect();
+        assert_eq!(order, [(10, 120), (20, 120), (40, 40), (30, 3)]);
     }
 }
