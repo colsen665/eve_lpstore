@@ -1328,6 +1328,27 @@ leave the program doing what it did.
       Agreement asks for, quoted from developers.eveonline.com/license-agreement. The paths are the
       Linux ones `paths.rs` documents; the Windows and macOS ones are left to `--verbose` rather
       than written down unchecked.
+- [x] CI, `.github/workflows/ci.yml`, on every branch push and pull request: one job runs
+      `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings`, and
+      `cargo test --locked` runs on Linux, Windows, and macOS, as chosen, all on stable. Locally,
+      stable 1.99 passes all three.
+- [x] Releases, `.github/workflows/release.yml`, on a `v*` tag push: the tag is checked against
+      the version in `Cargo.toml`; `x86_64-unknown-linux-musl` and `x86_64-pc-windows-msvc` are
+      built, as chosen, and packaged with the README and both licenses as
+      `eve_lpstore-<tag>-<target>.tar.gz` and `.zip`; and `gh release create` publishes them with
+      `SHA256SUMS` and generated notes. The actions are the majors current on 2026-10-12:
+      checkout v7, upload-artifact v7, download-artifact v8, rust-cache v2.
+- [x] Checked locally: both workflow files parse; the tag check accepts `v0.1.0` and refuses
+      `v0.2.0` with the two versions named; and the packaging and checksum steps, run as written
+      against a native `x86_64-unknown-linux-gnu` build, give an archive of the four files whose
+      checksum verifies and whose binary prints `eve_lpstore 0.1.0`.
+- [ ] Not checked locally. The musl build: `ring` compiles C and needs a musl C compiler, which
+      this machine lacks, so the build stopped looking for `x86_64-linux-musl-gcc`. In CI the
+      `musl-tools` package provides `musl-gcc`, which cc 1.6.0 tries next
+      (`find_working_gnu_prefix(&["x86_64-linux-musl", "musl"])`), so it should build there; that
+      is read from the source, not run. Also unchecked: the Windows build, the tests on Windows
+      and macOS, some of which time requests against a local server, and every GitHub-side step.
+      The first push and the first tag are those checks.
 
 ## Done
 
