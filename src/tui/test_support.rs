@@ -71,6 +71,7 @@ pub fn report_of(offers: Vec<OfferResult>) -> Report {
     let offer_ids = offers.iter().map(|result| result.offer.offer_id).collect();
     let results = offers.into_iter().map(Arc::new).collect();
     Report::new(
+        &[1000002],
         vec![Store::new(vec![1000002], offer_ids, results)],
         Vec::new(),
         10,

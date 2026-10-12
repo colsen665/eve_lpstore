@@ -5,7 +5,7 @@ mod pipeline;
 
 use crate::lpstore::{OfferError, OfferResult};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,25 +25,60 @@ pub struct Report {
     pub errors: Vec<OfferError>,
     /// The groups for the depth last given to [`Report::regroup`], best first.
     pub groups: Vec<Group>,
+    /// Each corporation's place in the run, which a group lists its corporations in.
+    positions: HashMap<i32, usize>,
 }
 
 impl Report {
-    /// A report of `stores` and the offers that failed, grouped for `depth`.
-    pub fn new(stores: Vec<Store>, errors: Vec<OfferError>, depth: usize) -> Self {
+    /// A report of `stores` and the offers that failed, grouped for `depth`. `corporations` is
+    /// the run's order, which groups list their corporations in; any it leaves out go after, in
+    /// store order.
+    pub fn new(
+        corporations: &[i32],
+        stores: Vec<Store>,
+        errors: Vec<OfferError>,
+        depth: usize,
+    ) -> Self {
+        let positions = corporations
+            .iter()
+            .enumerate()
+            .map(|(position, &corp_id)| (corp_id, position))
+            .collect();
         let mut report = Self {
             stores,
             errors,
             groups: Vec::new(),
+            positions,
         };
         report.regroup(depth);
         report
     }
 
-    /// Builds the groups for `depth`, one per store, and orders them by the average ISK per LP
-    /// over their top `depth` offers, best first, with ties broken by the lower first
-    /// corporation ID.
+    /// Lists together the stores whose top `depth` offers are the same, in the same order, and
+    /// orders the groups by the average ISK per LP over those offers, best first, with ties
+    /// broken by the lower first corporation ID. A store with fewer offers than `depth` only joins
+    /// stores listing exactly its offers. Nothing is priced again, so this is cheap enough to
+    /// repeat on every depth change.
     pub fn regroup(&mut self, depth: usize) {
-        let mut groups: Vec<Group> = self.stores.iter().map(Group::of_store).collect();
+        let mut found: HashMap<Vec<i32>, usize> = HashMap::new();
+        let mut members: Vec<Vec<&Store>> = Vec::new();
+        for store in &self.stores {
+            let listed: Vec<i32> = store
+                .results
+                .iter()
+                .take(depth)
+                .map(|result| result.offer.offer_id)
+                .collect();
+            let index = *found.entry(listed).or_insert_with(|| {
+                members.push(Vec::new());
+                members.len() - 1
+            });
+            members[index].push(store);
+        }
+        let mut groups: Vec<Group> = members
+            .iter()
+            .map(|stores| Group::of_stores(stores, depth, &self.positions))
+            .collect();
         let key = |group: &Group| group.average_isk_per_lp(depth).unwrap_or(f64::NEG_INFINITY);
         groups.sort_by(|a, b| {
             key(b)
@@ -63,14 +98,27 @@ impl Report {
         offers.len()
     }
 
-    /// The corporations whose stores hold `offer_id`, in store order.
-    pub fn corporations_with(&self, offer_id: i32) -> Vec<i32> {
-        self.stores
+    /// The corporations whose stores hold `offer_id`, each with its store's offer count, in the
+    /// run's order.
+    pub fn corporations_with(&self, offer_id: i32) -> Vec<(i32, usize)> {
+        let mut corporations: Vec<(i32, usize)> = self
+            .stores
             .iter()
             .filter(|store| store.offer_ids.binary_search(&offer_id).is_ok())
-            .flat_map(|store| store.corp_ids.iter().copied())
-            .collect()
+            .flat_map(Store::corporations)
+            .collect();
+        self.in_run_order(&mut corporations);
+        corporations
     }
+
+    fn in_run_order(&self, corporations: &mut [(i32, usize)]) {
+        in_run_order(&self.positions, corporations);
+    }
+}
+
+/// Sorts `corporations` into the run's order, keeping the order of any the run does not place.
+fn in_run_order(positions: &HashMap<i32, usize>, corporations: &mut [(i32, usize)]) {
+    corporations.sort_by_key(|(corp_id, _)| positions.get(corp_id).copied().unwrap_or(usize::MAX));
 }
 
 /// Corporations whose loyalty stores hold the same offers, with the priced ones ranked.
@@ -98,6 +146,12 @@ impl Store {
             results,
         }
     }
+
+    /// Each of its corporations with the store's offer count.
+    fn corporations(&self) -> impl Iterator<Item = (i32, usize)> + '_ {
+        let count = self.offer_ids.len();
+        self.corp_ids.iter().map(move |&corp_id| (corp_id, count))
+    }
 }
 
 /// The order offers are listed in: ISK per LP, best first, then offers without a value, with ties
@@ -110,20 +164,48 @@ fn ranking(a: &OfferResult, b: &OfferResult) -> Ordering {
         .then_with(|| a.offer.offer_id.cmp(&b.offer.offer_id))
 }
 
-/// Corporations listed together, with their offers best first.
+/// Corporations whose top offers, as many as the depth, are the same, listed together with those
+/// offers best first.
 #[derive(Debug)]
 pub struct Group {
+    /// In the run's order.
     pub corp_ids: Vec<i32>,
-    pub offer_count: usize,
+    /// How many offers each corporation's store holds, in `corp_ids` order. They differ when the
+    /// group joins stores that differ only below the offers it lists.
+    pub offer_counts: Vec<usize>,
+    /// The offers it lists, at most the depth it was built for.
     pub results: Vec<Arc<OfferResult>>,
 }
 
 impl Group {
-    fn of_store(store: &Store) -> Self {
+    /// The group of `stores`, which list the same top `depth` offers.
+    fn of_stores(stores: &[&Store], depth: usize, positions: &HashMap<i32, usize>) -> Self {
+        let mut corporations: Vec<(i32, usize)> = stores
+            .iter()
+            .flat_map(|store| store.corporations())
+            .collect();
+        in_run_order(positions, &mut corporations);
+        let (corp_ids, offer_counts) = corporations.into_iter().unzip();
         Self {
-            corp_ids: store.corp_ids.clone(),
-            offer_count: store.offer_ids.len(),
-            results: store.results.clone(),
+            corp_ids,
+            offer_counts,
+            results: stores[0].results.iter().take(depth).cloned().collect(),
+        }
+    }
+
+    /// The fewest and the most offers its corporations' stores hold.
+    pub fn offer_range(&self) -> (usize, usize) {
+        let fewest = self.offer_counts.iter().copied().min().unwrap_or(0);
+        let most = self.offer_counts.iter().copied().max().unwrap_or(0);
+        (fewest, most)
+    }
+
+    /// The offer count as the CLI and the view print it: one number, or the fewest and the most,
+    /// such as `118–127`.
+    pub fn offer_count_text(&self) -> String {
+        match self.offer_range() {
+            (fewest, most) if fewest == most => fewest.to_string(),
+            (fewest, most) => format!("{fewest}–{most}"),
         }
     }
 
@@ -237,7 +319,7 @@ mod tests {
         let results = results(1, isk_per_lp);
         Group {
             corp_ids: corp_ids.to_vec(),
-            offer_count: results.len(),
+            offer_counts: vec![results.len(); corp_ids.len()],
             results,
         }
     }
@@ -266,7 +348,7 @@ mod tests {
 
     /// Groups `stores` for `depth` and returns the groups' first corporation IDs, in order.
     fn sorted_corp_ids(stores: Vec<Store>, depth: usize) -> Vec<i32> {
-        let report = Report::new(stores, Vec::new(), depth);
+        let report = Report::new(&[], stores, Vec::new(), depth);
         report.groups.iter().map(|g| g.corp_ids[0]).collect()
     }
 
@@ -275,8 +357,9 @@ mod tests {
         let order = sorted_corp_ids(
             vec![
                 store(&[30], &[Some(1.0)]),
-                store(&[20], &[]),
-                store(&[10], &[]),
+                // Different offers, both without a value, so neither joins the other.
+                store(&[20], &[None]),
+                store(&[10], &[None]),
                 store(&[40], &[Some(5.0)]),
                 store(&[15], &[Some(5.0)]),
             ],
@@ -366,9 +449,104 @@ mod tests {
         second.offer_ids.push(7);
         first.offer_ids.sort_unstable();
         second.offer_ids.sort_unstable();
-        let report = Report::new(vec![first, second], Vec::new(), 10);
+        let report = Report::new(&[], vec![first, second], Vec::new(), 10);
         assert_eq!(report.offer_count(), 3, "1000, 2000, and 7 once");
-        assert_eq!(report.corporations_with(7), [10, 11, 20]);
-        assert_eq!(report.corporations_with(2000), [20]);
+        assert_eq!(report.corporations_with(7), [(10, 2), (11, 2), (20, 2)]);
+        assert_eq!(report.corporations_with(2000), [(20, 2)]);
+    }
+
+    /// A store of `corp_ids` holding offers with these (offer ID, ISK per LP) pairs.
+    fn holding(corp_ids: &[i32], offers: &[(i32, f64)]) -> Store {
+        let results: Vec<Arc<OfferResult>> = offers
+            .iter()
+            .map(|&(offer_id, isk_per_lp)| {
+                let mut result = OfferResult {
+                    isk_per_lp: Some(isk_per_lp),
+                    ..Default::default()
+                };
+                result.offer.offer_id = offer_id;
+                Arc::new(result)
+            })
+            .collect();
+        let offer_ids = offers.iter().map(|&(offer_id, _)| offer_id).collect();
+        Store::new(corp_ids.to_vec(), offer_ids, results)
+    }
+
+    /// The groups' corporations, best group first.
+    fn grouped(report: &Report) -> Vec<Vec<i32>> {
+        report.groups.iter().map(|g| g.corp_ids.clone()).collect()
+    }
+
+    #[test]
+    fn stores_listing_the_same_top_offers_are_one_group() {
+        // Both list offers 1 and 2 at depth 2. They differ below that, in what and how many.
+        let stores = vec![
+            holding(&[10], &[(1, 9.0), (2, 8.0), (3, 1.0)]),
+            holding(&[20], &[(1, 9.0), (2, 8.0), (4, 2.0), (5, 0.5)]),
+            holding(&[30], &[(1, 9.0), (6, 7.0)]),
+        ];
+        let report = Report::new(&[10, 20, 30], stores, Vec::new(), 2);
+        assert_eq!(grouped(&report), [vec![10, 20], vec![30]]);
+        let joined = &report.groups[0];
+        assert_eq!(joined.offer_counts, [3, 4]);
+        assert_eq!(joined.offer_count_text(), "3–4");
+        assert_eq!(report.groups[1].offer_count_text(), "2");
+        let listed: Vec<i32> = joined.results.iter().map(|r| r.offer.offer_id).collect();
+        assert_eq!(listed, [1, 2], "only the shared offers");
+    }
+
+    #[test]
+    fn a_new_depth_joins_or_splits_groups() {
+        let stores = vec![
+            holding(&[10], &[(1, 9.0), (2, 8.0), (3, 1.0)]),
+            holding(&[20], &[(1, 9.0), (2, 8.0), (4, 2.0)]),
+            holding(&[30], &[(1, 9.0), (6, 7.0)]),
+        ];
+        let mut report = Report::new(&[10, 20, 30], stores, Vec::new(), 3);
+        assert_eq!(grouped(&report), [vec![30], vec![20], vec![10]]);
+        report.regroup(1);
+        assert_eq!(
+            grouped(&report),
+            [vec![10, 20, 30]],
+            "all list offer 1 first"
+        );
+        report.regroup(2);
+        assert_eq!(grouped(&report), [vec![10, 20], vec![30]]);
+    }
+
+    #[test]
+    fn a_store_with_fewer_offers_than_the_depth_joins_only_the_same_list() {
+        // 30 lists offers 1 and 2 and nothing else. At depth 3, 10 lists a third offer, so they
+        // are not the same list; 20 lists exactly what 30 does.
+        let stores = vec![
+            holding(&[10], &[(1, 9.0), (2, 8.0), (3, 1.0)]),
+            holding(&[20], &[(1, 9.0), (2, 8.0)]),
+            holding(&[30], &[(1, 9.0), (2, 8.0)]),
+        ];
+        let report = Report::new(&[10, 20, 30], stores, Vec::new(), 3);
+        assert_eq!(grouped(&report), [vec![20, 30], vec![10]]);
+    }
+
+    #[test]
+    fn stores_listing_nothing_are_one_group() {
+        let stores = vec![
+            holding(&[10], &[]),
+            holding(&[20], &[]),
+            holding(&[30], &[(1, 1.0)]),
+        ];
+        let report = Report::new(&[10, 20, 30], stores, Vec::new(), 10);
+        assert_eq!(grouped(&report), [vec![30], vec![10, 20]]);
+    }
+
+    #[test]
+    fn a_joined_group_lists_its_corporations_in_the_runs_order() {
+        // The run is 1, 3, 5, so the first store's 1 and 5 do not stay together ahead of 3.
+        let stores = vec![
+            holding(&[1, 5], &[(7, 2.0), (8, 1.0)]),
+            holding(&[3], &[(7, 2.0)]),
+        ];
+        let report = Report::new(&[1, 3, 5], stores, Vec::new(), 1);
+        assert_eq!(grouped(&report), [vec![1, 3, 5]]);
+        assert_eq!(report.groups[0].offer_counts, [2, 1, 2]);
     }
 }

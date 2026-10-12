@@ -59,7 +59,11 @@ fn group_item(
         .map(|&id| corp_name(sdata, id))
         .collect();
     ListItem::new(vec![
-        Line::from(format!("{} avg ISK/LP | {} offers", isk, group.offer_count)),
+        Line::from(format!(
+            "{} avg ISK/LP | {} offers",
+            isk,
+            group.offer_count_text()
+        )),
         Line::from(Span::styled(
             truncate(&names.join(", "), names_width),
             Style::new().dark_gray(),

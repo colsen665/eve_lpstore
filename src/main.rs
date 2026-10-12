@@ -46,8 +46,8 @@ Options:
   --cache-minutes <n>    Extend how long cached responses are reused, by n minutes past their Expires time. Default 0 for --example, and the number of corporations for --lpstores. Use 0 to turn it off.
   --cache-dir <path>     Where to keep ESI responses, instead of the platform cache directory. The static data does not move with it.
   --tasks <n>            Fetch and pricing tasks that run at once with --lpstores. Default 64. The ESI requests they make are capped separately, by --max-inflight.
-  --max-inflight <n>     Maximum ESI requests in flight at once across all groups. Default 4.
-  --depth <n>            Offers printed per corporation group with --lpstores. Default 10.
+  --max-inflight <n>     Maximum ESI requests in flight at once across the whole run. Default 4.
+  --depth <n>            Offers listed per group with --lpstores. Corporations whose top n offers are the same are listed as one group. Default 10.
   --verbose              Print cache hits, misses, and writes, with reasons and file names, and the cache and data directories. In the full-screen view, the default when no mode is given, they go to the log, which names the two directories with or without this flag.
   --clear-cache          Delete the cached ESI responses, and the static data archive if one is on disk. The four extracted static data files stay. With no other mode this stops there rather than opening the full-screen view.
 

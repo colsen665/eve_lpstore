@@ -301,15 +301,19 @@ impl App {
         });
     }
 
-    /// Changes how many offers each group lists. The run itself is unchanged, so the group
-    /// order is re-sorted for the new depth and the selected group stays selected.
+    /// Changes how many offers each group lists. The run itself is unchanged, so the groups are
+    /// rebuilt for the new depth from the offers already priced, which can join or split them,
+    /// and the group holding the selected group's first corporation stays selected.
     pub fn apply_depth(&mut self, depth: usize) {
-        let selected = self.selected_group().map(|group| group.corp_ids.clone());
+        let selected = self.selected_group().map(|group| group.corp_ids[0]);
         self.depth = depth;
         if let Some(report) = &mut self.report {
             report.regroup(depth);
             if let Some(selected) = selected
-                && let Some(index) = report.groups.iter().position(|g| g.corp_ids == selected)
+                && let Some(index) = report
+                    .groups
+                    .iter()
+                    .position(|g| g.corp_ids.contains(&selected))
             {
                 self.group = index;
             }
@@ -787,7 +791,7 @@ mod tests {
     }
 
     fn report(stores: Vec<Store>, errors: Vec<OfferError>) -> Report {
-        Report::new(stores, errors, 10)
+        Report::new(&[], stores, errors, 10)
     }
 
     fn app_with(stores: Vec<Store>, depth: usize) -> App {
@@ -1450,11 +1454,41 @@ mod tests {
         // moved to depth 2 while it ran, where corp 2's 6 beats corp 1's 5.
         let mut app = new_app(2);
         app.finish(Report::new(
+            &[],
             vec![group(1, &[10.0, 0.0]), group(2, &[6.0, 6.0])],
             Vec::new(),
             1,
         ));
         assert_eq!(app.groups()[0].corp_ids, vec![2]);
+    }
+
+    #[test]
+    fn a_depth_change_that_joins_and_splits_groups_keeps_the_selected_corporation() {
+        // Both list offer 1 first, at 9 ISK per LP, and differ below it.
+        let store = |corp_id: i32, second: f64| {
+            let mut best = offer(9.0);
+            best.offer.offer_id = 1;
+            let mut next = offer(second);
+            next.offer.offer_id = corp_id * 100;
+            Store::new(
+                vec![corp_id],
+                vec![1, corp_id * 100],
+                vec![Arc::new(best), Arc::new(next)],
+            )
+        };
+        let mut app = app_with(vec![store(1, 5.0), store(2, 8.0)], 2);
+        assert_eq!(app.groups()[1].corp_ids, vec![1]);
+        app.group = 1;
+        app.apply_depth(1);
+        assert_eq!(app.groups().len(), 1, "both list only offer 1");
+        assert_eq!(app.groups()[0].corp_ids, vec![1, 2]);
+        assert_eq!(app.group, 0);
+        app.apply_depth(2);
+        assert_eq!(app.groups()[1].corp_ids, vec![1]);
+        assert_eq!(
+            app.group, 1,
+            "the group holding corporation 1 is selected again"
+        );
     }
 
     #[test]

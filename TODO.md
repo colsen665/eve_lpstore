@@ -1254,6 +1254,40 @@ leave the program doing what it did.
       the view's depth on arrival, and a failed join naming the ID `spawn` returned. The fixtures
       build stores through `Report::new` and `Store::new`.
 
+#### Grouping by the listed offers
+
+- [x] Observed: corporations were one group only when their whole stores matched, so groups
+      listing the same top offers printed the same lines more than once.
+- [x] `Report::regroup(depth)` joins the stores whose top `depth` offers are the same, in the same
+      order; the ranking is a total order, so the same offers always come in the same order. A
+      store with fewer offers than the depth joins only stores listing exactly its offers, and
+      stores listing nothing are one group. A group lists only the offers its stores share.
+      Corporations are listed in the run's order, which `Report` keeps, since joined stores can
+      interleave in it: stores of 1 and 5 and of 3 list as 1, 3, 5. The view regroups on every
+      depth change and keeps the group holding the selected group's first corporation selected.
+- [x] Offer counts as a range, as chosen: `Loyalty offers: 319–322 found` in the CLI and
+      `| 319–322 offers` in the groups pane, one number when equal. JSON groups have
+      `min_offer_count` and `max_offer_count`, and every corporation entry, in groups and in
+      errors, its own `offer_count`; CSV's `offer_count` column is now `min_offer_count` and
+      `max_offer_count`, so it has 21 columns. The help for `--depth` says how groups are formed,
+      and `--max-inflight` says "across the whole run" instead of "across all groups".
+- [x] Observed and left as it is: stores with no offers join a store whose three offers all
+      failed to price, since neither lists anything, and the group reads `Loyalty offers: 0–3
+      found` over no offers.
+- [x] Measured fully cached, on the same warm copy, at depths 5, 10, and 20: 71 groups before at
+      every depth; 40, 42, and 51 after, of which 14, 13, and 16 show a range. Checked against an
+      oracle built from the old binary's output by joining the groups whose printed top offers
+      match as sets: the same number of groups at each depth, and the matching groups in the same
+      order. The rest, 2, 2, and 5, each have the same corporations and ISK per LP sequence as one
+      new group, and differ only in which offers without a value are listed at the cut, which the
+      tie-break by offer ID now decides.
+- [x] Tests: 7 added, for stores listing the same top offers joining with a range, a new depth
+      joining and splitting groups, a store with fewer offers than the depth, stores listing
+      nothing, a joined group in the run's order, the view keeping the selected corporation through
+      a join and a split, and the export's fewest and most offers. One test changed: its two empty
+      stores are now one group, so each holds one offer without a value instead. Keying the join
+      on the whole ranked list fails 4 of them.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

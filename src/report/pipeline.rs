@@ -12,8 +12,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 
 /// Fetches the loyalty offers of every corporation in `resolved`, puts the corporations whose
-/// offers are identical in one store, prices each distinct offer once, and groups the stores for
-/// `resolved.depth`.
+/// offers are identical in one store, prices each distinct offer once, and groups the stores that
+/// list the same top `resolved.depth` offers.
 ///
 /// Progress goes to `events` as it happens, tagged with `run_id`.
 pub async fn run(
@@ -149,7 +149,7 @@ pub async fn run(
         cache: cache_delta(&price_before, &price_after),
     }));
 
-    let stores = stores
+    let stores: Vec<Store> = stores
         .into_iter()
         .map(|(offer_ids, corp_ids, _)| {
             let results = offer_ids
@@ -159,7 +159,7 @@ pub async fn run(
             Store::new(corp_ids, offer_ids, results)
         })
         .collect();
-    Report::new(stores, errors, resolved.depth)
+    Report::new(&resolved.corp_ids, stores, errors, resolved.depth)
 }
 
 /// A store waiting for its offers to be priced: its offer ids, sorted, which is what makes two

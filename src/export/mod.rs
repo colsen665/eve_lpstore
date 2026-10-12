@@ -66,10 +66,11 @@ pub struct ExportContext<'a> {
 
 /// The columns of the CSV export, in order. The required items of an offer are a list, so they
 /// only appear in the JSON export.
-const CSV_COLUMNS: [&str; 20] = [
+const CSV_COLUMNS: [&str; 21] = [
     "group",
     "average_isk_per_lp",
-    "offer_count",
+    "min_offer_count",
+    "max_offer_count",
     "corporations",
     "rank",
     "item",
@@ -99,21 +100,25 @@ struct ExportFile<'a> {
     errors: Vec<ExportError<'a>>,
 }
 
-/// One corporation group, as the groups pane lists it.
+/// One corporation group, as the groups pane lists it. Its corporations' stores can hold
+/// different numbers of offers, since a group only needs the offers it lists to be the same.
 #[derive(Serialize)]
 struct ExportGroup<'a> {
     rank: usize,
     average_isk_per_lp: Option<f64>,
-    offer_count: usize,
+    min_offer_count: usize,
+    max_offer_count: usize,
     corporations: Vec<ExportCorp<'a>>,
     offers: Vec<ExportOffer<'a>>,
 }
 
-/// A corporation in the group. The name is `None` when static data does not know the id.
+/// A corporation, with how many offers its store holds. The name is `None` when static data does
+/// not know the id.
 #[derive(Serialize)]
 struct ExportCorp<'a> {
     id: i32,
     name: Option<&'a str>,
+    offer_count: usize,
 }
 
 /// One loyalty offer, with the same figures the offers pane and the detail pane show.
@@ -210,18 +215,23 @@ fn build<'a>(
             .map(|error| ExportError {
                 offer_id: error.offer_id,
                 error: error.error.to_string(),
-                corporations: corporations(&report.corporations_with(error.offer_id), sdata),
+                corporations: corporations(report.corporations_with(error.offer_id), sdata),
             })
             .collect(),
     }
 }
 
-fn corporations<'a>(corp_ids: &[i32], sdata: &'a StaticData) -> Vec<ExportCorp<'a>> {
-    corp_ids
-        .iter()
-        .map(|&id| ExportCorp {
+/// Corporations as (id, offer count) pairs, named.
+fn corporations<'a>(
+    corporations: impl IntoIterator<Item = (i32, usize)>,
+    sdata: &'a StaticData,
+) -> Vec<ExportCorp<'a>> {
+    corporations
+        .into_iter()
+        .map(|(id, offer_count)| ExportCorp {
             id,
             name: sdata.corporation_name(id).map(String::as_str),
+            offer_count,
         })
         .collect()
 }
@@ -245,8 +255,16 @@ fn export_group<'a>(
     ExportGroup {
         rank,
         average_isk_per_lp: money(group.average_isk_per_lp(depth)),
-        offer_count: group.offer_count,
-        corporations: corporations(&group.corp_ids, sdata),
+        min_offer_count: group.offer_range().0,
+        max_offer_count: group.offer_range().1,
+        corporations: corporations(
+            group
+                .corp_ids
+                .iter()
+                .copied()
+                .zip(group.offer_counts.iter().copied()),
+            sdata,
+        ),
         offers: group
             .results
             .iter()
@@ -309,7 +327,8 @@ fn csv_row(group: &ExportGroup, offer: &ExportOffer) -> Vec<String> {
     vec![
         group.rank.to_string(),
         number(group.average_isk_per_lp),
-        group.offer_count.to_string(),
+        group.min_offer_count.to_string(),
+        group.max_offer_count.to_string(),
         csv_field(&corporations),
         offer.rank.to_string(),
         csv_text(offer.item),
@@ -371,6 +390,7 @@ mod tests {
             },
         };
         Report::new(
+            &[],
             vec![
                 Store::new(
                     vec![1000002, 999999],
@@ -514,13 +534,14 @@ mod tests {
         // back to their ids, and the group lists both of its corps in one cell.
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], "1");
-        assert_eq!(rows[0][3], "1000002, 999999");
-        assert_eq!(rows[0][5], "");
-        assert_eq!(rows[0][6], "30486");
+        assert_eq!(rows[0][2..4], ["3", "3"], "fewest and most offers");
+        assert_eq!(rows[0][4], "1000002, 999999");
+        assert_eq!(rows[0][6], "");
+        assert_eq!(rows[0][7], "30486");
         assert_eq!(rows[1][0], "1");
-        assert_eq!(rows[1][4], "2");
+        assert_eq!(rows[1][5], "2");
         assert_eq!(rows[2][0], "2");
-        assert_eq!(rows[2][3], "1000001");
+        assert_eq!(rows[2][4], "1000001");
     }
 
     #[test]
@@ -530,12 +551,12 @@ mod tests {
         let text = csv(&report, &context, &no_names());
         // The second offer of the first group has no reward, no ask, and no book.
         let cells = csv_fields(text.lines().skip(1).nth(1).unwrap());
-        assert_eq!(cells[9], "", "reward");
-        assert_eq!(cells[13], "", "best ask");
-        assert_eq!(cells[14], "", "spread");
-        assert_eq!(cells[17], "", "imbalance");
-        assert_eq!(cells[19], "", "profit within 10%");
-        assert_eq!(cells[12], "900", "isk per lp is still there");
+        assert_eq!(cells[10], "", "reward");
+        assert_eq!(cells[14], "", "best ask");
+        assert_eq!(cells[15], "", "spread");
+        assert_eq!(cells[18], "", "imbalance");
+        assert_eq!(cells[20], "", "profit within 10%");
+        assert_eq!(cells[13], "900", "isk per lp is still there");
     }
 
     /// Splits a CSV row on commas, keeping a quoted field together however many commas it holds.
@@ -614,8 +635,10 @@ mod tests {
         assert_eq!(parsed["depth"], 10);
         let group = &parsed["groups"][0];
         assert_eq!(group["rank"], 1);
-        assert_eq!(group["offer_count"], 3);
+        assert_eq!(group["min_offer_count"], 3);
+        assert_eq!(group["max_offer_count"], 3);
         assert_eq!(group["corporations"][0]["id"], 1000002);
+        assert_eq!(group["corporations"][0]["offer_count"], 3);
         assert_eq!(group["corporations"][0]["name"], serde_json::Value::Null);
         let offer = &group["offers"][0];
         assert_eq!(offer["rank"], 1);
@@ -653,8 +676,44 @@ mod tests {
     }
 
     #[test]
+    fn a_joined_group_writes_its_fewest_and_most_offers() {
+        // At depth 1 both stores list only offer 1, so they are one group, though one store holds
+        // two offers and the other one.
+        let shared = || Arc::new(offer(1, 30486, 1627.78, true));
+        let report = Report::new(
+            &[1000001, 1000002],
+            vec![
+                Store::new(
+                    vec![1000001],
+                    vec![1, 2],
+                    vec![shared(), Arc::new(offer(2, 1, 900.0, false))],
+                ),
+                Store::new(vec![1000002], vec![1], vec![shared()]),
+            ],
+            Vec::new(),
+            1,
+        );
+        let context = context(1);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
+        let group = &parsed["groups"][0];
+        assert_eq!(parsed["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(group["min_offer_count"], 1);
+        assert_eq!(group["max_offer_count"], 2);
+        assert_eq!(group["corporations"][0]["offer_count"], 2);
+        assert_eq!(group["corporations"][1]["offer_count"], 1);
+        let rows: Vec<Vec<String>> = csv(&report, &context, &no_names())
+            .lines()
+            .skip(1)
+            .map(csv_fields)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][2..5], ["1", "2", "1000001, 1000002"]);
+    }
+
+    #[test]
     fn an_empty_report_still_writes_a_valid_file() {
-        let report = Report::new(Vec::new(), Vec::new(), 10);
+        let report = Report::new(&[], Vec::new(), Vec::new(), 10);
         let context = context(10);
         assert_eq!(
             csv(&report, &context, &no_names()),

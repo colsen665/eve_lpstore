@@ -194,7 +194,7 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 println!("{}", corp_line(sdata, id, &resolved.agent_filter));
             }
         }
-        println!("Loyalty offers: {} found", group.offer_count);
+        println!("Loyalty offers: {} found", group.offer_count_text());
 
         println!(
             "Top {} offers by ISK per LP (descending):",
