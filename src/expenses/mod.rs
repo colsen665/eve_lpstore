@@ -1,6 +1,6 @@
+use crate::esi::EsiClient;
 use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
-use crate::esi::EsiClient;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};

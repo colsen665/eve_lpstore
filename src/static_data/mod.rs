@@ -174,7 +174,11 @@ impl StaticData {
 
     fn faction_short_name(full: &str) -> String {
         let stripped = full.strip_prefix("the ").unwrap_or(full);
-        stripped.split_whitespace().next().unwrap_or(stripped).to_string()
+        stripped
+            .split_whitespace()
+            .next()
+            .unwrap_or(stripped)
+            .to_string()
     }
 
     /// The division ID for an internal name, matched case-insensitively.
@@ -195,7 +199,10 @@ impl StaticData {
 
     /// Division names accepted by `division_id`.
     pub fn division_names(&self) -> Vec<String> {
-        self.divisions.iter().map(|(_, internal)| internal.to_lowercase()).collect()
+        self.divisions
+            .iter()
+            .map(|(_, internal)| internal.to_lowercase())
+            .collect()
     }
 
     /// The agent type ID for a name such as `basic` or `BasicAgent`, matched case-insensitively.

@@ -73,7 +73,10 @@ mod tests {
 
     #[test]
     fn shared_keeps_rate_limit_fields() {
-        let error = EsiError::RateLimit { remain: 0, reset: 42 };
+        let error = EsiError::RateLimit {
+            remain: 0,
+            reset: 42,
+        };
         match SharedError::from(&error) {
             SharedError::RateLimit { remain, reset } => assert_eq!((remain, reset), (0, 42)),
             other => panic!("unexpected variant: {other:?}"),

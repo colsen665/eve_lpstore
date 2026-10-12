@@ -55,10 +55,7 @@ impl<'a> UniverseEndpoint<'a> {
     /// Get detailed information about a specific type.
     ///
     /// `GET /universe/types/{type_id}/`
-    pub async fn type_info(
-        &self,
-        type_id: i32,
-    ) -> Result<TypeInfo, crate::esi::error::EsiError> {
+    pub async fn type_info(&self, type_id: i32) -> Result<TypeInfo, crate::esi::error::EsiError> {
         let path = format!("universe/types/{}/", type_id);
         self.client.get(&path, &[]).await
     }

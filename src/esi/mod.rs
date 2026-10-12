@@ -6,7 +6,7 @@ pub mod retry;
 pub mod universe;
 
 use error::{EsiError, SharedError};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeSet, HashMap};
@@ -743,17 +743,26 @@ impl EsiClient {
         };
 
         // Ensure cache directory exists
-        tokio::fs::create_dir_all(cache_dir).await.map_err(EsiError::Io)?;
+        tokio::fs::create_dir_all(cache_dir)
+            .await
+            .map_err(EsiError::Io)?;
 
         // Write cache file
         let filename = format!("{}_{}_{}.json", entry_type, entry_id, expiry);
         // Write to a temporary file, then rename it into place so readers never see a partial file
         let filepath = std::path::Path::new(cache_dir).join(&filename);
-        let temp_path = std::path::Path::new(cache_dir)
-            .join(format!(".{}.{}.tmp", filename, std::process::id()));
+        let temp_path = std::path::Path::new(cache_dir).join(format!(
+            ".{}.{}.tmp",
+            filename,
+            std::process::id()
+        ));
         let content = serde_json::to_string(&CachedPageRef { pages, body })?;
-        tokio::fs::write(&temp_path, content).await.map_err(EsiError::Io)?;
-        tokio::fs::rename(&temp_path, &filepath).await.map_err(EsiError::Io)?;
+        tokio::fs::write(&temp_path, content)
+            .await
+            .map_err(EsiError::Io)?;
+        tokio::fs::rename(&temp_path, &filepath)
+            .await
+            .map_err(EsiError::Io)?;
         self.stats.lock().unwrap().cache_writes += 1;
         self.cache_index
             .lock()
@@ -845,12 +854,7 @@ impl EsiClient {
             };
             drop(waiting);
             let in_flight = InFlightGuard::new(self.stats.clone());
-            let response = self
-                .http
-                .get(url.clone())
-                .headers(headers)
-                .send()
-                .await;
+            let response = self.http.get(url.clone()).headers(headers).send().await;
             let response = response.map_err(EsiError::Http)?;
 
             let status = response.status();
@@ -934,8 +938,7 @@ impl EsiClient {
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.to_string());
 
-                let body: serde_json::Value =
-                    response.json().await.map_err(EsiError::Http)?;
+                let body: serde_json::Value = response.json().await.map_err(EsiError::Http)?;
                 drop(in_flight);
                 drop(permit);
 

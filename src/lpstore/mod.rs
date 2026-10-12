@@ -1,6 +1,6 @@
+use crate::esi::EsiClient;
 use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
-use crate::esi::EsiClient;
 use crate::expenses::{
     ExpenseBreakdown, ItemExpense, ItemPrices, MarketQuote, PricingError, breakdown_from,
 };
