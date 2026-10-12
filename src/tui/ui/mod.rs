@@ -56,6 +56,8 @@ pub struct PaneLayout {
     pub detail_visible: usize,
     pub destinations_rows: usize,
     pub destinations_visible: usize,
+    pub help_rows: usize,
+    pub help_visible: usize,
 }
 
 /// Draws the whole view. Reports what each scrollable pane needs to know about itself.
@@ -104,7 +106,7 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
         header,
     );
 
-    let layout = match &app.overlay {
+    let mut layout = match &app.overlay {
         Overlay::Log => {
             draw_log(frame, body, app);
             PaneLayout::default()
@@ -124,7 +126,9 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
     // footer being drawn over the popup's last rows.
     draw_footer(frame, footer, stats, app);
     match &app.overlay {
-        Overlay::Help => draw_help(frame, area),
+        Overlay::Help => {
+            (layout.help_rows, layout.help_visible) = draw_help(frame, area, app.help_scroll);
+        }
         Overlay::Donate => draw_donate(frame, area),
         Overlay::Export(prompt) => draw_export(frame, area, prompt),
         Overlay::StaticData(dialog) => draw_static_data(frame, area, dialog, &app.data_dir),
@@ -148,8 +152,7 @@ fn draw_results(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) ->
     PaneLayout {
         detail_rows,
         detail_visible,
-        destinations_rows: 0,
-        destinations_visible: 0,
+        ..PaneLayout::default()
     }
 }
 

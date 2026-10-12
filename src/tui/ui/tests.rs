@@ -1284,3 +1284,61 @@ fn a_popup_reaching_the_footer_keeps_its_last_rows() {
     assert!(text.contains(DONATION_ADDRESS), "{text}");
     assert!(text.contains("Esc or d closes this"), "{text}");
 }
+
+/// The view with the help open over one finished run, scrolled `scroll` lines down.
+fn help_text(width: u16, height: u16, scroll: usize) -> String {
+    let mut app = results_app(one_priced_offer(), 10);
+    app.on_key(press(crossterm::event::KeyCode::Char('?')));
+    app.help_scroll = scroll;
+    view_text(&app, width, height)
+}
+
+#[test]
+fn the_help_explains_every_figure_in_full_on_a_large_screen() {
+    let text = help_text(120, 40, 0);
+    assert!(text.contains(" Help "), "{text}");
+    assert!(
+        !text.contains("to scroll"),
+        "it all fits, so there is nothing to scroll: {text}"
+    );
+    assert!(text.contains("Figures"));
+    // Every line whole: the popup is 78 columns inside, and the longest figure line is 78.
+    for (name, line) in HELP_FIGURES {
+        assert!(
+            text.contains(line),
+            "{name:?} {line:?} is cut or missing: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_help_scrolls_on_the_smallest_screen() {
+    // Whole rows, with the key column, since a row drawn over by something else can still leave a
+    // fragment of its text behind.
+    let row = |key: &str, text: &str| format!("│{:<16}{:<62}│", key, text);
+    let top = help_text(MIN_WIDTH, MIN_HEIGHT, 0);
+    assert!(top.contains(" Help, Up/Down to scroll "), "{top}");
+    assert!(top.contains(&row("Tab", "switch between groups, offers, and details")));
+    assert!(
+        top.contains(&row("", "(ISK cost + items) ÷ units")),
+        "the last row of the window shows whole: {top}"
+    );
+    assert!(
+        !top.contains("only the Market system's stations"),
+        "the last line is below the window: {top}"
+    );
+    assert!(
+        !top.contains("In-flight:"),
+        "the help covers the footer: {top}"
+    );
+    // Scrolled past the end, the window stops at the last line.
+    let bottom = help_text(MIN_WIDTH, MIN_HEIGHT, 100);
+    let (name, text) = HELP_FIGURES[HELP_FIGURES.len() - 1];
+    assert!(bottom.contains(&row(name, text)), "{bottom}");
+    let (name, text) = HELP_FIGURES[HELP_FIGURES.len() - 2];
+    assert!(bottom.contains(&row(name, text)), "{bottom}");
+    assert!(
+        !bottom.contains("switch between groups"),
+        "the first line scrolled away: {bottom}"
+    );
+}

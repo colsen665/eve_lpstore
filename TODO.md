@@ -1395,6 +1395,30 @@ leave the program doing what it did.
       The footer is drawn before the popups now. A test of the whole view at 80x24 with the
       donation popup open, which fails with the old order, checks both lines show.
 
+#### Figures in the help
+
+- [x] The help, `?`, lists under "Figures" what each column of the offers table is and how it is
+      worked out, in the wording chosen: the formula and what its colour means, two lines at
+      most. ISK/LP is (reward × units − ISK cost − items) ÷ LP cost per redemption, with the
+      reward at the best buy order and the items at the best sell orders. Spread is (best ask −
+      best bid) ÷ best bid, green to 10%, yellow to 50%, red past it, magenta when inverted.
+      Imbal is (bid − ask volume) ÷ their sum within 10% of each best price, green from +25% and
+      red from −25%. Vol ±10% is the units buy orders take at 90% or more of the best bid, and
+      Profit ±10% is (price − unit cost) × units over them, with unit cost (ISK cost + items) ÷
+      units. Two more lines say what n/a means and that prices come from the Market region, or
+      only the Market system's stations. Each was checked against `lpstore` and the colour
+      bands in `offers.rs`.
+- [x] The column titles stay as they are, as chosen, although Vol ±10% and Profit ±10% count only
+      buy orders from 90% to 100% of the best bid; the help says so.
+- [x] The help scrolls, as chosen. It is 80 columns wide, so a formula fits on one 78-column
+      line, and 24 lines long, so at 80x24 it shows 22 and the title says Up/Down scrolls. The
+      arrows and the page keys scroll it within its length, as they do the details pane, and it
+      opens at the top. The Up/Down key line says it scrolls the help too.
+- [x] Tests: 3 added, for every figure line showing whole on a large screen, the window at 80x24
+      at the top and at the end, with whole rows and no footer showing through, and the keys
+      scrolling it within bounds and reopening it at the top. Drawing the footer last again
+      fails the 80x24 one.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

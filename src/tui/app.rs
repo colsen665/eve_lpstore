@@ -145,6 +145,10 @@ pub struct App {
     pub destinations_rows: usize,
     pub destinations_visible: usize,
     pub destinations_scroll: usize,
+    /// Scrolling within the help, bounded the same way.
+    pub help_rows: usize,
+    pub help_visible: usize,
+    pub help_scroll: usize,
     pub overlay: Overlay,
     /// Where the static data files live, for the dialog's text. The view is given this after the
     /// platform roots are found; until then it says only that there is a data directory.
@@ -179,6 +183,9 @@ impl App {
             destinations_rows: 0,
             destinations_visible: 0,
             destinations_scroll: 0,
+            help_rows: 0,
+            help_visible: 0,
+            help_scroll: 0,
             overlay: Overlay::None,
             data_dir: super::ui::UNKNOWN_DATA_DIR.to_string(),
         }
@@ -455,6 +462,11 @@ impl App {
         self.destinations_visible = visible;
     }
 
+    pub fn set_help_layout(&mut self, rows: usize, visible: usize) {
+        self.help_rows = rows;
+        self.help_visible = visible;
+    }
+
     /// Records how the details pane was drawn: its total rows, and how many fit on screen.
     /// Scrolling uses these, so the last row can always be reached.
     pub fn set_detail_layout(&mut self, rows: usize, visible: usize) {
@@ -550,13 +562,16 @@ impl App {
     fn on_view_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Esc => self.overlay = Overlay::None,
-            KeyCode::Char('?') => self.toggle(Overlay::Help),
+            KeyCode::Char('?') => {
+                // The help opens at its top, on the keys, whatever was scrolled to last time.
+                self.help_scroll = 0;
+                self.toggle(Overlay::Help);
+            }
             KeyCode::Char('l') => self.toggle(Overlay::Log),
             KeyCode::Char('f') => self.open_form(),
             KeyCode::Char('e') if self.report.is_some() => self.open_export(),
             KeyCode::Char('d') => self.toggle(Overlay::Donate),
             KeyCode::Char('m') if self.report.is_some() => self.toggle(Overlay::Destinations),
-            _ if self.overlay == Overlay::Help => {}
             KeyCode::Tab => {
                 if self.overlay == Overlay::None && self.report.is_some() {
                     self.focus = self.focus.next();
@@ -641,6 +656,11 @@ impl App {
         if self.overlay == Overlay::Log {
             let max = self.log.len().saturating_sub(1);
             self.log_scroll = shift(self.log_scroll, -delta, max);
+            return;
+        }
+        if self.overlay == Overlay::Help {
+            let max = self.help_rows.saturating_sub(self.help_visible);
+            self.help_scroll = shift(self.help_scroll, delta, max);
             return;
         }
         if self.overlay == Overlay::Destinations {
@@ -1489,6 +1509,32 @@ mod tests {
             app.group, 1,
             "the group holding corporation 1 is selected again"
         );
+    }
+
+    #[test]
+    fn the_keys_scroll_the_help_and_it_reopens_at_the_top() {
+        let mut app = app_with(vec![group(1, &[5.0, 4.0])], 10);
+        app.on_key(press(KeyCode::Char('?')));
+        assert_eq!(app.overlay, Overlay::Help);
+        // As the draw reports it at 80x24: 24 lines, 22 of them showing.
+        app.set_help_layout(24, 22);
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.help_scroll, 1);
+        app.on_key(press(KeyCode::PageDown));
+        assert_eq!(app.help_scroll, 2, "no further than the last line");
+        app.on_key(press(KeyCode::Char('k')));
+        assert_eq!(app.help_scroll, 1);
+        app.on_key(press(KeyCode::Tab));
+        assert_eq!(
+            app.focus,
+            Focus::Groups,
+            "Tab does not move the panes behind it"
+        );
+        assert_eq!(app.offer, 0, "nor do the arrows");
+        app.on_key(press(KeyCode::Char('?')));
+        assert_eq!(app.overlay, Overlay::None);
+        app.on_key(press(KeyCode::Char('?')));
+        assert_eq!(app.help_scroll, 0, "back at the keys");
     }
 
     #[test]

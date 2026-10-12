@@ -145,12 +145,15 @@ pub(super) fn draw_export(frame: &mut Frame, area: Rect, prompt: &ExportPrompt) 
     popup(frame, area, " Export ", POPUP_WIDTH, lines);
 }
 
-pub(super) fn draw_help(frame: &mut Frame, area: Rect) {
-    let rows = [
+/// The keys, then what the figures in the offers table are and how they are worked out. Taller
+/// than the screen can be, so it scrolls: `scroll` is how many lines are above the window, and the
+/// result is the help's total lines and how many showed, which the keys scroll against.
+pub(super) fn draw_help(frame: &mut Frame, area: Rect, scroll: usize) -> (usize, usize) {
+    let keys = [
         ("Tab", "switch between groups, offers, and details"),
         (
             "Up, Down, j, k",
-            "move the selection, or scroll the details",
+            "move the selection, or scroll the details and this help",
         ),
         ("PgUp, PgDn", "move a page at a time"),
         ("f", "edit the filters; Enter runs them, Esc cancels"),
@@ -165,13 +168,80 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect) {
         ("Esc", "close the log or this help"),
         ("q, Ctrl+C", "quit, stopping the run if it is still going"),
     ];
-    // The key column fits the longest key, `Up, Down, j, k`, and the popup the longest line.
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(key, text)| Line::from(format!("{:<16}{}", key, text)))
-        .collect();
-    popup(frame, area, " Keys ", 70, lines);
+    // The key column fits the longest key, `Up, Down, j, k`, and the popup the longest line. A
+    // figure's second line has an empty key, so it lines up under the first.
+    let row = |(key, text): &(&str, &str)| Line::from(format!("{:<16}{}", key, text));
+    let mut lines: Vec<Line> = keys.iter().map(row).collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from("Figures").bold());
+    lines.extend(HELP_FIGURES.iter().map(row));
+
+    let visible = usize::from(area.height.saturating_sub(2)).min(lines.len());
+    let (start, end) = pane_window(lines.len(), scroll, visible);
+    let title = if visible < lines.len() {
+        " Help, Up/Down to scroll "
+    } else {
+        " Help "
+    };
+    let total = lines.len();
+    popup(
+        frame,
+        area,
+        title,
+        HELP_WIDTH,
+        lines.drain(start..end).collect(),
+    );
+    (total, visible)
 }
+
+/// The help's width: the screen's minimum, so a figure's formula fits on one 78-column line.
+const HELP_WIDTH: u16 = MIN_WIDTH;
+
+/// What each figure in the offers table means, as the code works it out: the reward and the
+/// stations in `lpstore`, and the colour bands beside `SPREAD_WIDE` and `IMBALANCE_STRONG`.
+pub(super) const HELP_FIGURES: [(&str, &str); 11] = [
+    (
+        "ISK/LP",
+        "(reward × units − ISK cost − items) ÷ LP cost, per redemption;",
+    ),
+    (
+        "",
+        "reward at the best buy order, items at the best sell orders",
+    ),
+    (
+        "Spread",
+        "(best ask − best bid) ÷ best bid. Green to 10%, yellow to 50%,",
+    ),
+    (
+        "",
+        "red past it: the bid may be one stale order. Magenta: inverted",
+    ),
+    (
+        "Imbal",
+        "(bid − ask volume) ÷ their sum, within 10% of each best price.",
+    ),
+    (
+        "",
+        "Green from +25%: buyers outweigh sellers; red from −25%",
+    ),
+    (
+        "Vol ±10%",
+        "units buy orders take at 90% or more of the best bid",
+    ),
+    (
+        "Profit ±10%",
+        "selling them: (price − unit cost) × units, unit cost being",
+    ),
+    ("", "(ISK cost + items) ÷ units"),
+    (
+        "n/a",
+        "a side of the market is missing, or nothing to compute from",
+    ),
+    (
+        "Prices",
+        "from the Market region, or only the Market system's stations",
+    ),
+];
 
 /// The donation popup: the address as a QR code, with the address as text under it. When the
 /// terminal is too small for the code, the popup shows only the address and a note.

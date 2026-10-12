@@ -344,10 +344,9 @@ pub(super) fn draw_destinations(
     // Sliced to the visible window already, so no `.scroll()` offset on top of that.
     frame.render_widget(Paragraph::new(lines), inner);
     PaneLayout {
-        detail_rows: 0,
-        detail_visible: 0,
         // The count the keys scroll against is the wrapped rows, not the logical lines.
         destinations_rows: body.len(),
         destinations_visible: height,
+        ..PaneLayout::default()
     }
 }
