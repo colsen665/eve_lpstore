@@ -3,6 +3,7 @@ mod tui;
 
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::report::{self, Field, LpStoreOptions, OptionError};
+use eve_lpstore::static_data::StaticDataError;
 use eve_lpstore::{EsiClient, Paths, StaticData};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -386,16 +387,17 @@ fn warn_ignored_local_dirs() {
     }
 }
 
-/// Says what is about to happen before the static data archive is fetched. Loading it pulls the
-/// whole SDE download, which takes long enough that a silent terminal looks hung.
-fn announce_static_data_download(data: &Path) {
-    if StaticData::is_cached(data) {
-        return;
+/// The static data on disk, or downloaded when it is not there. Says so before downloading: the
+/// fetch is the whole SDE archive, which takes long enough that a silent terminal looks hung.
+async fn load_static_data(data: &Path) -> Result<StaticData, StaticDataError> {
+    if let Some(loaded) = StaticData::load_cached(data)? {
+        return Ok(loaded);
     }
     println!(
         "Static data not found, downloading it to {}...",
         data.display()
     );
+    StaticData::download(data).await
 }
 
 async fn run_example(
@@ -407,9 +409,7 @@ async fn run_example(
     max_inflight: usize,
     paths: &Paths,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Load static data (only downloads if cache is missing or forced)
-    announce_static_data_download(&paths.data);
-    let sdata = match StaticData::load(false, &paths.data).await {
+    let sdata = match load_static_data(&paths.data).await {
         Ok(data) => {
             println!(
                 "Static data loaded: {} regions",
@@ -527,8 +527,7 @@ async fn run_lpstores(
         }
         return;
     }
-    announce_static_data_download(&paths.data);
-    let sdata = match StaticData::load(false, &paths.data).await {
+    let sdata = match load_static_data(&paths.data).await {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Failed to load static data: {}", e);

@@ -49,24 +49,22 @@ impl DestinationSpread {
     }
 }
 
-/// A route's standing: (security floor, gates flown, systems crossed), judged highest floor first,
-/// then fewest gates, then the smaller system sequence so the choice does not depend on hash order.
-type Route = (f64, usize, Vec<i32>);
+/// A route's standing: (security floor, gates flown), judged highest floor first, then fewest
+/// gates. Two routes that tie on both are equal, and the first one found stands; the search walks
+/// neighbours in id order, so which one that is does not depend on hash order.
+type Route = (f64, usize);
 
 /// Ranking for two candidate routes to the same destination.
 fn better_route(candidate: &Route, current: &Route) -> bool {
-    let (cf, ch, cp) = candidate;
-    let (bf, bh, bp) = current;
-    if *cf > *bf + f64::EPSILON {
+    let (cf, ch) = *candidate;
+    let (bf, bh) = *current;
+    if cf > bf + f64::EPSILON {
         return true;
     }
-    if *cf < *bf - f64::EPSILON {
+    if cf < bf - f64::EPSILON {
         return false;
     }
-    if *ch != *bh {
-        return *ch < *bh;
-    }
-    cp < bp
+    ch < bh
 }
 
 /// The two destination marginals over a uniformly weighted system set. Both regular and burner
@@ -168,9 +166,15 @@ impl StaticData {
     /// Destinations are the other systems in the constellation, which is the model this project
     /// assumes rather than a measurement. For each one the route chosen is the one that keeps the
     /// highest possible security floor, staying inside the constellation, because that is what a
-    /// pilot flying there would pick; among those, the fewest gates, then the smaller system order
-    /// for a stable answer. The floor includes the agent system itself, so a route can never be
-    /// safer than where it starts, and every band here is at or below the agent system's own.
+    /// pilot flying there would pick; among those, the fewest gates. The floor includes the agent
+    /// system itself, so a route can never be safer than where it starts, and every band here is at
+    /// or below the agent system's own.
+    ///
+    /// The floors are exact. The gate counts are not always the fewest: the search keeps one route
+    /// per system, so when a safer but longer route replaces a system's route before that system
+    /// is expanded, a destination behind it can report more gates than its shortest route at the
+    /// same floor. This is recorded in TODO.md and left as it is while the route model is being
+    /// compared with the game.
     ///
     /// A member with no path inside the constellation is left out of the counts rather than guessed
     /// at, so `systems` is what was counted and the probabilities sum to one.
@@ -187,7 +191,7 @@ impl StaticData {
 
         let mut destinations = Vec::new();
         for system in &members {
-            let Some((floor, hops, _)) = score.get(system) else {
+            let Some((floor, hops)) = score.get(system) else {
                 continue;
             };
             let route_band = displayed_security(*floor);
@@ -252,7 +256,7 @@ impl StaticData {
         let routes = self.best_routes(agent_system, None, &route_blocked)?;
         let mut destinations = Vec::new();
         for system in candidates {
-            let Some((floor, hops, _)) = routes.get(&system) else {
+            let Some((floor, hops)) = routes.get(&system) else {
                 continue;
             };
             destinations.push((
@@ -267,8 +271,8 @@ impl StaticData {
 
     /// The safest routes from an origin. `inside` restricts traversal when present; `blocked`
     /// systems cannot be entered, except that a blocked origin is allowed as the starting point.
-    /// The queue-based widest-path relaxation is deterministic because neighbours are sorted and
-    /// equal floor/hop routes use the lexicographically smaller system path.
+    /// The queue-based widest-path relaxation is deterministic because neighbours are sorted and a
+    /// route only replaces one it beats.
     fn best_routes(
         &self,
         origin: i32,
@@ -276,10 +280,10 @@ impl StaticData {
         blocked: &HashSet<i32>,
     ) -> Option<HashMap<i32, Route>> {
         let start = self.mission_security(origin)?;
-        let mut score: HashMap<i32, Route> = HashMap::from([(origin, (start, 0, vec![origin]))]);
+        let mut score: HashMap<i32, Route> = HashMap::from([(origin, (start, 0))]);
         let mut queue = VecDeque::from([origin]);
         while let Some(system) = queue.pop_front() {
-            let (floor, hops, path) = score.get(&system)?.clone();
+            let (floor, hops) = *score.get(&system)?;
             for next in self.gate_neighbours(system) {
                 if blocked.contains(next) || inside.is_some_and(|set| !set.contains(next)) {
                     continue;
@@ -287,9 +291,7 @@ impl StaticData {
                 let Some(security) = self.mission_security(*next) else {
                     continue;
                 };
-                let mut next_path = path.clone();
-                next_path.push(*next);
-                let candidate = (floor.min(security), hops + 1, next_path);
+                let candidate = (floor.min(security), hops + 1);
                 let improve = score
                     .get(next)
                     .is_none_or(|current| better_route(&candidate, current));

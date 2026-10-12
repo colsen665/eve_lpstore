@@ -267,14 +267,19 @@ impl StaticData {
             }
         }
 
-        let stations: Vec<(i64, i32)> = station_systems
+        // Both lists come out of a `HashMap`, whose order changes from run to run, so they are
+        // sorted to make the same archive always write the same file.
+        let mut stations: Vec<(i64, i32)> = station_systems
             .iter()
             .map(|(station_id, system_id)| (*station_id as i64, *system_id))
             .collect();
+        stations.sort_unstable();
+        let mut corporations: Vec<(i32, Vec<AgentRow>)> = corporations.into_iter().collect();
+        corporations.sort_unstable_by_key(|(corporation_id, _)| *corporation_id);
 
         Ok(AgentCache {
             version: AGENT_CACHE_VERSION,
-            corporations: corporations.into_iter().collect(),
+            corporations,
             divisions,
             agent_types,
             systems: system_names,
@@ -332,6 +337,45 @@ mod tests {
             writer.write_all(text.as_bytes()).unwrap();
         }
         writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn the_agent_cache_lists_corporations_and_stations_in_id_order() {
+        // Forty of each, so a list left in `HashMap` order would almost surely come out unsorted.
+        let ids: Vec<i32> = (0..40).map(|n| (n * 37) % 40 + 1).collect();
+        let stations: String = ids
+            .iter()
+            .map(|id| format!("{{\"_key\": {}, \"solarSystemID\": 1}}\n", 60000000 + id))
+            .collect();
+        let characters: String = ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "{{\"corporationID\": {}, \"locationID\": {}, \"agent\": {{\"level\": 1, \"agentTypeID\": 2, \"divisionID\": 24}}}}\n",
+                    1000000 + id,
+                    60000000 + id
+                )
+            })
+            .collect();
+        let system = r#"{"_key": 1, "securityStatus": 0.9, "regionID": 7, "constellationID": 100, "name": {"en": "A"}}"#;
+        let bytes = archive_with(&[
+            (SDE_STATIONS, &stations),
+            (SDE_SYSTEMS, system),
+            (SDE_STARGATES, ""),
+            (SDE_CORPORATIONS, ""),
+            (SDE_FACTIONS, ""),
+            (SDE_DIVISIONS, ""),
+            (SDE_AGENT_TYPES, ""),
+            (SDE_CHARACTERS, &characters),
+        ]);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes[..])).unwrap();
+        let cache = StaticData::extract_agent_cache(&mut archive).unwrap();
+        let corporations: Vec<i32> = cache.corporations.iter().map(|(id, _)| *id).collect();
+        let expected: Vec<i32> = (1..=40).map(|id| 1000000 + id).collect();
+        assert_eq!(corporations, expected);
+        let stations: Vec<i64> = cache.stations.iter().map(|(id, _)| *id).collect();
+        let expected: Vec<i64> = (1..=40).map(|id| 60000000 + id as i64).collect();
+        assert_eq!(stations, expected);
     }
 
     #[test]

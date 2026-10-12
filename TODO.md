@@ -882,11 +882,11 @@ leave the program doing what it did.
       English name read beside another language, and a damaged cache file named by path. The
       last reads through `load_from_disk` rather than `load`, so a regression in `is_cached`
       cannot turn it into a download.
-- [ ] Not done here, and noted by the review: the burner route search copies each route's full
+- [x] Not done here, and noted by the review: the burner route search copies each route's full
       path at every step and then discards it (about 14 ms per agent system, 25 ms at worst, in
       the review's release-build measurement), and the agent file is read three times at start-up.
       The two `HashMap`-ordered lists could be sorted before writing so the file is the same bytes
-      on every download.
+      on every download. Done afterwards; see *Static data performance* below.
 
 #### The TUI state and render code
 
@@ -980,6 +980,42 @@ leave the program doing what it did.
       removed file being a miss that leaves the index, the newest file answering while expired
       ones are deleted, a missing cache directory, and which file names are entries. The first
       fails when every lookup is made to list again: 4 listings against 1.
+
+#### Static data performance
+
+- [x] `best_routes` no longer keeps each route's path. The path was copied at every step and
+      used only as the last tie-break, between routes equal on floor and gates, and both callers
+      dropped it. A route is now `(floor, gates)`, and the first of two equal ones stands.
+      Dropping the tie-break also changes which systems are queued again, and the bug below makes
+      the result depend on that order, so sameness was checked rather than assumed: every
+      mission spread of all 8,490 systems and every burner spread of the 457 burner origins,
+      dumped from the real static data before and after, are byte-identical. A burner spread went
+      from 12.93 ms to 3.92 ms each in a release build.
+- [ ] Open, recorded and not fixed, as chosen: the gate counts are not always the fewest at the
+      best floor. The search keeps one route per system, so when a safer but longer route replaces
+      a system's route before that system is expanded, the shorter route never extends past it.
+      Shown on a six-system graph: O to X by A1 and A2 at 0.6 (3 gates) or by B at 0.5 (2 gates),
+      Y at 0.4 one gate past X; every route to Y has floor 0.4, and the shortest is 3 gates through
+      B, but Y reports 4. Bands are exact; only the hop shares can be off. From the user: the route
+      model is shaped by an ESI bug, a rounding error that rounds some systems with true security
+      between 0.4 and 0.5 down to 0.4 in ESI's route calculation and so applies the security
+      penalty, and the user is in contact with FC about it. Not verified here. The
+      `mission_spread` doc comment now says the gate counts can be high.
+- [x] The agent file is read once at start-up instead of three times. `StaticData::load_cached`
+      returns the data, `None` when it has to be downloaded (a file missing, or the agent file from
+      an older build or unreadable), or an error when current files do not load; `download`
+      fetches and reads back. `is_cached`, `load`, and `agent_cache_version`'s file read are gone,
+      and the CLI's `announce_static_data_download` became `load_static_data`, which says the same
+      line before downloading. Measured in three rounds of ten starts: release 37.0 to 39.7 ms
+      before and 32.4 to 33.8 ms after, debug 409 to 422 ms before and 331 to 338 ms after. One
+      version check alone is 6.11 ms in release and 71.6 ms in debug, which the old start ran
+      twice.
+- [x] The agent file's `corporations` and `stations` lists are sorted by id before writing, so
+      the same archive always writes the same bytes. They came out of a `HashMap`.
+- [x] Tests: 1 added, for the two lists coming out in id order, which fails with the sorting
+      removed; the three cache tests moved from `is_cached` and `agent_cache_version` to
+      `load_cached` and the parse of the text, and the damaged-file test no longer has a path to a
+      download.
 
 ## Done
 

@@ -66,48 +66,39 @@ pub(super) struct AgentCache {
 pub(super) const AGENT_CACHE_VERSION: u32 = 3;
 
 impl StaticData {
-    /// Whether every file [`load`](Self::load) reads from disk is there and current. It says nothing
-    /// about whether they parse, so a `true` answer can still fail to load.
+    /// The static data on disk under `data`, or `None` when it has to be downloaded: a file is
+    /// missing, or the agent file is from an older build or cannot be read. An error means the
+    /// files are there and current and still do not load, which a download is also the way past.
     ///
-    /// `load` downloads on its own when this is `false`, which is a fetch of the whole static data
-    /// archive, about 100 MB. Callers that want to ask before spending that, rather than
-    /// finding out silently, check this first.
-    ///
-    /// The agent file is read rather than merely stat-ed, because a cache written by an older build
-    /// exists and is the wrong shape: a version field is how that is told apart, and it cannot be
-    /// seen without opening the file.
-    pub fn is_cached(data: &Path) -> bool {
-        if !Self::files(data).iter().all(|path| path.exists()) {
-            return false;
+    /// Callers ask this before downloading, because a download is the whole static data archive,
+    /// about 100 MB, and is worth saying so before it starts. The agent file is read once, for its
+    /// version and for its contents: a cache from an older build exists and is the wrong shape, and
+    /// the version field is how that is told apart.
+    pub fn load_cached(data: &Path) -> Result<Option<Self>, StaticDataError> {
+        let files = Self::files(data);
+        if !files.iter().all(|path| path.exists()) {
+            return Ok(None);
         }
-        Self::agent_cache_version(data) == Some(AGENT_CACHE_VERSION)
+        let Ok(agent_text) = std::fs::read_to_string(&files[3]) else {
+            return Ok(None);
+        };
+        if agent_cache_version(&agent_text) != Some(AGENT_CACHE_VERSION) {
+            return Ok(None);
+        }
+        Self::load_from_disk(&files, &agent_text).map(Some)
     }
 
-    /// The version recorded in the cached agent data, or `None` when it cannot be read. A file from
-    /// before the version field existed reports zero, not `None`, so only an unreadable file is
-    /// `None`.
-    fn agent_cache_version(data: &Path) -> Option<u32> {
-        let text = std::fs::read_to_string(Self::security_path(data)).ok()?;
-        #[derive(Deserialize)]
-        struct VersionOnly {
-            #[serde(default)]
-            version: u32,
-        }
-        let parsed: VersionOnly = serde_json::from_str(&text).ok()?;
-        Some(parsed.version)
-    }
-
-    /// Load static data from the local cache under `data`.
-    ///
-    /// If `force_download` is `true`, the cache is re-downloaded from the SDE even if a local copy
-    /// exists. If `false`, the local cache is used when present; otherwise a download is
-    /// triggered.
-    pub async fn load(force_download: bool, data: &Path) -> Result<Self, StaticDataError> {
-        if force_download || !Self::is_cached(data) {
-            Self::download_and_cache(data).await?;
-        }
-        let [regions, corporations, types, security] = Self::files(data);
-        Self::load_from_disk(&regions, &corporations, &types, &security)
+    /// Download the archive, replace the four files under `data` with what it holds, and read
+    /// them back.
+    pub async fn download(data: &Path) -> Result<Self, StaticDataError> {
+        Self::download_and_cache(data).await?;
+        let files = Self::files(data);
+        let agent_text =
+            std::fs::read_to_string(&files[3]).map_err(|source| StaticDataError::Io {
+                path: files[3].clone(),
+                source,
+            })?;
+        Self::load_from_disk(&files, &agent_text)
     }
 
     /// The file holding the region names.
@@ -130,7 +121,7 @@ impl StaticData {
         data.join(SECURITY_CACHE_FILE)
     }
 
-    /// The four files [`load`](Self::load) reads, in the order it reads them.
+    /// The four files [`load_cached`](Self::load_cached) reads, in the order it reads them.
     pub(super) fn files(data: &Path) -> [PathBuf; 4] {
         [
             Self::regions_path(data),
@@ -140,14 +131,10 @@ impl StaticData {
         ]
     }
 
-    /// Load regions, corporations, types, and the agent cache from the four files under the data
-    /// directory.
-    fn load_from_disk(
-        regions_path: &Path,
-        corporations_path: &Path,
-        types_path: &Path,
-        security_path: &Path,
-    ) -> Result<Self, StaticDataError> {
+    /// Load regions, corporations, and types from the first three of `files`, and the agent cache
+    /// from `agent_text`, which the caller has already read from the fourth.
+    fn load_from_disk(files: &[PathBuf; 4], agent_text: &str) -> Result<Self, StaticDataError> {
+        let [regions_path, corporations_path, types_path, security_path] = files;
         let region_entries: Vec<RegionEntry> = read_json(regions_path)?;
         let mut regions = HashMap::with_capacity(region_entries.len());
         let mut region_names_by_id = HashMap::with_capacity(region_entries.len());
@@ -170,7 +157,11 @@ impl StaticData {
             .map(|entry| (entry.type_id, entry.name))
             .collect();
 
-        let agents: AgentCache = read_json(security_path)?;
+        let agents: AgentCache =
+            serde_json::from_str(agent_text).map_err(|source| StaticDataError::Json {
+                path: security_path.clone(),
+                source,
+            })?;
         // Derived from `agents.systems` and `agents.gates`, which the struct below then moves.
         let constellation_members = Self::constellation_index(
             &agents
@@ -230,6 +221,19 @@ pub(super) async fn write_json<T: Serialize>(
         })
 }
 
+/// The version recorded in the agent file's text, or `None` when it is not JSON. A file from
+/// before the version field existed reports zero, not `None`.
+fn agent_cache_version(text: &str) -> Option<u32> {
+    #[derive(Deserialize)]
+    struct VersionOnly {
+        #[serde(default)]
+        version: u32,
+    }
+    serde_json::from_str::<VersionOnly>(text)
+        .ok()
+        .map(|parsed| parsed.version)
+}
+
 /// Reads one of the cache files back.
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StaticDataError> {
     let text = std::fs::read_to_string(path).map_err(|source| StaticDataError::Io {
@@ -246,19 +250,32 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StaticDataError> {
 mod tests {
     use super::*;
 
+    /// A data directory under the system temp directory, emptied first.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("eve_lpstore_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The smallest agent file of the current version that loads.
+    fn current_agent_file() -> String {
+        format!(
+            r#"{{"version":{AGENT_CACHE_VERSION},"corporations":[],"divisions":[],"agent_types":[],"systems":[],"corporation_factions":[],"factions":[],"stations":[],"gates":[]}}"#
+        )
+    }
+
     #[test]
     fn a_damaged_cache_file_is_named_in_the_error() {
-        // Read through `load_from_disk` rather than `load`, so a regression in `is_cached` cannot
-        // turn this test into a download.
-        let dir =
-            std::env::temp_dir().join(format!("eve_lpstore_damaged_cache_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // `load_cached` never downloads, so this cannot turn into a 100 MB fetch.
+        let dir = scratch("damaged_cache");
         let [regions, corporations, types, security] = StaticData::files(&dir);
-        for path in [&regions, &corporations, &security] {
+        for path in [&regions, &corporations] {
             std::fs::write(path, "[]").unwrap();
         }
         std::fs::write(&types, "not json").unwrap();
-        let error = StaticData::load_from_disk(&regions, &corporations, &types, &security)
+        std::fs::write(&security, current_agent_file()).unwrap();
+        let error = StaticData::load_cached(&dir)
             .err()
             .expect("the types file does not parse");
         let named = types.display().to_string();
@@ -270,45 +287,44 @@ mod tests {
     }
 
     #[test]
-    fn the_cached_agent_version_is_read_from_the_file() {
-        let dir = std::env::temp_dir().join(format!("eve_lpstore_ver_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = StaticData::security_path(&dir);
-
+    fn the_cached_agent_version_is_read_from_the_text() {
         // A file from before the version field existed reads as zero, not unreadable.
-        std::fs::write(&file, r#"{"corporations":[]}"#).unwrap();
-        assert_eq!(StaticData::agent_cache_version(&dir), Some(0));
+        assert_eq!(agent_cache_version(r#"{"corporations":[]}"#), Some(0));
         // The previous shape, which has each system's region but no constellation or gates.
-        std::fs::write(&file, r#"{"version":2}"#).unwrap();
-        assert_eq!(StaticData::agent_cache_version(&dir), Some(2));
-        std::fs::write(&file, format!(r#"{{"version":{AGENT_CACHE_VERSION}}}"#)).unwrap();
+        assert_eq!(agent_cache_version(r#"{"version":2}"#), Some(2));
         assert_eq!(
-            StaticData::agent_cache_version(&dir),
+            agent_cache_version(&current_agent_file()),
             Some(AGENT_CACHE_VERSION)
         );
-        std::fs::write(&file, "not json").unwrap();
-        assert_eq!(StaticData::agent_cache_version(&dir), None);
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(agent_cache_version("not json"), None);
     }
 
     #[test]
-    fn a_stale_agent_cache_is_not_reported_as_cached() {
-        let dir = std::env::temp_dir().join(format!("eve_lpstore_stale_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn a_stale_or_incomplete_cache_has_to_be_downloaded() {
+        let dir = scratch("stale");
         for path in StaticData::files(&dir) {
             std::fs::write(path, "[]").unwrap();
         }
-        // A version 2 file exists but is stale, which is the case the gate needs to catch. All four
-        // files exist, so a purely existence-based check would say yes and then read a mapping
-        // that is not there.
+        // A version 2 file exists but is stale, which is the case the check is for. All four
+        // files exist, so a check on existence alone would say yes and then read a mapping that
+        // is not there.
         std::fs::write(StaticData::security_path(&dir), r#"{"version":2}"#).unwrap();
-        assert!(!StaticData::is_cached(&dir), "a stale shape is not cached");
-        std::fs::write(
-            StaticData::security_path(&dir),
-            format!(r#"{{"version":{AGENT_CACHE_VERSION}}}"#),
-        )
-        .unwrap();
-        assert!(StaticData::is_cached(&dir));
+        assert!(matches!(StaticData::load_cached(&dir), Ok(None)), "stale");
+        std::fs::write(StaticData::security_path(&dir), "not json").unwrap();
+        assert!(
+            matches!(StaticData::load_cached(&dir), Ok(None)),
+            "unreadable"
+        );
+        std::fs::write(StaticData::security_path(&dir), current_agent_file()).unwrap();
+        assert!(
+            matches!(StaticData::load_cached(&dir), Ok(Some(_))),
+            "current"
+        );
+        std::fs::remove_file(StaticData::types_path(&dir)).unwrap();
+        assert!(
+            matches!(StaticData::load_cached(&dir), Ok(None)),
+            "a file missing"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -93,13 +93,13 @@ fn spawn_run(
 }
 
 /// Fetches the static data archive on the runtime, replacing whatever is on disk. It belongs here
-/// rather than on the UI thread because `StaticData::load` is async and `ui_loop` is sync inside
+/// rather than on the UI thread because `StaticData::download` is async and `ui_loop` is sync inside
 /// `spawn_blocking`.
 fn spawn_download(session: &mut Session) {
     let (done_tx, done_rx) = oneshot::channel();
     let data = session.paths.data.clone();
     let task = session.handle.spawn(async move {
-        let result = StaticData::load(true, &data)
+        let result = StaticData::download(&data)
             .await
             .map_err(|error| error.to_string());
         let _ = done_tx.send(result);
@@ -182,15 +182,10 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
     app.set_data_dir(paths.data.display().to_string());
     log_roots(&mut app, &paths);
 
-    // Loading is only attempted when the files are there, so the question comes before the wait.
-    let loaded = if StaticData::is_cached(&paths.data) {
-        let data = StaticData::load(false, &paths.data)
-            .await
-            .map_err(|error| error.to_string());
-        Some(data)
-    } else {
-        None
-    };
+    // Only what is on disk is read here, so a missing cache is asked about before any download.
+    let loaded = StaticData::load_cached(&paths.data)
+        .map_err(|error| error.to_string())
+        .transpose();
     let (sdata, ask) = match opening(loaded) {
         Opening::Filters(data) => (Arc::new(*data), None),
         Opening::Ask { reason } => (Arc::new(StaticData::default()), Some(reason)),
