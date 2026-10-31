@@ -1317,11 +1317,11 @@ leave the program doing what it did.
       stopped at that failure, so the binary's own tests had not yet run on Windows.
 - [x] The second run failed two tests that treated `/no/such/directory` as unwritable. On Windows
       `save_to` could create it, after which the export could write there. Both now write under a
-      regular file instead, which no platform or user can do. Passing Windows CI is the check.
-- [ ] Watch the first CI run. It is the first run of the tests on Windows and macOS, and a few of
-      them time requests against a local server.
-- [ ] Once CI passes, `git tag v0.1.0 && git push origin v0.1.0`. It is the first run of the musl
-      and Windows builds, and of the publishing steps.
+      regular file instead, which no platform or user can do.
+- [x] The third CI run passed on Linux, Windows, and macOS, at `4a0e424`.
+- [x] Tagged `v0.1.0` and the release workflow passed. The checksums of both downloaded archives
+      verify. The Linux binary prints `eve_lpstore 0.1.0` and is static. The Windows binary has not
+      been run, since CI builds it and only the tests run on Windows.
 - [x] History rewritten before the first push: every commit is by
       `colsen665 <colsen665@proton.me>`, and the early commits are squashed into the initial one.
 - [x] `cargo fmt` run once over the tree, alone in its commit: 11 hunks in 6 files that predated
@@ -1355,13 +1355,9 @@ leave the program doing what it did.
       `v0.2.0` with the two versions named; and the packaging and checksum steps, run as written
       against a native `x86_64-unknown-linux-gnu` build, give an archive of the four files whose
       checksum verifies and whose binary prints `eve_lpstore 0.1.0`.
-- [ ] Not checked locally. The musl build: `ring` compiles C and needs a musl C compiler, which
-      this machine lacks, so the build stopped looking for `x86_64-linux-musl-gcc`. In CI the
-      `musl-tools` package provides `musl-gcc`, which cc 1.6.0 tries next
-      (`find_working_gnu_prefix(&["x86_64-linux-musl", "musl"])`), so it should build there; that
-      is read from the source, not run. Also unchecked: the Windows build, the tests on Windows
-      and macOS, some of which time requests against a local server, and every GitHub-side step.
-      The first push and the first tag are those checks.
+- [x] Not checkable locally, and since checked by the first push and tag: the musl build, which
+      needs a musl C compiler this machine lacks, the Windows build, the tests on Windows and macOS,
+      and every GitHub-side step.
 
 #### A single-thread runtime
 
