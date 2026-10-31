@@ -20,7 +20,7 @@ full-screen terminal view or as a text report.
 
 ## Install
 
-Download an archive from the [Releases](https://github.com/OWNER/eve_lpstore/releases) page:
+Download an archive from the [Releases](https://github.com/colsen665/eve_lpstore/releases) page:
 
 | Platform | Archive |
 | --- | --- |
@@ -32,7 +32,7 @@ Each release lists the archives' SHA-256 sums in `SHA256SUMS`.
 On other platforms, build it with a stable Rust toolchain:
 
 ```sh
-cargo install --locked --git https://github.com/OWNER/eve_lpstore
+cargo install --locked --git https://github.com/colsen665/eve_lpstore
 ```
 
 ## Use

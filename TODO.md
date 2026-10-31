@@ -1308,18 +1308,16 @@ leave the program doing what it did.
 
 #### Publishing on GitHub
 
-- [ ] Create the repository on GitHub. The location is a placeholder, `OWNER/eve_lpstore`, as
-      chosen, so replace `OWNER` in `Cargo.toml` line 7 and `README.md` lines 23 and 35; the
-      User-Agent reads the URL from `Cargo.toml`.
-- [ ] Add the repository as a remote and push:
-      `git remote add github git@github.com:<owner>/eve_lpstore.git`, then
-      `git push github master`. `origin` stays the local bare repository.
+- [x] The location is `colsen665/eve_lpstore`, in `Cargo.toml` line 7 and `README.md` lines 23 and
+      35; the User-Agent reads the URL from `Cargo.toml`.
+- [ ] Create the public repository on GitHub, empty, and push with `git push -u origin master`.
+      `origin` is GitHub and `backup` is the local bundle of the history from before the rewrite.
 - [ ] Watch the first CI run. It is the first run of the tests on Windows and macOS, and a few of
       them time requests against a local server.
-- [ ] Once CI passes, `git tag v0.1.0 && git push github v0.1.0`. It is the first run of the musl
+- [ ] Once CI passes, `git tag v0.1.0 && git push origin v0.1.0`. It is the first run of the musl
       and Windows builds, and of the publishing steps.
-- [ ] Optional: all 120 commits carry the author email `colsen665@proton.me`, which GitHub cannot link to
-      an account.
+- [x] History rewritten before the first push: every commit is by
+      `colsen665 <colsen665@proton.me>`, and the early commits are squashed into the initial one.
 - [x] `cargo fmt` run once over the tree, alone in its commit: 11 hunks in 6 files that predated
       it. Stable rustfmt 1.10.0 and the nightly one agree, so CI can check `cargo fmt --check`.
 - [x] The User-Agent was a hard-coded `eve_lpstore/0.1.0` with no contact, which ESI asks for, and
