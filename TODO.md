@@ -1315,6 +1315,9 @@ leave the program doing what it did.
 - [x] The first CI run failed `paths::tests::neither_root_is_the_working_directory` on Windows,
       where the roots do end in `cache` and `data`. The test no longer checks their names. cargo
       stopped at that failure, so the binary's own tests had not yet run on Windows.
+- [x] The second run failed two tests that treated `/no/such/directory` as unwritable. On Windows
+      `save_to` could create it, after which the export could write there. Both now write under a
+      regular file instead, which no platform or user can do. Passing Windows CI is the check.
 - [ ] Watch the first CI run. It is the first run of the tests on Windows and macOS, and a few of
       them time requests against a local server.
 - [ ] Once CI passes, `git tag v0.1.0 && git push origin v0.1.0`. It is the first run of the musl

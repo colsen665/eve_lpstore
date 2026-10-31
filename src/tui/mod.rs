@@ -642,6 +642,15 @@ mod tests {
             .into_owned()
     }
 
+    /// A path no write can succeed at, whatever the platform or user: its parent is a regular
+    /// file. A directory that does not exist is not enough, since an administrator can create one.
+    /// Returns the path and the file to remove afterwards.
+    fn unwritable_path(name: &str) -> (PathBuf, PathBuf) {
+        let blocker = PathBuf::from(temp_path(name));
+        std::fs::write(&blocker, "").unwrap();
+        (blocker.join("out.csv"), blocker)
+    }
+
     #[test]
     fn an_export_writes_the_view_and_reports_it_in_the_log() {
         let path = format!("{}.csv", temp_path("csv"));
@@ -673,8 +682,9 @@ mod tests {
 
     #[test]
     fn a_write_that_fails_keeps_the_prompt_open_with_the_reason() {
-        // A directory that does not exist, so the write cannot succeed.
-        let mut app = prompt("/no/such/directory/eve_lpstore_out.csv");
+        let (path, blocker) = unwritable_path("blocked_export");
+        let path = path.to_string_lossy().into_owned();
+        let mut app = prompt(&path);
         write_export(&mut app, &StaticData::default());
         assert!(
             matches!(app.overlay, Overlay::Export(_)),
@@ -685,7 +695,8 @@ mod tests {
             .clone()
             .expect("the reason shows beside the name");
         assert!(error.contains("Could not write"), "{}", error);
-        assert!(error.contains("no/such/directory"), "{}", error);
+        assert!(error.contains(&path), "{}", error);
+        std::fs::remove_file(&blocker).unwrap();
     }
 
     #[test]
@@ -962,7 +973,8 @@ mod tests {
         // The run is already going, so a file that cannot be written must not stop the view.
         let mut app = App::new(LpStoreOptions::default());
         app.start_run(forge_run(1), "none".to_string(), 10);
-        remember(&mut app, Path::new("/no/such/directory/filters.json"));
+        let (path, blocker) = unwritable_path("blocked_remember");
+        remember(&mut app, &path);
         assert_eq!(app.stage, Stage::Starting, "the run is untouched");
         let line = app.log.back().expect("the failure is reported");
         assert!(line.is_error);
@@ -971,6 +983,7 @@ mod tests {
             "{}",
             line.text
         );
+        std::fs::remove_file(&blocker).unwrap();
     }
 
     #[test]
