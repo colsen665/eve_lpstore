@@ -86,12 +86,12 @@ mod tests {
         let paths = discovered();
         let here = std::env::current_dir().unwrap();
         for root in [&paths.cache, &paths.data] {
+            // Only the location is checked. On Windows the roots do end in `cache` and `data`,
+            // under `%LOCALAPPDATA%\eve_lpstore`.
             assert!(
-                !root.starts_with(&here) || root == &here,
-                "{root:?} is inside the working directory {here:?}"
+                !root.starts_with(&here),
+                "{root:?} is the working directory {here:?} or inside it"
             );
-            assert_ne!(root.file_name().and_then(|n| n.to_str()), Some("cache"));
-            assert_ne!(root.file_name().and_then(|n| n.to_str()), Some("data"));
         }
     }
 
