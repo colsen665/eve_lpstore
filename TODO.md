@@ -1311,7 +1311,7 @@ leave the program doing what it did.
 - [x] The location is `colsen665/eve_lpstore`, in `Cargo.toml` line 7 and `README.md` lines 23 and
       35; the User-Agent reads the URL from `Cargo.toml`.
 - [x] Created the public repository on GitHub and pushed with `git push -u origin master`.
-      `origin` is GitHub and `backup` is the local bundle of the history from before the rewrite.
+      `origin` is GitHub, the only remote.
 - [x] The first CI run failed `paths::tests::neither_root_is_the_working_directory` on Windows,
       where the roots do end in `cache` and `data`. The test no longer checks their names. cargo
       stopped at that failure, so the binary's own tests had not yet run on Windows.
