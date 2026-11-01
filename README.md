@@ -3,6 +3,8 @@
 Ranks EVE Online loyalty point (LP) store offers by ISK per LP, from live market data, in a
 full-screen terminal view or as a text report.
 
+Started out as a quick prototype.
+
 ## What it does
 
 - Fetches the LP store of every NPC corporation from ESI, and prices each offer in one market
