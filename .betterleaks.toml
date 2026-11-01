@@ -1,0 +1,3 @@
+# The platform directories this program documents, and the placeholder home its tests use.
+[[allowlists]]
+regexes = ['''/home/user$''', '''~/(\.cache|\.config|\.local/share|Library/Caches)/(com\.example\.)?eve_lpstore(/filters\.json)?$''']
