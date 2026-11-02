@@ -3,7 +3,9 @@
 Ranks EVE Online loyalty point (LP) store offers by ISK per LP, from live market data, in a
 full-screen terminal view or as a text report.
 
-Started out as a quick prototype.
+Started out as a quick console prototype. Then I added a vibe coded UI. ESI layer is done by Claude as well.
+
+![image](eve_lpstore_results.png)
 
 ## What it does
 
@@ -19,6 +21,12 @@ Started out as a quick prototype.
   and how lopsided the order book is near the top.
 - In the full-screen view, `e` writes what is on screen to a `.csv` or `.json` file, and `m` shows
   where missions from the selected group's agents can take you.
+
+## What it does not do (yet)
+
+- It shows some crude spread and order book balance markers, they could obviously be used for filtering but for now you have to evaluate them manually and scroll down to SOE and verify that Lan is still there.
+
+- (bug) There seem to be a bug in the ESI implementation where it calculates hisec routes wrong for some systems that have a trusec of <0.5 that should be rounded to 0.5, the tell is burners that show more than 10 jumps. I have notified Eve support but they did not want to forward  my bug report to the devs, since ESI  was not their desk.
 
 ## Install
 
@@ -48,6 +56,22 @@ eve_lpstore --help                # every option, with examples
 ```
 
 In the view, `?` lists the keys. The filters it applies are remembered for the next start.
+
+## TUI
+
+Inspired by BBG terminal
+
+### Filters screen
+
+![image](eve_lpstore_filters.png)
+
+### Loading ESI data
+
+![image](eve_lpstore_loading.png)
+
+### Show results
+
+![image](eve_lpstore_results.png)
 
 ## Files it keeps
 
