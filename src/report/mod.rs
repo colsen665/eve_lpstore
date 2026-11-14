@@ -1,14 +1,19 @@
 //! The `--lpstores` report: option checks, fetching, pricing, and grouping.
 
+mod arrange;
 mod options;
 mod pipeline;
 
+pub mod budget;
+
 use crate::lpstore::{OfferError, OfferResult};
+use budget::BudgetFill;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use arrange::{Arrangement, DEFAULT_LP_BUDGET, GroupSort, OfferFilter};
 pub use options::{
     DEFAULT_DEPTH, DEFAULT_REGION_ID, Field, FieldSpec, FilterSummary, LpStoreOptions, NamedValue,
     OptionError, Parsed, Resolved, SystemSummary, region_id,
@@ -23,10 +28,12 @@ pub struct Report {
     pub stores: Vec<Store>,
     /// The offers that failed to price, each once, in offer ID order.
     pub errors: Vec<OfferError>,
-    /// The groups for the depth last given to [`Report::regroup`], best first.
+    /// The groups for the arrangement last given to [`Report::arrange`], in its sort order.
     pub groups: Vec<Group>,
     /// Each corporation's place in the run, which a group lists its corporations in.
     positions: HashMap<i32, usize>,
+    /// What `groups` was built and sorted for.
+    arrangement: Arrangement,
 }
 
 impl Report {
@@ -49,24 +56,47 @@ impl Report {
             errors,
             groups: Vec::new(),
             positions,
+            arrangement: Arrangement::depth(depth),
         };
-        report.regroup(depth);
+        report.rebuild();
         report
     }
 
-    /// Lists together the stores whose top `depth` offers are the same, in the same order, and
-    /// orders the groups by the average ISK per LP over those offers, best first, with ties
-    /// broken by the lower first corporation ID. A store with fewer offers than `depth` only joins
-    /// stores listing exactly its offers. Nothing is priced again, so this is cheap enough to
-    /// repeat on every depth change.
+    /// Groups for `depth` over every priced offer, by the average ISK per LP, best first, as
+    /// [`Arrangement::depth`] describes. Any filter, exclusion, or sort set before is dropped.
     pub fn regroup(&mut self, depth: usize) {
+        self.arrange(&Arrangement::depth(depth));
+    }
+
+    /// Lists together the stores whose top `depth` visible offers are the same, in the same
+    /// order, and sorts the groups as `arrangement` says. An offer is visible when
+    /// [`Arrangement::visible`] says so, so a hidden offer leaves room for the next one that
+    /// counts. A store with fewer visible offers than `depth` only joins stores listing exactly
+    /// its offers. Nothing is priced again, so this is cheap enough to repeat on every change.
+    pub fn arrange(&mut self, arrangement: &Arrangement) {
+        self.arrangement = arrangement.clone();
+        self.rebuild();
+    }
+
+    /// What the groups were last built and sorted for.
+    pub fn arrangement(&self) -> &Arrangement {
+        &self.arrangement
+    }
+
+    /// Sorts the groups again by `sort`, without regrouping, since the groups do not depend on it.
+    pub fn sort_groups(&mut self, sort: GroupSort, reverse: bool) {
+        self.arrangement.sort = sort;
+        self.arrangement.reverse = reverse;
+        sort_groups(&mut self.groups, &self.arrangement);
+    }
+
+    fn rebuild(&mut self) {
+        let arrangement = &self.arrangement;
         let mut found: HashMap<Vec<i32>, usize> = HashMap::new();
         let mut members: Vec<Vec<&Store>> = Vec::new();
         for store in &self.stores {
             let listed: Vec<i32> = store
-                .results
-                .iter()
-                .take(depth)
+                .listed(arrangement)
                 .map(|result| result.offer.offer_id)
                 .collect();
             let index = *found.entry(listed).or_insert_with(|| {
@@ -77,14 +107,9 @@ impl Report {
         }
         let mut groups: Vec<Group> = members
             .iter()
-            .map(|stores| Group::of_stores(stores, depth, &self.positions))
+            .map(|stores| Group::of_stores(stores, arrangement, &self.positions))
             .collect();
-        let key = |group: &Group| group.average_isk_per_lp(depth).unwrap_or(f64::NEG_INFINITY);
-        groups.sort_by(|a, b| {
-            key(b)
-                .total_cmp(&key(a))
-                .then_with(|| a.corp_ids[0].cmp(&b.corp_ids[0]))
-        });
+        sort_groups(&mut groups, arrangement);
         self.groups = groups;
     }
 
@@ -111,14 +136,58 @@ impl Report {
         corporations
     }
 
+    /// The fewest and the most priced offers the arrangement's filter and exclusions take out of
+    /// the stores of `group`'s corporations, counted as [`Group::hidden_counts`] counts them with
+    /// hiding on. With hiding on this is [`Group::hidden_range`]; with it off, where a group hides
+    /// nothing, it is what turning hiding back on would hide from those stores.
+    pub fn hideable_range(&self, group: &Group) -> (usize, usize) {
+        let hiding = Arrangement {
+            hiding: true,
+            ..self.arrangement.clone()
+        };
+        let counts: Vec<usize> = group
+            .corp_ids
+            .iter()
+            .filter_map(|corp_id| {
+                self.stores
+                    .iter()
+                    .find(|store| store.corp_ids.contains(corp_id))
+            })
+            .map(|store| store.hidden_count(&hiding))
+            .collect();
+        range(&counts)
+    }
+
+    /// [`Report::hideable_range`] printed the way [`Group::hidden_count_text`] prints its range.
+    pub fn hideable_count_text(&self, group: &Group) -> String {
+        range_text(self.hideable_range(group))
+    }
+
     fn in_run_order(&self, corporations: &mut [(i32, usize)]) {
         in_run_order(&self.positions, corporations);
     }
 }
 
 /// Sorts `corporations` into the run's order, keeping the order of any the run does not place.
-fn in_run_order(positions: &HashMap<i32, usize>, corporations: &mut [(i32, usize)]) {
+fn in_run_order<T>(positions: &HashMap<i32, usize>, corporations: &mut [(i32, T)]) {
     corporations.sort_by_key(|(corp_id, _)| positions.get(corp_id).copied().unwrap_or(usize::MAX));
+}
+
+/// Orders `groups` by the value `arrangement.sort` gives each, best first, or worst first when
+/// `arrangement.reverse` is set. Groups without a value go last in both directions. Ties, and
+/// groups without a value, go to the lower first corporation ID.
+fn sort_groups(groups: &mut [Group], arrangement: &Arrangement) {
+    let key = |group: &Group| group.sort_value(arrangement.sort, arrangement.depth);
+    groups.sort_by(|a, b| {
+        let by_value = match (key(a), key(b)) {
+            (Some(a), Some(b)) if arrangement.reverse => a.total_cmp(&b),
+            (Some(a), Some(b)) => b.total_cmp(&a),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        };
+        by_value.then_with(|| a.corp_ids[0].cmp(&b.corp_ids[0]))
+    });
 }
 
 /// Corporations whose loyalty stores hold the same offers, with the priced ones ranked.
@@ -152,6 +221,28 @@ impl Store {
         let count = self.offer_ids.len();
         self.corp_ids.iter().map(move |&corp_id| (corp_id, count))
     }
+
+    /// The offers it lists under `arrangement`: the top `depth` of its visible offers, in
+    /// [`ranking`] order. Whether an offer is visible depends on the offer alone, so these are a
+    /// subsequence of a total order, and two stores holding the same visible offers list them
+    /// the same way whatever hidden offers lie between them. Grouping relies on that.
+    fn listed<'a>(
+        &'a self,
+        arrangement: &'a Arrangement,
+    ) -> impl Iterator<Item = &'a Arc<OfferResult>> + 'a {
+        self.results
+            .iter()
+            .filter(|result| arrangement.visible(result))
+            .take(arrangement.depth)
+    }
+
+    /// How many of its priced offers `arrangement` hides.
+    fn hidden_count(&self, arrangement: &Arrangement) -> usize {
+        self.results
+            .iter()
+            .filter(|result| !arrangement.visible(result))
+            .count()
+    }
 }
 
 /// The order offers are listed in: ISK per LP, best first, then offers without a value, with ties
@@ -173,39 +264,93 @@ pub struct Group {
     /// How many offers each corporation's store holds, in `corp_ids` order. They differ when the
     /// group joins stores that differ only below the offers it lists.
     pub offer_counts: Vec<usize>,
+    /// How many priced offers in each corporation's store the arrangement hides, in `corp_ids`
+    /// order, counted over the whole store rather than only above the offers it lists.
+    pub hidden_counts: Vec<usize>,
     /// The offers it lists, at most the depth it was built for.
     pub results: Vec<Arc<OfferResult>>,
+    /// What spending the arrangement's LP budget on the offers it lists realizes, or `None` when
+    /// the arrangement sets no budget or none of those offers can be redeemed into a buy order.
+    /// Hidden offers, and offers below the depth, take no part.
+    pub budget: Option<BudgetFill>,
 }
 
 impl Group {
-    /// The group of `stores`, which list the same top `depth` offers.
-    fn of_stores(stores: &[&Store], depth: usize, positions: &HashMap<i32, usize>) -> Self {
-        let mut corporations: Vec<(i32, usize)> = stores
+    /// The group of `stores`, which list the same offers under `arrangement`.
+    fn of_stores(
+        stores: &[&Store],
+        arrangement: &Arrangement,
+        positions: &HashMap<i32, usize>,
+    ) -> Self {
+        let mut corporations: Vec<(i32, (usize, usize))> = stores
             .iter()
-            .flat_map(|store| store.corporations())
+            .flat_map(|store| {
+                let hidden = store.hidden_count(arrangement);
+                store
+                    .corporations()
+                    .map(move |(corp_id, count)| (corp_id, (count, hidden)))
+            })
             .collect();
         in_run_order(positions, &mut corporations);
-        let (corp_ids, offer_counts) = corporations.into_iter().unzip();
+        let (corp_ids, counts): (Vec<i32>, Vec<(usize, usize)>) = corporations.into_iter().unzip();
+        let (offer_counts, hidden_counts) = counts.into_iter().unzip();
+        let results: Vec<Arc<OfferResult>> = stores[0].listed(arrangement).cloned().collect();
+        let budget = arrangement
+            .lp_budget
+            .and_then(|lp| budget::fill(&results, lp));
         Self {
             corp_ids,
             offer_counts,
-            results: stores[0].results.iter().take(depth).cloned().collect(),
+            hidden_counts,
+            results,
+            budget,
         }
     }
 
     /// The fewest and the most offers its corporations' stores hold.
     pub fn offer_range(&self) -> (usize, usize) {
-        let fewest = self.offer_counts.iter().copied().min().unwrap_or(0);
-        let most = self.offer_counts.iter().copied().max().unwrap_or(0);
-        (fewest, most)
+        range(&self.offer_counts)
     }
 
     /// The offer count as the CLI and the view print it: one number, or the fewest and the most,
     /// such as `118–127`.
     pub fn offer_count_text(&self) -> String {
-        match self.offer_range() {
-            (fewest, most) if fewest == most => fewest.to_string(),
-            (fewest, most) => format!("{fewest}–{most}"),
+        range_text(self.offer_range())
+    }
+
+    /// The fewest and the most offers the arrangement hides in its corporations' stores.
+    pub fn hidden_range(&self) -> (usize, usize) {
+        range(&self.hidden_counts)
+    }
+
+    /// The hidden count printed the way [`Group::offer_count_text`] prints the offer count.
+    pub fn hidden_count_text(&self) -> String {
+        range_text(self.hidden_range())
+    }
+
+    /// The ISK per LP of the first offer it lists, which is its best, or `None` when it lists
+    /// nothing or the first offer has no value.
+    pub fn best_isk_per_lp(&self) -> Option<f64> {
+        self.results.first()?.isk_per_lp
+    }
+
+    /// The profit within 10% of the best bid, summed over the offers it lists that have one, or
+    /// `None` when none of them do.
+    pub fn profit_within_10(&self) -> Option<f64> {
+        self.results
+            .iter()
+            .filter_map(|result| result.within_10.map(|(_, profit)| profit))
+            .reduce(|sum, profit| sum + profit)
+    }
+
+    /// The value `sort` orders groups by, for a group built at `depth`, or `None` when the group
+    /// has none.
+    pub fn sort_value(&self, sort: GroupSort, depth: usize) -> Option<f64> {
+        match sort {
+            GroupSort::AverageIskPerLp => self.average_isk_per_lp(depth),
+            GroupSort::BudgetIsk => self.budget.map(|fill| fill.isk),
+            GroupSort::BestOffer => self.best_isk_per_lp(),
+            GroupSort::ProfitWithin10 => self.profit_within_10(),
         }
     }
 
@@ -220,6 +365,22 @@ impl Group {
                 (sum + value, count + 1)
             });
         (count > 0).then(|| sum / count as f64)
+    }
+}
+
+/// The fewest and the most of `counts`, or zero for both when there are none.
+fn range(counts: &[usize]) -> (usize, usize) {
+    let fewest = counts.iter().copied().min().unwrap_or(0);
+    let most = counts.iter().copied().max().unwrap_or(0);
+    (fewest, most)
+}
+
+/// One number when the fewest and the most agree, otherwise both, such as `118–127`.
+fn range_text((fewest, most): (usize, usize)) -> String {
+    if fewest == most {
+        fewest.to_string()
+    } else {
+        format!("{fewest}–{most}")
     }
 }
 
@@ -320,7 +481,9 @@ mod tests {
         Group {
             corp_ids: corp_ids.to_vec(),
             offer_counts: vec![results.len(); corp_ids.len()],
+            hidden_counts: vec![0; corp_ids.len()],
             results,
+            budget: None,
         }
     }
 
@@ -548,5 +711,429 @@ mod tests {
         let report = Report::new(&[1, 3, 5], stores, Vec::new(), 1);
         assert_eq!(grouped(&report), [vec![1, 3, 5]]);
         assert_eq!(report.groups[0].offer_counts, [2, 1, 2]);
+    }
+
+    /// An offer with these figures and nothing else priced.
+    fn offer(
+        offer_id: i32,
+        isk_per_lp: Option<f64>,
+        spread: Option<f64>,
+        within_10: Option<(i64, f64)>,
+    ) -> OfferResult {
+        let mut result = OfferResult {
+            isk_per_lp,
+            spread,
+            within_10,
+            ..Default::default()
+        };
+        result.offer.offer_id = offer_id;
+        result
+    }
+
+    /// The store of `corp_ids` holding `offers`.
+    fn store_of(corp_ids: &[i32], offers: Vec<OfferResult>) -> Store {
+        let offer_ids = offers.iter().map(|result| result.offer.offer_id).collect();
+        let results = offers.into_iter().map(Arc::new).collect();
+        Store::new(corp_ids.to_vec(), offer_ids, results)
+    }
+
+    /// An offer with this ISK per LP and a spread of `spread`.
+    fn spread(offer_id: i32, isk_per_lp: f64, spread: f64) -> OfferResult {
+        offer(offer_id, Some(isk_per_lp), Some(spread), None)
+    }
+
+    /// The offer IDs the group lists.
+    fn listed(group: &Group) -> Vec<i32> {
+        group.results.iter().map(|r| r.offer.offer_id).collect()
+    }
+
+    /// An arrangement for `depth` with spreads above 50% filtered out.
+    fn narrow_spreads(depth: usize) -> Arrangement {
+        let mut arrangement = Arrangement::depth(depth);
+        arrangement.filter.max_spread = Some(50.0);
+        arrangement
+    }
+
+    #[test]
+    fn a_failing_top_offer_drops_out_and_the_next_passing_one_fills_the_top() {
+        let stores = vec![store_of(
+            &[10],
+            vec![
+                spread(1, 9.0, 80.0),
+                spread(2, 8.0, 5.0),
+                spread(3, 7.0, 5.0),
+                spread(4, 6.0, 5.0),
+            ],
+        )];
+        let mut report = Report::new(&[10], stores, Vec::new(), 2);
+        assert_eq!(listed(&report.groups[0]), [1, 2]);
+        report.arrange(&narrow_spreads(2));
+        assert_eq!(listed(&report.groups[0]), [2, 3], "still two offers");
+        assert_eq!(report.groups[0].hidden_counts, [1]);
+        assert_eq!(report.groups[0].average_isk_per_lp(2), Some(7.5));
+        assert_eq!(report.arrangement(), &narrow_spreads(2));
+    }
+
+    #[test]
+    fn stores_differing_only_in_a_failing_offer_are_one_group() {
+        let stores = vec![
+            store_of(
+                &[10],
+                vec![
+                    spread(1, 9.0, 5.0),
+                    spread(2, 8.0, 80.0),
+                    spread(3, 7.0, 5.0),
+                ],
+            ),
+            store_of(
+                &[20],
+                vec![
+                    spread(1, 9.0, 5.0),
+                    spread(3, 7.0, 5.0),
+                    spread(4, 1.0, 5.0),
+                ],
+            ),
+        ];
+        let mut report = Report::new(&[10, 20], stores, Vec::new(), 2);
+        assert_eq!(grouped(&report), [vec![10], vec![20]]);
+        report.arrange(&narrow_spreads(2));
+        assert_eq!(grouped(&report), [vec![10, 20]]);
+        assert_eq!(listed(&report.groups[0]), [1, 3]);
+        assert_eq!(report.groups[0].offer_counts, [3, 3]);
+        assert_eq!(report.groups[0].hidden_counts, [1, 0]);
+        assert_eq!(report.groups[0].hidden_count_text(), "0–1");
+    }
+
+    #[test]
+    fn an_excluded_offer_drops_out_like_a_failing_one() {
+        let stores = vec![
+            holding(&[10], &[(1, 9.0), (2, 8.0), (3, 7.0)]),
+            holding(&[20], &[(1, 9.0), (3, 7.0), (4, 1.0)]),
+        ];
+        let mut report = Report::new(&[10, 20], stores, Vec::new(), 2);
+        let mut arrangement = Arrangement::depth(2);
+        arrangement.excluded = Arc::new(HashSet::from([2]));
+        report.arrange(&arrangement);
+        assert_eq!(grouped(&report), [vec![10, 20]]);
+        assert_eq!(listed(&report.groups[0]), [1, 3]);
+        assert_eq!(report.groups[0].hidden_counts, [1, 0]);
+    }
+
+    #[test]
+    fn with_hiding_off_filters_and_exclusions_are_ignored() {
+        let stores = vec![store_of(
+            &[10],
+            vec![
+                spread(1, 9.0, 80.0),
+                spread(2, 8.0, 5.0),
+                spread(3, 7.0, 5.0),
+            ],
+        )];
+        let mut report = Report::new(&[10], stores, Vec::new(), 2);
+        let mut arrangement = narrow_spreads(2);
+        arrangement.excluded = Arc::new(HashSet::from([2]));
+        report.arrange(&arrangement);
+        assert_eq!(listed(&report.groups[0]), [3]);
+        assert_eq!(report.groups[0].hidden_counts, [2]);
+        arrangement.hiding = false;
+        report.arrange(&arrangement);
+        assert_eq!(listed(&report.groups[0]), [1, 2]);
+        assert_eq!(report.groups[0].hidden_counts, [0]);
+    }
+
+    #[test]
+    fn the_hideable_range_counts_what_hiding_would_take_out_whether_it_is_on_or_off() {
+        let stores = vec![
+            store_of(
+                &[10, 30],
+                vec![
+                    spread(1, 9.0, 5.0),
+                    spread(2, 8.0, 80.0),
+                    spread(3, 1.0, 90.0),
+                ],
+            ),
+            store_of(&[20], vec![spread(1, 9.0, 5.0), spread(4, 2.0, 60.0)]),
+        ];
+        let mut report = Report::new(&[10, 20, 30], stores, Vec::new(), 1);
+        let mut arrangement = narrow_spreads(1);
+        report.arrange(&arrangement);
+        let on = report.hideable_range(&report.groups[0]);
+        assert_eq!(
+            on,
+            report.groups[0].hidden_range(),
+            "hiding on: the group's own"
+        );
+        arrangement.hiding = false;
+        report.arrange(&arrangement);
+        // Hiding off lists offer 1 in every store too, so the group is the same three.
+        assert_eq!(report.groups[0].hidden_range(), (0, 0), "nothing is hidden");
+        assert_eq!(report.hideable_range(&report.groups[0]), (1, 2));
+        assert_eq!(report.hideable_count_text(&report.groups[0]), "1–2");
+        assert_eq!(
+            report.groups[0].sort_value(GroupSort::BestOffer, 1),
+            Some(9.0)
+        );
+    }
+
+    #[test]
+    fn the_hideable_range_counts_an_exclusion_with_the_filter_failures() {
+        // Store 10 holds a failing offer (2) and an excluded one (3); store 20 only the excluded one.
+        let stores = vec![
+            store_of(
+                &[10],
+                vec![
+                    spread(1, 9.0, 5.0),
+                    spread(2, 8.0, 80.0),
+                    spread(3, 7.0, 5.0),
+                ],
+            ),
+            store_of(&[20], vec![spread(1, 9.0, 5.0), spread(3, 7.0, 5.0)]),
+        ];
+        let mut report = Report::new(&[10, 20], stores, Vec::new(), 1);
+        let mut arrangement = narrow_spreads(1);
+        arrangement.excluded = Arc::new(HashSet::from([3]));
+        report.arrange(&arrangement);
+        assert_eq!(grouped(&report), [vec![10, 20]]);
+        assert_eq!(report.groups[0].hidden_counts, [2, 1]);
+        assert_eq!(report.hideable_range(&report.groups[0]), (1, 2));
+        arrangement.hiding = false;
+        report.arrange(&arrangement);
+        assert_eq!(report.groups[0].hidden_range(), (0, 0));
+        assert_eq!(
+            report.hideable_range(&report.groups[0]),
+            (1, 2),
+            "hiding off still counts the exclusion as what it would hide"
+        );
+        // The exclusion alone, with no filter, is counted too.
+        arrangement.filter = OfferFilter::default();
+        report.arrange(&arrangement);
+        assert_eq!(report.hideable_range(&report.groups[0]), (1, 1));
+    }
+
+    #[test]
+    fn hidden_counts_cover_each_corporations_whole_store_in_the_runs_order() {
+        // At depth 1 all three list offer 1. The store of 10 and 30 hides two offers below it,
+        // the store of 20 hides one.
+        let stores = vec![
+            store_of(
+                &[10, 30],
+                vec![
+                    spread(1, 9.0, 5.0),
+                    spread(2, 8.0, 80.0),
+                    spread(3, 1.0, 90.0),
+                ],
+            ),
+            store_of(&[20], vec![spread(1, 9.0, 5.0), spread(4, 2.0, 60.0)]),
+        ];
+        let mut report = Report::new(&[10, 20, 30], stores, Vec::new(), 1);
+        report.arrange(&narrow_spreads(1));
+        let group = &report.groups[0];
+        assert_eq!(group.corp_ids, [10, 20, 30]);
+        assert_eq!(group.offer_counts, [3, 2, 3]);
+        assert_eq!(group.hidden_counts, [2, 1, 2]);
+        assert_eq!(group.hidden_range(), (1, 2));
+        assert_eq!(group.hidden_count_text(), "1–2");
+
+        report.regroup(1);
+        assert_eq!(
+            report.groups[0].hidden_count_text(),
+            "0",
+            "one number when equal"
+        );
+        assert_eq!(
+            report.arrangement(),
+            &Arrangement::depth(1),
+            "regroup resets"
+        );
+    }
+
+    #[test]
+    fn a_missing_figure_fails_a_filter_on_that_figure() {
+        let stores = vec![store_of(
+            &[10],
+            vec![
+                offer(1, Some(9.0), Some(5.0), None),
+                offer(2, None, Some(5.0), Some((10, 1e6))),
+                offer(3, Some(7.0), None, Some((10, 1e6))),
+                offer(4, Some(6.0), Some(5.0), Some((10, 1e6))),
+            ],
+        )];
+        let mut report = Report::new(&[10], stores, Vec::new(), 10);
+        // Ranked 1, 3, 4, then 2, which has no ISK per LP.
+        type Set = fn(&mut OfferFilter);
+        let cases: [(&str, Set, [i32; 3]); 4] = [
+            ("volume", |filter| filter.min_volume = Some(0), [3, 4, 2]),
+            ("profit", |filter| filter.min_profit = Some(0.0), [3, 4, 2]),
+            (
+                "ISK/LP",
+                |filter| filter.min_isk_per_lp = Some(0.0),
+                [1, 3, 4],
+            ),
+            (
+                "spread",
+                |filter| filter.max_spread = Some(100.0),
+                [1, 4, 2],
+            ),
+        ];
+        for (figure, set, expected) in cases {
+            let mut arrangement = Arrangement::depth(10);
+            set(&mut arrangement.filter);
+            report.arrange(&arrangement);
+            assert_eq!(listed(&report.groups[0]), expected, "{figure}");
+            assert_eq!(report.groups[0].hidden_counts, [1], "{figure}");
+        }
+    }
+
+    /// Stores whose groups order differently under each sort, and two that tie or lack a value.
+    ///
+    /// | corp | ISK/LP   | profit ±10%  | average | best | profit |
+    /// |------|----------|--------------|---------|------|--------|
+    /// | 10   | 10, 1    | 1M, 1M       | 5.5     | 10   | 2M     |
+    /// | 20   | 6, 6     | 5M, none     | 6       | 6    | 5M     |
+    /// | 30   | 8, 5     | none         | 6.5     | 8    | none   |
+    /// | 5    | 3        | 2M           | 3       | 3    | 2M     |
+    /// | 25   | none     | none         | none    | none | none   |
+    fn sortable() -> Report {
+        let with = |offer_id, isk_per_lp, profit: Option<f64>| {
+            offer(offer_id, isk_per_lp, None, profit.map(|p| (1, p)))
+        };
+        let stores = vec![
+            store_of(
+                &[10],
+                vec![
+                    with(101, Some(10.0), Some(1e6)),
+                    with(102, Some(1.0), Some(1e6)),
+                ],
+            ),
+            store_of(
+                &[20],
+                vec![with(201, Some(6.0), Some(5e6)), with(202, Some(6.0), None)],
+            ),
+            store_of(
+                &[30],
+                vec![with(301, Some(8.0), None), with(302, Some(5.0), None)],
+            ),
+            store_of(&[5], vec![with(51, Some(3.0), Some(2e6))]),
+            store_of(&[25], vec![with(251, None, None)]),
+        ];
+        Report::new(&[], stores, Vec::new(), 2)
+    }
+
+    /// The groups' first corporations, in order.
+    fn firsts(report: &Report) -> Vec<i32> {
+        report.groups.iter().map(|g| g.corp_ids[0]).collect()
+    }
+
+    #[test]
+    fn groups_sort_by_each_key_whether_arranged_or_only_resorted() {
+        let expected = [
+            (GroupSort::AverageIskPerLp, [30, 20, 10, 5, 25]),
+            (GroupSort::BestOffer, [10, 30, 20, 5, 25]),
+            (GroupSort::ProfitWithin10, [20, 5, 10, 25, 30]),
+        ];
+        let mut report = sortable();
+        for (sort, order) in expected {
+            let mut arrangement = Arrangement::depth(2);
+            arrangement.sort = sort;
+            report.arrange(&arrangement);
+            assert_eq!(firsts(&report), order, "arranged by {sort:?}");
+
+            let mut resorted = sortable();
+            resorted.sort_groups(sort, false);
+            assert_eq!(firsts(&resorted), order, "resorted by {sort:?}");
+            assert_eq!(resorted.arrangement().sort, sort);
+        }
+    }
+
+    #[test]
+    fn a_reversed_sort_keeps_groups_without_a_value_last_and_ties_by_first_corporation() {
+        let mut report = sortable();
+        report.sort_groups(GroupSort::ProfitWithin10, true);
+        // 10 and 5 tie at 2M, so 5 goes first in both directions; 25 and 30 have no value.
+        assert_eq!(firsts(&report), [5, 10, 20, 25, 30]);
+        assert!(report.arrangement().reverse);
+        report.sort_groups(GroupSort::AverageIskPerLp, true);
+        assert_eq!(firsts(&report), [5, 10, 20, 30, 25]);
+    }
+
+    /// An offer of one unit for 100 LP and no ISK, with this ISK per LP and spread, whose reward
+    /// sells into `book`, given as (price, volume) best first. Each offer has its own reward type.
+    fn redeemable(offer_id: i32, isk_per_lp: f64, spread: f64, book: &[(f64, i32)]) -> OfferResult {
+        let mut result = offer(offer_id, Some(isk_per_lp), Some(spread), None);
+        result.offer.type_id = offer_id;
+        result.offer.quantity = 1;
+        result.offer.lp_cost = 100;
+        result.buy_orders = book
+            .iter()
+            .map(|&(price, volume_remain)| crate::expenses::BookOrder {
+                price,
+                volume_remain,
+            })
+            .collect();
+        result
+    }
+
+    #[test]
+    fn the_budget_sort_orders_groups_by_the_isk_the_fill_realizes() {
+        // With the default 1,000 LP: 10 sells 5 units at 1,000 and runs out of book, 5,000 ISK;
+        // 20 sells 10 units at 600 and runs out of budget, 6,000 ISK. 30 has the best ISK per LP,
+        // but nobody buys its reward, so it has no fill and goes last.
+        let stores = vec![
+            store_of(&[10], vec![redeemable(101, 10.0, 5.0, &[(1000.0, 5)])]),
+            store_of(&[20], vec![redeemable(201, 6.0, 5.0, &[(600.0, 100)])]),
+            store_of(&[30], vec![redeemable(301, 20.0, 5.0, &[])]),
+        ];
+        let mut report = Report::new(&[], stores, Vec::new(), 10);
+        assert_eq!(firsts(&report), [30, 10, 20], "by the average");
+        let fill = |corp_id: i32| {
+            let group = report.groups.iter().find(|g| g.corp_ids[0] == corp_id);
+            group.unwrap().budget
+        };
+        let ten = fill(10).unwrap();
+        assert_eq!(
+            (ten.isk, ten.lp_spent, ten.stopped),
+            (5000.0, 500, budget::Stop::Book)
+        );
+        let twenty = fill(20).unwrap();
+        assert_eq!(
+            (twenty.isk, twenty.lp_spent, twenty.stopped),
+            (6000.0, 1000, budget::Stop::Budget)
+        );
+        assert_eq!(fill(30), None);
+
+        report.sort_groups(GroupSort::BudgetIsk, false);
+        assert_eq!(firsts(&report), [20, 10, 30]);
+        report.sort_groups(GroupSort::BudgetIsk, true);
+        assert_eq!(firsts(&report), [10, 20, 30], "no fill stays last");
+
+        let mut arrangement = Arrangement::depth(10);
+        arrangement.sort = GroupSort::BudgetIsk;
+        arrangement.lp_budget = Some(400);
+        report.arrange(&arrangement);
+        // 400 LP buys 4 redemptions of each: 4,000 ISK against 2,400.
+        assert_eq!(firsts(&report), [10, 20, 30]);
+        arrangement.lp_budget = None;
+        report.arrange(&arrangement);
+        assert!(report.groups.iter().all(|g| g.budget.is_none()));
+        assert_eq!(firsts(&report), [10, 20, 30], "by first corporation");
+    }
+
+    #[test]
+    fn hidden_offers_take_no_part_in_the_fill() {
+        // Offer 1 pays 50 ISK per LP but fails the spread filter; offer 2 pays 2.
+        let stores = vec![store_of(
+            &[10],
+            vec![
+                redeemable(1, 50.0, 80.0, &[(5000.0, 100)]),
+                redeemable(2, 2.0, 5.0, &[(200.0, 100)]),
+            ],
+        )];
+        let mut report = Report::new(&[10], stores, Vec::new(), 10);
+        let all = report.groups[0].budget.unwrap();
+        assert_eq!((all.isk, all.redemptions), (50_000.0, 10));
+        report.arrange(&narrow_spreads(10));
+        let passing = report.groups[0].budget.unwrap();
+        assert_eq!((passing.isk, passing.redemptions), (2000.0, 10));
+        assert_eq!(passing.isk_per_lp(), Some(2.0));
     }
 }

@@ -2,12 +2,12 @@
 //! not reachable from here, because the view is part of the binary and the library is compiled
 //! without `cfg(test)` for it.
 
-use super::app::{App, ExportPrompt, Overlay, RunInfo, StaticDataDialog};
+use super::app::{App, ExportPrompt, Overlay, RunInfo, SearchPrompt, StaticDataDialog};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use eve_lpstore::OfferResult;
 use eve_lpstore::esi::loyalty::LoyaltyOffer;
 use eve_lpstore::expenses::ExpenseBreakdown;
-use eve_lpstore::report::{LpStoreOptions, Report, Store};
+use eve_lpstore::report::{Arrangement, LpStoreOptions, Report, Store};
 use eve_lpstore::static_data::AgentFilter;
 use std::sync::Arc;
 
@@ -63,6 +63,7 @@ pub fn priced_offer(
         }),
         imbalance,
         within_10,
+        buy_orders: Default::default(),
     }
 }
 
@@ -82,7 +83,7 @@ pub fn report_of(offers: Vec<OfferResult>) -> Report {
 /// corporation 1000002.
 pub fn results_app(offers: Vec<OfferResult>, depth: usize) -> App {
     let mut app = App::new(LpStoreOptions::default());
-    app.begin_run(forge_run(1), "none".to_string(), depth);
+    app.begin_run(forge_run(1), "none".to_string(), Arrangement::depth(depth));
     app.finish(report_of(offers));
     app
 }
@@ -105,5 +106,13 @@ pub fn dialog(app: &App) -> &StaticDataDialog {
     match &app.overlay {
         Overlay::StaticData(dialog) => dialog,
         other => panic!("the static data dialog is not open: {other:?}"),
+    }
+}
+
+/// The open search prompt.
+pub fn search_prompt(app: &App) -> &SearchPrompt {
+    match &app.overlay {
+        Overlay::Search(prompt) => prompt,
+        other => panic!("the search prompt is not open: {other:?}"),
     }
 }

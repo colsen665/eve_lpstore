@@ -1,7 +1,8 @@
 use super::*;
-use crate::tui::form::FilterForm;
+use crate::tui::form::{FilterForm, FormKind};
 use crate::tui::test_support::{forge_run, press, priced_offer, report_of, results_app};
-use eve_lpstore::report::{Field, LpStoreOptions, OptionError};
+use eve_lpstore::report::{Arrangement, Field, LpStoreOptions, OptionError};
+use ratatui::style::Modifier;
 
 #[test]
 fn wrapping_keeps_the_indent_on_every_row() {
@@ -314,16 +315,194 @@ fn the_wide_offers_table_survives_the_terminal_it_switches_on_at() {
 fn no_terminal_width_cuts_the_last_offers_column() {
     // Both layouts were truncating "Profit ±10%" at their own minimum widths, and the gap
     // between them was not obvious from the column arithmetic. Every width the view accepts has
-    // to show the last column in full, whichever layout it picks.
+    // to show the last column in full, whichever layout it picks, and with the table sorted by it.
     for width in MIN_WIDTH..=160 {
-        let app = results_app(one_priced_offer(), 10);
+        let mut app = results_app(one_priced_offer(), 10);
         let text = view_text(&app, width, MIN_HEIGHT + 4);
         assert!(
             text.contains("Profit ±10%") && text.contains("3.98B"),
             "the last offers column was cut at {} columns",
             width
         );
+        for _ in 0..4 {
+            app.on_key(press(crossterm::event::KeyCode::Char('o')));
+        }
+        let text = view_text(&app, width, MIN_HEIGHT + 4);
+        assert!(
+            text.contains(" Offers: profit ▼ "),
+            "no sort in the title at {width}: {text}"
+        );
+        assert!(
+            text.contains("Profit ±10%") && text.contains("3.98B"),
+            "the last offers column was cut at {width} columns sorted by profit"
+        );
     }
+}
+
+/// The fixture offer and a second one, of type 34, ranked above it with a smaller profit.
+fn two_offers() -> Vec<OfferResult> {
+    let mut second = priced_offer(Some(80.0), Some(0.0), Some((10, 1e6)));
+    second.offer.offer_id = 2;
+    second.offer.type_id = 34;
+    second.isk_per_lp = Some(2000.0);
+    let mut offers = one_priced_offer();
+    offers.push(second);
+    offers
+}
+
+/// The screen line holding `item`, from text [`view_text`] rendered `width` cells wide.
+fn line_with(text: &str, width: u16, item: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .chunks(usize::from(width))
+        .map(|line| line.iter().collect::<String>())
+        .find(|line| line.contains(item))
+        .unwrap_or_else(|| panic!("{item:?} is not on screen: {text}"))
+}
+
+#[test]
+fn a_sorted_offers_table_keeps_each_offers_rank_and_says_how_it_is_sorted() {
+    let mut app = results_app(two_offers(), 10);
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(
+        text.contains(" Offers "),
+        "no sort named for the ranking: {text}"
+    );
+    assert!(
+        text.find("Type 34") < text.find("Type 30486"),
+        "the better ISK per LP first: {text}"
+    );
+    for _ in 0..4 {
+        app.on_key(press(crossterm::event::KeyCode::Char('o')));
+    }
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains(" Offers: profit ▼ "), "{text}");
+    assert!(
+        text.find("Type 30486") < text.find("Type 34"),
+        "the larger profit first: {text}"
+    );
+    // The `#` column keeps the ranking, and the selection stays on the offer it was on.
+    assert!(
+        line_with(&text, MIN_WIDTH, "Type 30486").contains("│  2 "),
+        "{text}"
+    );
+    assert!(
+        line_with(&text, MIN_WIDTH, "Type 34").contains("│> 1 "),
+        "{text}"
+    );
+    app.on_key(press(crossterm::event::KeyCode::Char('O')));
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains(" Offers: profit ▲ "), "{text}");
+    // Back on the ranking, still reversed, with the filters hiding the wide offer: the title
+    // carries both.
+    app.on_key(press(crossterm::event::KeyCode::Char('o')));
+    app.rearrange(|arrangement| arrangement.filter.max_spread = Some(20.0));
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains(" Offers: rank ▼, 1 hidden "), "{text}");
+}
+
+#[test]
+fn a_long_offers_title_drops_the_panes_name_to_keep_the_stale_mark() {
+    // Two stores that list the fixture offer first, at depth 1, below which one holds one offer a
+    // 20% spread limit fails and the other two, so the count is a range.
+    let failing = |offer_id: i32| {
+        let mut result = priced_offer(Some(80.0), Some(0.0), Some((10, 1e6)));
+        result.offer.offer_id = offer_id;
+        result.isk_per_lp = Some(1.0);
+        result
+    };
+    let store = |corp_id: i32, offers: Vec<OfferResult>| {
+        let offer_ids = offers.iter().map(|result| result.offer.offer_id).collect();
+        let results = offers.into_iter().map(std::sync::Arc::new).collect();
+        eve_lpstore::report::Store::new(vec![corp_id], offer_ids, results)
+    };
+    let mut app = App::new(LpStoreOptions::default());
+    app.begin_run(forge_run(2), "none".to_string(), Arrangement::depth(1));
+    app.finish(eve_lpstore::report::Report::new(
+        &[1, 2],
+        vec![
+            store(1, vec![one_priced_offer().remove(0), failing(2)]),
+            store(
+                2,
+                vec![one_priced_offer().remove(0), failing(3), failing(4)],
+            ),
+        ],
+        Vec::new(),
+        1,
+    ));
+    app.rearrange(|arrangement| arrangement.filter.max_spread = Some(20.0));
+    app.on_key(press(crossterm::event::KeyCode::Char('F')));
+    app.on_key(press(crossterm::event::KeyCode::Char('o')));
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(
+        text.contains(" Offers: spread ▲, hiding off, 1–2 would hide "),
+        "{text}"
+    );
+    let same = app.arrangement.clone();
+    app.start_run(forge_run(2), "none".to_string(), same);
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(
+        text.contains("┌ spread ▲, hiding off, 1–2 would hide (stale) ─"),
+        "{text}"
+    );
+    let text = view_text(&app, 120, MIN_HEIGHT);
+    assert!(
+        text.contains(" Offers: spread ▲, hiding off, 1–2 would hide (stale) "),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_search_prompt_renders_at_the_minimum_terminal_size() {
+    let mut app = results_app(one_priced_offer(), 10);
+    app.on_key(press(crossterm::event::KeyCode::Char('/')));
+    for c in "trit".chars() {
+        app.on_key(press(crossterm::event::KeyCode::Char(c)));
+    }
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    for line in [
+        " Search ",
+        "Find a corporation or item name",
+        "trit",
+        "Enter jumps to the next match  Esc cancels  Ctrl+U clears",
+        "Enter find  Esc cancel  Ctrl+U clear  Ctrl+C quit",
+    ] {
+        assert!(text.contains(line), "{line:?} is missing: {text}");
+    }
+    assert!(
+        !text.contains("f filters"),
+        "the view keys are hidden: {text}"
+    );
+    app.on_key(press(crossterm::event::KeyCode::Enter));
+    app.find(crate::tui::app::Direction::Next, &StaticData::default());
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains("No match"), "{text}");
+    assert!(text.contains("trit"), "the query stays to correct: {text}");
+}
+
+#[test]
+fn the_groups_pane_shows_the_search_and_a_miss() {
+    let mut app = results_app(one_priced_offer(), 10);
+    app.on_key(press(crossterm::event::KeyCode::Char('/')));
+    for c in "type 30486".chars() {
+        app.on_key(press(crossterm::event::KeyCode::Char(c)));
+    }
+    app.on_key(press(crossterm::event::KeyCode::Enter));
+    app.find(crate::tui::app::Direction::Next, &StaticData::default());
+    assert_eq!(app.overlay, Overlay::None);
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains("└ /type 30486 ─"), "{text}");
+    app.rearrange(|arrangement| arrangement.filter.max_spread = Some(5.0));
+    app.on_key(press(crossterm::event::KeyCode::Char('n')));
+    app.find(crate::tui::app::Direction::Next, &StaticData::default());
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains("└ /type 30486: no match ─┘"), "{text}");
+    // A query too long for the pane is cut so the miss still shows.
+    app.search.as_mut().unwrap().query = "type 30486 and more".to_string();
+    app.on_key(press(crossterm::event::KeyCode::Char('n')));
+    app.find(crate::tui::app::Direction::Next, &StaticData::default());
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains("└ /type 30486…: no match ┘"), "{text}");
 }
 
 #[test]
@@ -451,7 +630,7 @@ fn the_idle_view_says_nothing_has_started_behind_the_startup_dialog() {
 #[test]
 fn the_startup_filters_dialog_shows_the_prefilled_defaults() {
     let mut app = App::new(LpStoreOptions::default());
-    let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+    let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
     app.show_filters(form);
     let text = view_text(&app, 120, 40);
     assert!(text.contains("The Forge"), "the region default is visible");
@@ -460,8 +639,8 @@ fn the_startup_filters_dialog_shows_the_prefilled_defaults() {
         "the filter fields are there and empty"
     );
     assert!(
-        text.contains("Enter apply"),
-        "the footer shows the form's keys"
+        text.contains("Enter fetch"),
+        "the footer shows the form's keys, and what Enter does"
     );
 }
 
@@ -470,7 +649,7 @@ fn a_note_about_the_saved_file_shows_on_the_startup_form() {
     // The form owns the keyboard and the log panel cannot be opened over it, so this is the only
     // place the reason could be seen before the first run.
     let mut app = App::new(LpStoreOptions::default());
-    let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+    let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
     form.set_note(Some(
         "filters.json is not valid JSON: expected value".to_string(),
     ));
@@ -503,7 +682,7 @@ fn the_market_hints_split_between_the_row_and_the_note_below() {
         ),
     ] {
         let mut app = App::new(LpStoreOptions::default());
-        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
         form.focus = focus;
         app.show_filters(form);
         let text = view_text(&app, 120, 40);
@@ -518,7 +697,7 @@ fn the_market_hints_split_between_the_row_and_the_note_below() {
 #[test]
 fn the_focused_market_field_shows_both_hint_lines_when_there_is_room() {
     let mut app = App::new(LpStoreOptions::default());
-    let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+    let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
     form.focus = FormField::Text(Field::System);
     app.show_filters(form);
     let text = view_text(&app, 120, 40);
@@ -543,7 +722,7 @@ fn the_focused_place_field_shows_both_hint_lines() {
         ),
     ] {
         let mut app = App::new(LpStoreOptions::default());
-        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
         form.focus = focus;
         app.show_filters(form);
         let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
@@ -557,7 +736,7 @@ fn the_focused_place_field_shows_both_hint_lines() {
 #[test]
 fn the_cache_minutes_field_explains_the_blank_default_and_zero() {
     let mut app = App::new(LpStoreOptions::default());
-    let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+    let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
     form.focus = FormField::Text(Field::CacheMinutes);
     app.show_filters(form);
     let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
@@ -873,7 +1052,7 @@ fn the_new_place_fields_still_leave_room_for_a_hint() {
     // notes under them — hints, valid values, and every validation error — keep a row. If the
     // form ever fills the dialog again, this fails rather than the error going unseen.
     let mut app = App::new(LpStoreOptions::default());
-    let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+    let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
     app.show_filters(form);
     for focus in [
         FormField::Text(Field::AgentRegion),
@@ -894,7 +1073,7 @@ fn the_new_place_fields_still_leave_room_for_a_hint() {
 #[test]
 fn a_field_error_on_a_place_filter_is_visible_at_the_minimum_size() {
     let mut app = App::new(LpStoreOptions::default());
-    let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+    let form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
     app.show_filters(form);
     app.form.focus = FormField::Text(Field::AgentRegion);
     app.form.set_errors(vec![OptionError {
@@ -916,7 +1095,7 @@ fn the_place_fields_offer_name_matches_like_the_market_ones() {
         (FormField::Text(Field::AgentSystem), "jit"),
     ] {
         let mut app = App::new(LpStoreOptions::default());
-        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge", 10);
+        let mut form = FilterForm::from_options_with_defaults(&app.applied, "The Forge");
         form.focus = field;
         if let FormField::Text(field) = field {
             form.set_value(field, typed);
@@ -930,7 +1109,11 @@ fn the_place_fields_offer_name_matches_like_the_market_ones() {
 /// Results on screen, then a second run started over them: the state a re-applied filter leaves.
 fn rerun_app(done: usize, total: usize) -> App {
     let mut app = results_app(one_priced_offer(), 10);
-    app.start_run(forge_run(12), "--security 0.4..0.5".to_string(), 10);
+    app.start_run(
+        forge_run(12),
+        "--security 0.4..0.5".to_string(),
+        Arrangement::depth(10),
+    );
     app.on_event(
         &eve_lpstore::report::Event::FetchProgress { done, total },
         None,
@@ -958,7 +1141,7 @@ fn the_first_run_keeps_its_bars_inline() {
     // No results behind it, so there is nothing to cover and the progress view is already the
     // whole screen. The popup is only for a run that superseded something.
     let mut app = App::new(LpStoreOptions::default());
-    app.begin_run(forge_run(3), "none".to_string(), 10);
+    app.begin_run(forge_run(3), "none".to_string(), Arrangement::depth(10));
     app.on_event(
         &eve_lpstore::report::Event::FetchProgress { done: 1, total: 3 },
         None,
@@ -1189,6 +1372,12 @@ fn the_inline_hint_is_one_line_even_when_the_note_is_two() {
         FormField::Text(Field::AgentRegion),
         FormField::Text(Field::AgentSystem),
         FormField::Text(Field::CacheMinutes),
+        FormField::Text(Field::LpBudget),
+        FormField::Text(Field::MinIskPerLp),
+        FormField::Text(Field::MaxSpread),
+        FormField::Text(Field::MinImbalance),
+        FormField::Text(Field::MinVolume),
+        FormField::Text(Field::MinProfit),
     ] {
         let line = hint_line(field, &StaticData::default());
         assert!(
@@ -1200,7 +1389,11 @@ fn the_inline_hint_is_one_line_even_when_the_note_is_two() {
         );
     }
     // No inline hint may carry a break, whatever its length.
-    for field in FormField::all() {
+    for field in FormKind::Fetch
+        .fields()
+        .into_iter()
+        .chain(FormKind::Display.fields())
+    {
         assert!(
             !hint_line(field, &StaticData::default()).contains('\n'),
             "{field:?} kept the break in the row"
@@ -1214,7 +1407,6 @@ fn the_grouped_dialog_renders_at_the_minimum_terminal_size() {
     app.show_filters(FilterForm::from_options_with_defaults(
         &app.applied,
         "The Forge",
-        10,
     ));
     let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
     for label in [
@@ -1228,15 +1420,83 @@ fn the_grouped_dialog_renders_at_the_minimum_terminal_size() {
         "Faction",
         "Market region",
         "Market system",
-        "Depth",
         "Cache minutes",
         "Expire cache",
     ] {
         assert!(text.contains(label), "{label:?} did not render");
     }
     assert!(
+        !text.contains("Depth"),
+        "the depth moved to the display filters"
+    );
+    assert!(text.contains(" Filters "));
+    assert!(text.contains("Enter fetch"), "{text}");
+    assert!(
         !text.contains("stations.Name"),
         "a two-line hint was glued into one row"
+    );
+}
+
+/// An app on the results view of one finished run with the display form open.
+fn display_form_app() -> App {
+    let mut app = results_app(one_priced_offer(), 10);
+    app.on_key(press(crossterm::event::KeyCode::Char('v')));
+    assert_eq!(app.overlay, Overlay::DisplayFilters);
+    app
+}
+
+#[test]
+fn the_display_form_renders_every_field_at_the_minimum_terminal_size() {
+    let mut app = display_form_app();
+    for field in FormKind::Display.fields() {
+        app.form.focus = field;
+        let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+        for label in [
+            "Depth",
+            "LP budget",
+            "Min ISK/LP",
+            "Max spread %",
+            "Min imbalance",
+            "Min volume",
+            "Min profit",
+        ] {
+            assert!(text.contains(label), "{label:?} did not render: {text}");
+        }
+        assert!(text.contains(" Display filters "), "{text}");
+        assert!(text.contains("Enter re-arrange"), "{text}");
+        // The focused field's whole hint fits under the rows, every line of it.
+        for line in hint(field, &StaticData::default()).lines() {
+            assert!(text.contains(line), "{field:?}'s {line:?} was cut: {text}");
+        }
+    }
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains("1000"), "the LP budget in force is filled in");
+}
+
+#[test]
+fn an_error_on_the_display_form_is_visible_at_the_minimum_size() {
+    let mut app = display_form_app();
+    app.form.set_value(Field::MinVolume, "lots");
+    app.form.set_value(Field::LpBudget, "0");
+    app.form.focus = FormField::Text(Field::MinVolume);
+    let errors = app
+        .form
+        .to_options(&app.applied)
+        .parse()
+        .expect_err("both values are invalid");
+    app.form.set_errors(errors);
+    assert!(!app.apply_display_form(), "an invalid form does not apply");
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    let message = app
+        .form
+        .error_for(FormField::Text(Field::MinVolume))
+        .expect("the error sits on its field");
+    for row in wrap_text(&message, usize::from(MIN_WIDTH) - 2) {
+        assert!(text.contains(&row), "{row:?} is not on screen: {text}");
+    }
+    assert!(
+        text.contains("Invalid --lp-budget"),
+        "the other field's error starts in its row: {text}"
     );
 }
 
@@ -1320,12 +1580,23 @@ fn the_help_scrolls_on_the_smallest_screen() {
     assert!(top.contains(" Help, Up/Down to scroll "), "{top}");
     assert!(top.contains(&row("Tab", "switch between groups, offers, and details")));
     assert!(
-        top.contains(&row("", "(ISK cost + items) ÷ units")),
+        top.contains(&row(
+            "",
+            "reward at the best buy order, items at the best sell orders"
+        )),
         "the last row of the window shows whole: {top}"
+    );
+    assert!(
+        !top.contains("(best ask − best bid)"),
+        "the spread is below the window: {top}"
     );
     assert!(
         !top.contains("only the Market system's stations"),
         "the last line is below the window: {top}"
+    );
+    assert!(
+        !top.contains("redemption at a time"),
+        "the budget lines are below it too: {top}"
     );
     assert!(
         !top.contains("In-flight:"),
@@ -1340,5 +1611,286 @@ fn the_help_scrolls_on_the_smallest_screen() {
     assert!(
         !bottom.contains("switch between groups"),
         "the first line scrolled away: {bottom}"
+    );
+}
+
+#[test]
+fn the_help_names_the_arrangement_keys_and_the_budget_limits() {
+    let text = help_text(120, 40, 0);
+    for key in [
+        "edit depth, LP budget, thresholds; Enter re-arranges",
+        "cycle the group sort, or reverse its direction",
+        "show offers the thresholds hide, dimmed, or hide them again",
+        "exclude or restore the selected offer; F shows excluded ones",
+        "cycle the offer table's sort, or reverse its direction",
+        "search corporation and item names; Enter jumps to a match",
+        "jump to the next or previous match of the search",
+        "Greedy, so not always the most ISK,",
+        "items are always bought at the best sell price",
+    ] {
+        assert!(text.contains(key), "{key:?} is missing: {text}");
+    }
+}
+
+/// One finished run whose only group holds the fixture offer and a second offer, of type 34, with
+/// the better ISK per LP and an 80% spread, so a 20% spread limit hides it.
+fn filtered_app() -> App {
+    let mut wide = priced_offer(Some(80.0), Some(0.0), Some((10, 1e6)));
+    wide.offer.offer_id = 2;
+    wide.offer.type_id = 34;
+    wide.isk_per_lp = Some(2000.0);
+    let mut offers = one_priced_offer();
+    offers.push(wide);
+    let mut app = results_app(offers, 10);
+    app.rearrange(|arrangement| arrangement.filter.max_spread = Some(20.0));
+    app
+}
+
+#[test]
+fn the_groups_title_names_the_sort_and_its_direction_at_80_and_120_columns() {
+    let mut app = results_app(one_priced_offer(), 10);
+    for width in [MIN_WIDTH, 120] {
+        let text = view_text(&app, width, MIN_HEIGHT);
+        assert!(text.contains(" Groups: avg ▼ "), "at {width}: {text}");
+    }
+    let text = view_text(&app, 120, 40);
+    assert!(text.contains("1,627.78 avg ISK/LP | 1 offers"), "{text}");
+    app.on_key(press(crossterm::event::KeyCode::Char('s')));
+    app.on_key(press(crossterm::event::KeyCode::Char('S')));
+    for width in [MIN_WIDTH, 120] {
+        let text = view_text(&app, width, MIN_HEIGHT);
+        assert!(text.contains(" Groups: budget ▲ "), "at {width}: {text}");
+    }
+    // The fixture has no buy orders, so no redemption can be sold.
+    let text = view_text(&app, 120, 40);
+    assert!(text.contains("n/a ISK for budget | 1 offers"), "{text}");
+    for (sort, value) in [
+        ("best", "1,627.78 best ISK/LP"),
+        ("profit", "3.98B profit ±10%"),
+    ] {
+        app.on_key(press(crossterm::event::KeyCode::Char('s')));
+        let text = view_text(&app, 120, 40);
+        assert!(text.contains(&format!(" Groups: {sort} ▲ ")), "{text}");
+        assert!(text.contains(value), "{value:?}: {text}");
+    }
+    // With the stale mark, the pane's name gives way at 80 columns so the sort stays whole, and
+    // stays at 120.
+    app.start_run(forge_run(1), "none".to_string(), Arrangement::depth(10));
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(text.contains("┌ profit ▲ (stale) ─"), "{text}");
+    let text = view_text(&app, 120, MIN_HEIGHT);
+    assert!(text.contains(" Groups: profit ▲ (stale) "), "{text}");
+}
+
+#[test]
+fn no_terminal_width_cuts_the_last_offers_column_with_filters_active() {
+    for width in MIN_WIDTH..=160 {
+        let mut app = filtered_app();
+        let text = view_text(&app, width, MIN_HEIGHT + 4);
+        assert!(
+            text.contains("Profit ±10%") && text.contains("3.98B"),
+            "the last offers column was cut at {width} columns"
+        );
+        assert!(
+            text.contains(" Offers: 1 hidden "),
+            "no hidden count at {width}: {text}"
+        );
+        assert!(!text.contains("Type 34"), "the wide offer is hidden");
+        app.on_key(press(crossterm::event::KeyCode::Char('F')));
+        let text = view_text(&app, width, MIN_HEIGHT + 4);
+        assert!(
+            text.contains(" Offers: hiding off, 1 would hide "),
+            "no hiding-off title at {width}: {text}"
+        );
+        assert!(
+            text.contains("Profit ±10%") && text.contains("1.00M"),
+            "the last offers column was cut at {width} columns with hiding off"
+        );
+    }
+}
+
+#[test]
+fn an_excluded_row_is_struck_through_and_dim_and_a_failing_one_only_dim() {
+    let mut result = priced_offer(Some(12.5), Some(50.0), Some((100, 1000.0)));
+    result.offer.offer_id = 7;
+    let mut arrangement = Arrangement::depth(10);
+    arrangement.excluded = std::sync::Arc::new(HashSet::from([7]));
+    arrangement.filter.max_spread = Some(5.0);
+    let styles = |arrangement: &Arrangement, result: &OfferResult| -> Vec<Style> {
+        offer_cells(0, result, "Probe".to_string(), true)
+            .into_iter()
+            .map(|(_, style)| row_style(arrangement, result, style))
+            .collect()
+    };
+    // With hiding on the row is not listed, and the style is the cell's own.
+    assert_eq!(styles(&arrangement, &result)[3], spread_style(Some(12.5)));
+    arrangement.hiding = false;
+    for (column, style) in styles(&arrangement, &result).into_iter().enumerate() {
+        assert_eq!(
+            style,
+            Style::new().dark_gray().crossed_out(),
+            "excluded, column {column}"
+        );
+    }
+    arrangement.excluded = Default::default();
+    for (column, style) in styles(&arrangement, &result).into_iter().enumerate() {
+        assert_eq!(style, Style::new().dark_gray(), "failing, column {column}");
+    }
+    arrangement.filter = Default::default();
+    assert_eq!(styles(&arrangement, &result)[3], spread_style(Some(12.5)));
+    assert_eq!(styles(&arrangement, &result)[0], Style::new());
+}
+
+/// [`filtered_app`] with a third offer, 3 of type 35, that passes the filter, excluded with `x`.
+fn excluded_app() -> App {
+    let mut third = priced_offer(Some(5.0), Some(0.0), Some((10, 2e6)));
+    third.offer.offer_id = 3;
+    third.offer.type_id = 35;
+    third.isk_per_lp = Some(1000.0);
+    let mut wide = priced_offer(Some(80.0), Some(0.0), Some((10, 1e6)));
+    wide.offer.offer_id = 2;
+    wide.offer.type_id = 34;
+    wide.isk_per_lp = Some(2000.0);
+    let mut offers = one_priced_offer();
+    offers.push(wide);
+    offers.push(third);
+    let mut app = results_app(offers, 10);
+    app.rearrange(|arrangement| arrangement.filter.max_spread = Some(20.0));
+    app.on_key(press(crossterm::event::KeyCode::Tab));
+    app.on_key(press(crossterm::event::KeyCode::Down));
+    assert_eq!(app.selected_offer().map(|o| o.offer.offer_id), Some(3));
+    app.on_key(press(crossterm::event::KeyCode::Char('x')));
+    app
+}
+
+#[test]
+fn the_offers_title_counts_an_exclusion_as_hidden() {
+    let mut app = excluded_app();
+    for width in [MIN_WIDTH, 120] {
+        let text = view_text(&app, width, MIN_HEIGHT);
+        assert!(text.contains(" Offers: 2 hidden "), "at {width}: {text}");
+        assert!(!text.contains("Type 35"), "the excluded offer is hidden");
+    }
+    app.on_key(press(crossterm::event::KeyCode::Char('F')));
+    for width in [MIN_WIDTH, 120] {
+        let text = view_text(&app, width, MIN_HEIGHT);
+        assert!(
+            text.contains(" Offers: hiding off, 2 would hide "),
+            "at {width}: {text}"
+        );
+        assert!(text.contains("Type 35"), "the excluded offer is listed");
+    }
+}
+
+#[test]
+fn with_hiding_off_an_excluded_row_is_drawn_struck_through() {
+    let mut app = excluded_app();
+    app.on_key(press(crossterm::event::KeyCode::Char('F')));
+    // Off the selection, so the highlight's reversal does not mix into the style read back.
+    app.offer = 0;
+    let buffer = view_buffer(&app, 120, 40);
+    let excluded = cell_of(&buffer, "Type 35");
+    assert_eq!(excluded.fg, Color::DarkGray);
+    assert!(excluded.modifier.contains(Modifier::CROSSED_OUT));
+    assert!(
+        cell_of(&buffer, "5.00%")
+            .modifier
+            .contains(Modifier::CROSSED_OUT),
+        "every cell of the row"
+    );
+    let failing = cell_of(&buffer, "Type 34");
+    assert_eq!(failing.fg, Color::DarkGray, "a failing row stays dim");
+    assert!(
+        !failing.modifier.contains(Modifier::CROSSED_OUT),
+        "and is not struck"
+    );
+    let passing = cell_of(&buffer, "12.50%");
+    assert_eq!(passing.fg, Color::Yellow);
+    assert!(!passing.modifier.contains(Modifier::CROSSED_OUT));
+}
+
+/// The view's buffer at `width` x `height`, for the tests that read a cell's style.
+fn view_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let sdata = StaticData::default();
+    let stats = ClientStats::default();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(frame, app, &sdata, &stats);
+        })
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+/// The foreground colour of the first cell of `text` on screen.
+fn colour_of(buffer: &ratatui::buffer::Buffer, text: &str) -> Color {
+    cell_of(buffer, text).fg
+}
+
+/// The first cell of `text` on screen.
+fn cell_of<'a>(buffer: &'a ratatui::buffer::Buffer, text: &str) -> &'a ratatui::buffer::Cell {
+    let width = usize::from(buffer.area.width);
+    let symbols: Vec<&str> = buffer.content().iter().map(|cell| cell.symbol()).collect();
+    let first: Vec<char> = text.chars().collect();
+    let index = (0..symbols.len())
+        .find(|&start| {
+            first.iter().enumerate().all(|(offset, c)| {
+                symbols
+                    .get(start + offset)
+                    .is_some_and(|symbol| symbol.chars().eq([*c]))
+            })
+        })
+        .unwrap_or_else(|| panic!("{text:?} is not on screen"));
+    let (x, y) = (index % width, index / width);
+    &buffer[(x as u16, y as u16)]
+}
+
+#[test]
+fn with_hiding_off_a_row_the_filters_would_hide_is_dim_throughout() {
+    let mut app = filtered_app();
+    app.on_key(press(crossterm::event::KeyCode::Char('F')));
+    let buffer = view_buffer(&app, 120, 40);
+    assert_eq!(colour_of(&buffer, "Type 34"), Color::DarkGray);
+    assert_eq!(
+        colour_of(&buffer, "80.00%"),
+        Color::DarkGray,
+        "its spread loses its red too"
+    );
+    assert_eq!(
+        colour_of(&buffer, "12.50%"),
+        Color::Yellow,
+        "a passing row keeps its colours"
+    );
+    assert_ne!(colour_of(&buffer, "Type 30486"), Color::DarkGray);
+}
+
+#[test]
+fn the_details_pane_ends_with_the_groups_figures_and_budget_fill() {
+    let app = filtered_app();
+    let text = view_text(&app, 160, 50);
+    for line in [
+        "Group",
+        "Average ISK/LP: 1,627.78 | Best ISK/LP: 1,627.78",
+        "Profit ±10%, listed offers: 3.98 billion ISK",
+        "LP budget 1,000: n/a, no buy orders take a whole redemption of these offers",
+    ] {
+        assert!(text.contains(line), "{line:?} is missing: {text}");
+    }
+    assert!(
+        text.find("Corporations") < text.find("Average ISK/LP"),
+        "the Group block follows the corporations: {text}"
+    );
+}
+
+#[test]
+fn the_main_footer_shows_every_key_it_lists_at_80_columns() {
+    let app = results_app(one_priced_offer(), 10);
+    let text = view_text(&app, MIN_WIDTH, MIN_HEIGHT);
+    assert!(
+        text.contains(
+            "Tab panes  ↑↓ move  f filters  v display  s/S sort  m missions  ? help  q quit"
+        ),
+        "{text}"
     );
 }

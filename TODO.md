@@ -1419,6 +1419,288 @@ leave the program doing what it did.
       scrolling it within bounds and reopening it at the top. Drawing the footer last again
       fails the 80x24 one.
 
+### Group sorts, display filters, search and exclusions
+
+Groups were ordered only by the average ISK per LP of their top `depth` offers, and no offer could
+be left out. This adds more group sorts, an LP-budget order book, thresholds on the offer-table
+columns, search, and per-offer exclusions, in six phases. Decisions taken before the work:
+
+- Filters apply before grouping, so top-N means the N best offers that pass, and the average the
+  groups sort by is over those. A set threshold fails an offer that lacks its figure.
+- The order-book figure is the ISK an LP budget realizes, 1,000 LP by default, in whole
+  redemptions. Volume is the volume on the order book; market history is not fetched.
+- Options that do not change what is fetched get their own Display filters form (`v`).
+- The hidden count is over each corporation's whole store. The group sort lasts the session.
+- Search jumps to matches rather than filtering. Exclusions are per offer ID and only the view
+  reads them. `F` turns filters and exclusions off together. Exports keep the ranking order.
+
+#### Phase 1: The arrangement in the library
+
+- [x] `src/report/arrange.rs` holds what decides the groups short of pricing. `OfferFilter` has
+      five optional thresholds: least ISK/LP, widest spread, least imbalance, least volume within
+      10%, and least profit within 10%. A set threshold fails an offer that lacks its figure, as
+      chosen; an unset one passes everything. `GroupSort` is average ISK/LP, the default, best
+      offer, or profit within 10%, read from `avg`, `best`, and `profit`. `Arrangement` adds the
+      depth, whether hiding is on, the excluded offer IDs, the sort, and its direction.
+- [x] `Report::arrange` regroups for an arrangement and keeps it, `Report::arrangement` returns
+      it, and `Report::sort_groups` sorts again without regrouping. `Report::regroup(depth)` now
+      arranges for `Arrangement::depth(depth)`, which is the old behaviour, so its callers did not
+      change; it drops any filter, exclusion, or sort set before.
+- [x] Grouping keys on the top `depth` visible offers. Whether an offer is visible depends on the
+      offer alone, so a store's visible offers are a subsequence of the ranking's total order, and
+      stores that differ only in hidden offers join one group. With hiding off, filters and
+      exclusions are ignored.
+- [x] `Group` gains `hidden_counts`, per corporation like `offer_counts` and over the whole store,
+      as chosen, with `hidden_range` and `hidden_count_text` sharing the range text with the offer
+      count. `best_isk_per_lp` is the first listed offer's value and `profit_within_10` the sum
+      over the listed offers that have one.
+- [x] Groups with a value for the sort come before groups without one in both directions, values
+      compare with `total_cmp`, and ties go to the lower first corporation ID either way.
+- [x] Tests: 12 added, 8 in `src/report/mod.rs` and 4 in `src/report/arrange.rs`. They cover a
+      failing top offer replaced by the next passing one, stores joined by a failing offer, an
+      exclusion acting like a failure, hiding off, hidden counts per corporation and as a range, a
+      missing figure failing its filter, each sort key through `arrange` and `sort_groups`, the
+      reverse order, each threshold at its bound, and the sort names. No existing test changed;
+      the `group` test helper fills the new `hidden_counts` with zeros. Removing the visibility
+      check from the grouping key fails 5 of them.
+
+#### Phase 2: The LP-budget ladder in the library
+
+- [x] `OfferResult::buy_orders` keeps the reward's buy orders that the reward quote already
+      fetched, in the run's region and stations, highest price first; orders at one price keep
+      ESI's order. No request was added. `BookOrder` derives `PartialEq`.
+- [x] `report::budget::fill(offers, budget)` spends an LP budget on a group's offers, one whole
+      redemption at a time, always on the best ISK per LP of the next redemption, with ties to the
+      lower offer ID. Offers of one reward type share one book, the first listed offer's buy
+      orders, and one count of units sold, so no buy order is sold into twice. A redemption across
+      several orders is priced exactly across them. Redemptions of one offer at a single price are
+      taken as one batch, bounded by the units left at that price and by the LP left.
+- [x] The result is `BudgetFill { isk, lp_spent, redemptions, stopped }` with `isk_per_lp()`, and
+      `stopped` is `Budget` (a book still holds a redemption, but the LP left pays for none of
+      those offers), `Book` (no book holds another redemption) or `Unprofitable` (the best next
+      redemption earns zero or less). `None` when no book holds even one redemption, whatever the
+      budget; a budget of 0 otherwise gives an empty fill stopped at `Budget`.
+- [x] Limitations, in the module doc: the greedy choice is not guaranteed optimal, required items
+      are always bought at the best sell price, each group is evaluated on its own, and a buy
+      order's range and minimum volume are not checked, since the quote does not keep them.
+- [x] Tests: 10 for the ladder, including a seeded comparison with a one-redemption-at-a-time
+      reference that walks the orders, over 3,000 random groups with whole-number prices so the
+      results must match exactly; it fails with the batch not bounded by the price level, or with
+      the whole orders inside a straddle left out. 1 for the buy orders' sort.
+- [ ] Measure the buy-order count on a full run and record it here.
+- [x] `Group::budget` is the fill of the arrangement's LP budget over the offers the group lists,
+      so hidden offers and offers below the depth take no part. `Arrangement::lp_budget` is
+      `Some(1000)` in `Arrangement::depth` (`DEFAULT_LP_BUDGET`), as chosen; `None` works out no
+      fill. `GroupSort::BudgetIsk`, read from `budget`, sorts by the fill's ISK and follows the
+      average in the cycle. A group with no fill, such as one whose rewards nobody buys, sorts last
+      in both directions.
+- [x] Tests: 2 added in `src/report/mod.rs`, for the budget sort (by fill ISK, a group with no fill
+      last, a smaller budget, no budget) and for a hidden offer left out of the fill. The sort-name
+      test in `src/report/arrange.rs` now parses `budget` and rejects `spread` instead.
+
+#### Phase 3: Options, CLI report and export
+
+- [x] Seven option rows: `--lp-budget <lp>`, `--min-isk-per-lp <isk>`, `--max-spread <percent>`,
+      `--min-imbalance <percent>`, `--min-volume <units>`, `--min-profit <isk>` and
+      `--sort <avg|budget|best|profit>`. `Field::ALL` grows from 15 to 22.
+- [x] ISK, ISK per LP, volume and the budget take a K, M or B suffix in either case. The decimal
+      point is moved rather than the number multiplied, so `1.1M` is exactly 1,100,000. Volume is
+      a whole number of 0 or more, the budget a whole number of at least 1, and ISK any finite
+      number. Percents are any finite number without a suffix. Each error is reported on its own
+      field.
+- [x] `Field::changes_fetch()` is false for `Depth` and the seven new fields. `same_run`, the
+      header's filter summary and the split between the `f` and `v` forms read it (phase 4).
+- [x] `Parsed` and `Resolved` carry the filter, the budget (default 1,000) and the sort, and
+      `Resolved::arrangement()` builds the arrangement with hiding on and nothing excluded. The
+      pipeline arranges the report for it after `Report::new`.
+- [x] The text report is built by `output::report_text`. When a threshold is set the heading reads
+      `Top n offers that pass the filters, by ISK per LP (descending):`. A group whose stores hide
+      offers prints `Hidden by filters: <count>`, and every group prints
+      `LP budget <lp>: <isk> for <lp spent> LP, <isk/lp> ISK/LP realized, <n> redemptions (<why>)`,
+      with `budget spent`, `book exhausted` or `rest unprofitable`, or `n/a` when no buy order
+      takes a whole redemption. Groups print in the arrangement's order with the best last, as
+      before.
+- [x] `--help` documents the seven options, the K/M/B suffixes, the ladder's limitations, and an
+      example with `--sort budget --lp-budget 1M`.
+- [x] Export: `ExportContext::new(region, filters, arrangement)` carries the depth, sort, budget
+      and hiding, and the TUI passes the report's own arrangement. The JSON file gains `sort`,
+      `lp_budget` and `hiding`, and each group `best_isk_per_lp`,
+      `profit_within_10_percent_total`, `budget_isk`, `budget_lp_spent`, `budget_isk_per_lp`,
+      `min_hidden` and `max_hidden`. The CSV grows from 21 to 28 columns, the seven placed after
+      `max_offer_count` with the other group columns. Offers stay in ranking order, and the groups
+      and the offers listed follow the arrangement.
+- [x] Tests: 11 added. 4 in `src/report/options.rs` (the suffixes, an error per field,
+      `Resolved::arrangement`, `changes_fetch`), 3 in `src/export/mod.rs` (a filtered export with
+      the new figures, hiding off in ranking order, empty budget figures and the JSON `sort` and
+      `lp_budget`), and 4 in `src/output.rs` (the budget line, the filters heading with the hidden
+      line, a group with no fill, the group order under `--sort budget`). Changed: three export
+      tests read CSV cells by column name, since the new columns move the offer columns; the
+      options struct-literal test lists the seven fields; and, as the compiler required, the TUI's
+      `resolved_fixture` and the form hint's command-line-only arm.
+- [x] Run on 2026-11-13: `--lpstores --lpstore 1000035 --sort budget --lp-budget 1M --max-spread 20
+      --depth 3` printed `Loyalty offers: 310 found`, `Hidden by filters: 181` and `LP budget
+      1,000,000: 1.06 billion ISK for 984,000 LP, 1,078.31 ISK/LP realized, 51 redemptions (budget
+      spent)`. 2 of the 310 offers failed to price.
+
+#### Phase 4: The TUI
+
+- [x] The six display options get form labels, `LP budget`, `Min ISK/LP`, `Max spread %`,
+      `Min imbalance`, `Min volume` and `Min profit`, all within the 14-column label width, so
+      `filters.json` keeps them too. `--sort` stays command-line only. A file without the new keys
+      still loads, with them unset.
+- [x] Two forms, split by `Field::changes_fetch()` (`FormKind` in `src/tui/form.rs`). `f` keeps the
+      fetch filters, 12 rows with the expire toggle (13 before; `Depth` moved out). `v` opens the
+      Display filters, 7 rows: depth, LP budget and the five thresholds, with the depth (10) and
+      the budget (1000) filled in when unset. The startup form no longer fills in the depth. Each
+      footer says what Enter does: `Enter fetch` (71 characters) and `Enter re-arrange` (76).
+- [x] Applying the display form checks the values with `LpStoreOptions::parse`, which needs no
+      static data, re-arranges the report on hand, updates the header's filters and the options
+      applied, and remembers them in `filters.json`. It never starts a run (`Action::Arrange`).
+      An invalid value stays on the form beside its field.
+- [x] `App.depth` became `App.arrangement`. The first run takes the whole of
+      `Resolved::arrangement()`, so `--sort`, the thresholds and `--lp-budget` apply in the view;
+      later runs take only the depth, thresholds and budget, so the sort, its direction and hiding
+      last the session. `App::finish` arranges the report for it instead of regrouping, which
+      would reset the arrangement to `Arrangement::depth`.
+- [x] `App::rearrange(change)` replaces `apply_depth`. A change of sort or direction alone calls
+      `Report::sort_groups`; anything else calls `Report::arrange`. The group holding the selected
+      group's first corporation stays selected, the selected offer stays selected while the group
+      still lists it, and `Stage::Finished` counts the new groups.
+- [x] Keys: `s` cycles the group sort, `S` reverses it, `F` turns hiding off and on. They act only
+      with a report on screen and no overlay over it. `v` opens the display form from the same
+      views `f` does. None of the four was bound before in `on_view_key`.
+- [x] `same_run` ignores every option `changes_fetch()` leaves out. The header's filter summary
+      keeps the thresholds, since they hide offers, and leaves out the depth and the LP budget
+      with the region and the cache minutes.
+- [x] The groups pane is titled ` Groups: avg ▼ `, with the `--sort` word and ▲ when reversed. At
+      80 columns the pane is 26 cells wide; when the stale mark would not fit, the title drops
+      `Groups:` and reads ` profit ▲ (stale) `. Each group's first line shows the value it is
+      sorted by: `avg ISK/LP`, `ISK for budget`, `best ISK/LP` or `profit ±10%`.
+- [x] The offers pane is titled ` Offers: 3 hidden ` when the filters hide offers in the selected
+      group's stores. With hiding off it reads ` Offers: hiding off, 3 would hide `, counted by
+      `Report::hideable_range`, and the rows the filters would hide are drawn dark gray
+      throughout, their coloured cells too.
+- [x] The details pane ends with a Group block, after the offer so the offer's figures stay in
+      view at 80x24: the average and best ISK/LP, the profit within 10% summed over the listed
+      offers, and the LP budget line the text report prints (`output::budget_line`).
+- [x] Help: rows for `v`, `s, S` and `F`, and the `f` row says Enter fetches. `HELP_FIGURES` grows
+      from 11 to 15 lines, the four new ones on the LP budget's fill and its limits.
+- [x] Tests: 20 added. 6 key tests in `src/tui/app.rs` (`s` through every sort keeping the
+      corporation and offer, `S`, `F` splitting and joining groups, the keys before a report and
+      under the help, `v` and Enter without a run, the first run seeding the sort and later runs
+      keeping it), 2 in `src/tui/form.rs`, 3 in `src/tui/mod.rs` (`same_run` over every field, the
+      header summary, applying and remembering the display form), 7 render tests in
+      `src/tui/ui/tests.rs` (the display form with every hint at 80x24, an error on it at 80x24,
+      the help rows, the groups title at 80 and 120 columns, the width sweep from 80 to 160 with a
+      filter active and hiding off, a dimmed row, the Group block), 1 in `src/report/mod.rs` and 1
+      in `src/saved_filters.rs`. Changed: the `f` form's label and order tests (no `Depth`, 12
+      fields), the startup-form tests (no depth default), the footer text, the help scroll test
+      (the window now ends on the imbalance figure), and the `apply_depth` tests, which call
+      `rearrange`.
+- [ ] Run the view on a cached report: change the thresholds and check no fetch starts, run `s`
+      through every sort, and compare a budget with the details pane.
+
+#### Phase 5: Offer sort and search
+
+- [x] `o` cycles the offers table's sort: rank (the ranking, the default), spread, imbal, vol and
+      profit, the last two being the volume and the profit within 10%. The spread puts the
+      tightest first and the others the largest first; `O` reverses whichever is set, and the
+      direction lasts across `o` as it does across `s`. Offers without the figure go last in both
+      directions, ties keep the ranking order, and the ranking reversed is the ranking upside
+      down. The sort lasts the session and only orders the rows: the groups, their figures, and
+      exports keep the ranking order (`write_export` reads the report, not the table).
+- [x] `App::offer_rows()` gives the selected group's listed offers in the table's order, each with
+      its ranking place. `draw_offers`, `selected_offer`, `offer_count` and the search use it, and
+      the `#` column shows the ranking place. A group's `results` are already the top `depth`
+      visible offers (`Store::listed`), and the view keeps the report arranged for its own
+      arrangement, so the old `take(depth)` in those three was dropped. Changing the sort, like
+      `rearrange`, keeps the selected offer by offer ID.
+- [x] The offers title names the sort when it is not the ranking, with the groups title's arrows,
+      ▲ when the values rise down the table: ` Offers: spread ▲, 3 hidden `,
+      ` Offers: profit ▼, hiding off, 1 would hide `. When the title and the stale mark do not fit,
+      `Offers:` is left out, as in the groups title; at 80 columns the pane has 52 cells between
+      its corners, and a range such as `1–2 would hide` with a sort and the stale mark needs 54.
+- [x] `/` opens a search prompt that takes every key, so `q` types a letter; Esc cancels, Ctrl+U
+      clears, and Enter on an empty prompt closes it. Enter returns `Action::Find`, and the loop
+      calls `App::find` with the static data. The search runs over each group's corporation
+      names, then the item of each offer it lists in the table's order, group by group, with the
+      names the panes show, ignoring case. It starts after the selection and wraps around. A hit
+      selects the group, and the offer for an item, scrolls the details to the top, and closes
+      the prompt. A miss leaves the selection and keeps the prompt open with `No match`.
+- [x] `n` and `N` repeat the last search that found something, forward and back, and do nothing
+      before one. While one is set the groups pane's bottom border shows ` /query `; when `n` or
+      `N` finds nothing it reads ` /query: no match ` in red until the next key, the way the run
+      summary waits for a key. The search does not filter: the groups stay as they are.
+- [x] Help: rows for `o, O`, `/` and `n, N`.
+- [x] Tests: 15 added. 11 key tests in `src/tui/app.rs` (`o` through every key keeping the offer
+      and its rank with the group untouched, `O` with missing figures last, the keys before a
+      report and under the help, `q` and Esc in the prompt, Enter and an empty Enter, `n` without
+      a search, a jump across groups to an item with wrap-around both ways, a corporation hit and
+      the table order after it, `No match`, `n` finding nothing, and the names the panes show),
+      using name-lookup closures since the static data has no public fixture with names. 4
+      render tests in `src/tui/ui/tests.rs` (a sorted table with its `#` and title at 80x24, the
+      title dropping `Offers:` beside the stale mark at 80 columns, the search prompt and its
+      `No match` at 80x24, the search in the groups pane's border). Changed: the width sweep from
+      80 to 160 also sorts by profit, the help scroll tests (34 lines; the window now ends on the
+      spread's first line), and the help rows test.
+
+#### Phase 6: Exclusions
+
+- [x] `src/exclusions.rs`, modelled on `src/saved_filters.rs`: `excluded_offers.json` in the
+      config directory beside `filters.json`, a JSON list of `{offer_id, type_id, item}` sorted by
+      offer ID. `item` is the reward's name for a reader of the file and is not read back; keys
+      the file does not know are ignored. `Loaded` is `Absent`, `Offers` or `Unusable` with the
+      reason, and `load`, `load_from` and `save_to` match the saved filters' functions. As
+      chosen, an exclusion is per offer ID and only the view reads the file: nothing outside
+      `src/tui` uses the module, and `--lpstores` arranges with `Resolved::arrangement()`, which
+      excludes nothing.
+- [x] `tui::run` loads the file next to `filters.json`. An unusable file is reported the way an
+      unusable `filters.json` is, as an error line in the log and a note on the startup form (both
+      notes share it, one per line), and excludes nothing. It is not written until `x` changes an
+      exclusion, which replaces it with the offers excluded since; the note says so.
+- [x] `App.excluded` (offer ID to reward type) is the source of truth, and its IDs are copied into
+      `Arrangement::excluded` on every change. The first run's arrangement keeps them, so a session
+      starts with the file's exclusions; later runs keep them as they keep the sort and hiding.
+- [x] `x` excludes the selected offer, or restores it when it is excluded, which needs hiding off
+      since `F` turns off filters and exclusions together. It acts only with a report on screen,
+      no overlay over it and an offer selected, re-arranges with the corporation kept selected,
+      and returns `Action::SaveExclusions`; the loop saves with the static data's item names, and
+      a failed save is a log line, as for `filters.json`. `x` was not bound in `on_view_key`; the
+      static data dialog's own `x` (quit) is handled before it.
+- [x] With hiding off an excluded row is drawn dark gray and struck through, and a row failing only
+      the filters stays dark gray. `hidden_counts` and `Report::hideable_range` already counted
+      exclusions through `Arrangement::visible`, so the offers title's ` 2 hidden ` and
+      ` hiding off, 2 would hide ` include them; a test now covers it.
+- [x] Help: a row for `x`. The help is 35 lines, 22 of them on screen at 80x24. `--help` says the
+      view keeps the exclusions with the filters.
+- [x] Tests: 17 added. 7 in `src/exclusions.rs` (round trip, sorted output with item names,
+      absent, damaged, unknown keys and the name ignored, an empty list, the path), 1 in
+      `src/report/mod.rs` (the hideable range with an exclusion), 4 key tests in `src/tui/app.rs`
+      (`x` excluding and keeping the corporation, restoring with `F` off, doing nothing without a
+      report or offer or under an overlay, the exclusion lasting through later runs), 2 in
+      `src/tui/mod.rs` (saving and reading back, a failed save), 3 render tests in
+      `src/tui/ui/tests.rs` (the row style, the title counts at 80 and 120 columns, a struck-through
+      row on screen). Changed: the help scroll test (the window now ends on the ISK/LP figure's
+      second line), the help rows test, `sharing_stores` gives its offers reward types, and
+      `colour_of` reads through a new `cell_of`. Not carrying the exclusions into the first run's
+      arrangement fails 1 of them.
+- [ ] Run the view: exclude an offer, restart, and check it stays excluded.
+
+#### Footer
+
+- [x] The results view's footer was 89 characters and cut at 80 columns. It now reads
+      `Tab panes  ↑↓ move  f filters  v display  s/S sort  m missions  ? help  q quit`, 78
+      characters, so `v` and `s/S` are visible; `e`, `d` and `l` are listed only in the `?` help,
+      as chosen. A render test checks the whole line at 80x24.
+
+#### Open
+
+- [ ] Recorded and not fixed, as chosen: when the security agent division is filtered out
+      or unknown, `detail_entries` (`src/tui/ui/details.rs`) returns after the scope note and the
+      corporation list, so the details pane never shows the selected offer's figures. The early
+      return predates this feature (it was already there in 82a8fea); the Group block is appended
+      on that path too, so it still shows.
+
 ## Done
 
 - [x] Shared errors keep their structure (`SharedError`), so `RateLimit`, `Throttle`, and `Esi` fields survive request sharing.

@@ -1,4 +1,5 @@
-//! The filters dialog: its rows, the notes under them, and the name suggestions.
+//! The two form dialogs, the filters and the display filters: their rows, the notes under them,
+//! and the name suggestions.
 
 use super::*;
 
@@ -8,14 +9,16 @@ pub(crate) const LABEL_WIDTH: usize = 14;
 
 pub(super) const VALUE_WIDTH: usize = 26;
 
-/// The filter form, shown in place of the results while it is open. Each field has a row, and the
-/// space under the rows holds the notes for the focused field.
+/// The open form, either one, shown in place of the results while it is open. Each field has a
+/// row, and the space under the rows holds the notes for the focused field.
 pub(super) fn draw_form(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
-    let block = Block::bordered().title(" Filters ");
+    let block = Block::bordered().title(app.form.kind.title());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = usize::from(inner.width);
-    let mut lines: Vec<Line> = FormField::all()
+    let mut lines: Vec<Line> = app
+        .form
+        .fields()
         .iter()
         .map(|&field| form_row(app, field, sdata, width))
         .collect();
@@ -149,6 +152,38 @@ pub(super) fn hint(field: FormField, sdata: &StaticData) -> String {
             "Prices use its NPC stations.\nName or ID. Blank for all systems.".to_string()
         }
         FormField::Text(Field::Depth) => "Offers per group, 1 or more. Blank for 10.".to_string(),
+        // The display fields: what each does to the groups on the first line, which has to fit the
+        // detail column at the minimum width, then how to write it. A threshold also hides an
+        // offer that lacks its figure, which the note under the focused field says.
+        FormField::Text(Field::LpBudget) => {
+            "LP spent on each group's offers.\nA whole number; K, M or B allowed. Blank for 1,000."
+                .to_string()
+        }
+        FormField::Text(Field::MinIskPerLp) => {
+            "Hides offers below this ISK/LP.\nK, M or B allowed. Blank for no limit.\n\
+             An offer with no ISK/LP is hidden too."
+                .to_string()
+        }
+        FormField::Text(Field::MaxSpread) => {
+            "Hides offers with a wider spread.\nPercent, such as 20. Blank for no limit.\n\
+             An offer with no spread is hidden too."
+                .to_string()
+        }
+        FormField::Text(Field::MinImbalance) => {
+            "Hides offers below this imbalance.\nPercent, -100 to 100. Blank for no limit.\n\
+             An offer with no imbalance is hidden too."
+                .to_string()
+        }
+        FormField::Text(Field::MinVolume) => {
+            "Hides offers with less volume ±10%.\nUnits; K, M or B allowed. Blank for no limit.\n\
+             An offer with no volume figure is hidden too."
+                .to_string()
+        }
+        FormField::Text(Field::MinProfit) => {
+            "Hides offers with less profit ±10%.\nISK; K, M or B allowed. Blank for no limit.\n\
+             An offer with no profit figure is hidden too."
+                .to_string()
+        }
         FormField::Text(Field::CacheMinutes) => {
             "Minutes past ESI Expires.\nBlank: filtered corp count; 0 disables.".to_string()
         }
@@ -156,7 +191,9 @@ pub(super) fn hint(field: FormField, sdata: &StaticData) -> String {
             "Space toggles. Ignore cached responses and call the API again.".to_string()
         }
         // Set on the command line only, so the form never shows them.
-        FormField::Text(Field::Tasks | Field::MaxInflight | Field::CacheDir) => String::new(),
+        FormField::Text(Field::Tasks | Field::MaxInflight | Field::CacheDir | Field::Sort) => {
+            String::new()
+        }
     }
 }
 

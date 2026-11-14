@@ -29,7 +29,7 @@ pub enum PricingError {
 }
 
 /// One order on either side of the market for an item in a region.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BookOrder {
     pub price: f64,
     pub volume_remain: i32,

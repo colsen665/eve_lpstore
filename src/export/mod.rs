@@ -1,8 +1,9 @@
 //! Writing the priced report out as a file, for a spreadsheet or another tool.
 //!
 //! Both shapes are rendered from one intermediate tree, so a field renamed in one is renamed in
-//! the other, and the two column sets cannot drift apart. The export follows the `--tui` view:
-//! groups best first, and only the top `depth` offers of each group.
+//! the other, and the two column sets cannot drift apart. The export follows the report's
+//! arrangement, as the `--tui` view does: groups in its sort order, best first, and only the top
+//! `depth` offers of each group that its filters leave visible, in ranking order.
 //!
 //! Numbers are written plainly, without the thousands separators the terminal shows, so a
 //! spreadsheet reads them as numbers. A value the run could not work out is empty in CSV and
@@ -10,7 +11,7 @@
 //! same bytes; put a date in the name instead.
 
 use crate::lpstore::OfferResult;
-use crate::report::{Group, Report};
+use crate::report::{Arrangement, Group, GroupSort, Report};
 use crate::static_data::StaticData;
 use serde::Serialize;
 use std::path::Path;
@@ -57,20 +58,47 @@ impl ExportRequest {
     }
 }
 
-/// What the file says about the run, which the report itself does not carry.
+/// What the file says about the run, which the report itself does not carry, and how the report
+/// was arranged.
 pub struct ExportContext<'a> {
     pub region: &'a str,
     pub filters: &'a str,
     pub depth: usize,
+    pub sort: GroupSort,
+    pub lp_budget: Option<u64>,
+    /// Whether offers failing the filters, or excluded, were left out.
+    pub hiding: bool,
+}
+
+impl<'a> ExportContext<'a> {
+    /// The context of a report grouped and sorted for `arrangement`, which is the report's own
+    /// [`Report::arrangement`] when the file is to match what was shown.
+    pub fn new(region: &'a str, filters: &'a str, arrangement: &Arrangement) -> Self {
+        Self {
+            region,
+            filters,
+            depth: arrangement.depth,
+            sort: arrangement.sort,
+            lp_budget: arrangement.lp_budget,
+            hiding: arrangement.hiding,
+        }
+    }
 }
 
 /// The columns of the CSV export, in order. The required items of an offer are a list, so they
 /// only appear in the JSON export.
-const CSV_COLUMNS: [&str; 21] = [
+const CSV_COLUMNS: [&str; 28] = [
     "group",
     "average_isk_per_lp",
     "min_offer_count",
     "max_offer_count",
+    "best_isk_per_lp",
+    "profit_within_10_percent_total",
+    "budget_isk",
+    "budget_lp_spent",
+    "budget_isk_per_lp",
+    "min_hidden",
+    "max_hidden",
     "corporations",
     "rank",
     "item",
@@ -96,6 +124,10 @@ struct ExportFile<'a> {
     region: &'a str,
     filters: &'a str,
     depth: usize,
+    /// The [`GroupSort::name`] the groups are ordered by.
+    sort: &'static str,
+    lp_budget: Option<u64>,
+    hiding: bool,
     groups: Vec<ExportGroup<'a>>,
     errors: Vec<ExportError<'a>>,
 }
@@ -108,6 +140,17 @@ struct ExportGroup<'a> {
     average_isk_per_lp: Option<f64>,
     min_offer_count: usize,
     max_offer_count: usize,
+    best_isk_per_lp: Option<f64>,
+    profit_within_10_percent_total: Option<f64>,
+    /// The fill of the LP budget over the listed offers. All three are `None` when no budget is
+    /// set or no listed offer can be redeemed into a buy order; the ISK per LP also when no LP
+    /// was spent.
+    budget_isk: Option<f64>,
+    budget_lp_spent: Option<u64>,
+    budget_isk_per_lp: Option<f64>,
+    /// The fewest and the most offers the arrangement hides in the group's corporations' stores.
+    min_hidden: usize,
+    max_hidden: usize,
     corporations: Vec<ExportCorp<'a>>,
     offers: Vec<ExportOffer<'a>>,
 }
@@ -203,6 +246,9 @@ fn build<'a>(
         region: context.region,
         filters: context.filters,
         depth: context.depth,
+        sort: context.sort.name(),
+        lp_budget: context.lp_budget,
+        hiding: context.hiding,
         groups: report
             .groups
             .iter()
@@ -252,11 +298,19 @@ fn export_group<'a>(
     depth: usize,
     sdata: &'a StaticData,
 ) -> ExportGroup<'a> {
+    let (min_hidden, max_hidden) = group.hidden_range();
     ExportGroup {
         rank,
         average_isk_per_lp: money(group.average_isk_per_lp(depth)),
         min_offer_count: group.offer_range().0,
         max_offer_count: group.offer_range().1,
+        best_isk_per_lp: money(group.best_isk_per_lp()),
+        profit_within_10_percent_total: money(group.profit_within_10()),
+        budget_isk: money(group.budget.map(|fill| fill.isk)),
+        budget_lp_spent: group.budget.map(|fill| fill.lp_spent),
+        budget_isk_per_lp: money(group.budget.and_then(|fill| fill.isk_per_lp())),
+        min_hidden,
+        max_hidden,
         corporations: corporations(
             group
                 .corp_ids
@@ -329,6 +383,15 @@ fn csv_row(group: &ExportGroup, offer: &ExportOffer) -> Vec<String> {
         number(group.average_isk_per_lp),
         group.min_offer_count.to_string(),
         group.max_offer_count.to_string(),
+        number(group.best_isk_per_lp),
+        number(group.profit_within_10_percent_total),
+        number(group.budget_isk),
+        group
+            .budget_lp_spent
+            .map_or_else(String::new, |lp| lp.to_string()),
+        number(group.budget_isk_per_lp),
+        group.min_hidden.to_string(),
+        group.max_hidden.to_string(),
         csv_field(&corporations),
         offer.rank.to_string(),
         csv_text(offer.item),
@@ -446,15 +509,20 @@ mod tests {
             book_depth: full.then_some((2_474_600, 800_000)),
             imbalance: full.then_some(51.2),
             within_10: full.then_some((2_474_600, 3_980_000_000.0)),
+            buy_orders: Default::default(),
         }
     }
 
     fn context(depth: usize) -> ExportContext<'static> {
-        ExportContext {
-            region: "The Forge (10000002)",
-            filters: "none",
-            depth,
-        }
+        ExportContext::new("The Forge (10000002)", "none", &Arrangement::depth(depth))
+    }
+
+    /// The position of the CSV column `name`.
+    fn column(name: &str) -> usize {
+        CSV_COLUMNS
+            .iter()
+            .position(|&column| column == name)
+            .unwrap_or_else(|| panic!("no column {name}"))
     }
 
     /// An empty `StaticData`, so names are unknown and the export has to fall back to ids.
@@ -535,13 +603,13 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0][0], "1");
         assert_eq!(rows[0][2..4], ["3", "3"], "fewest and most offers");
-        assert_eq!(rows[0][4], "1000002, 999999");
-        assert_eq!(rows[0][6], "");
-        assert_eq!(rows[0][7], "30486");
+        assert_eq!(rows[0][column("corporations")], "1000002, 999999");
+        assert_eq!(rows[0][column("item")], "");
+        assert_eq!(rows[0][column("type_id")], "30486");
         assert_eq!(rows[1][0], "1");
-        assert_eq!(rows[1][5], "2");
+        assert_eq!(rows[1][column("rank")], "2");
         assert_eq!(rows[2][0], "2");
-        assert_eq!(rows[2][4], "1000001");
+        assert_eq!(rows[2][column("corporations")], "1000001");
     }
 
     #[test]
@@ -551,12 +619,20 @@ mod tests {
         let text = csv(&report, &context, &no_names());
         // The second offer of the first group has no reward, no ask, and no book.
         let cells = csv_fields(text.lines().skip(1).nth(1).unwrap());
-        assert_eq!(cells[10], "", "reward");
-        assert_eq!(cells[14], "", "best ask");
-        assert_eq!(cells[15], "", "spread");
-        assert_eq!(cells[18], "", "imbalance");
-        assert_eq!(cells[20], "", "profit within 10%");
-        assert_eq!(cells[13], "900", "isk per lp is still there");
+        assert_eq!(cells[column("reward")], "", "reward");
+        assert_eq!(cells[column("best_ask")], "", "best ask");
+        assert_eq!(cells[column("spread_percent")], "", "spread");
+        assert_eq!(cells[column("imbalance_percent")], "", "imbalance");
+        assert_eq!(
+            cells[column("profit_within_10_percent")],
+            "",
+            "profit within 10%"
+        );
+        assert_eq!(
+            cells[column("isk_per_lp")],
+            "900",
+            "isk per lp is still there"
+        );
     }
 
     /// Splits a CSV row on commas, keeping a quoted field together however many commas it holds.
@@ -708,7 +784,8 @@ mod tests {
             .map(csv_fields)
             .collect();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][2..5], ["1", "2", "1000001, 1000002"]);
+        assert_eq!(rows[0][2..4], ["1", "2"]);
+        assert_eq!(rows[0][column("corporations")], "1000001, 1000002");
     }
 
     #[test]
@@ -723,6 +800,120 @@ mod tests {
             serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
         assert_eq!(parsed["groups"].as_array().unwrap().len(), 0);
         assert_eq!(offer_count(&report, 10), 0);
+    }
+
+    /// One store holding offer 1, priced in full with 25 units bid at 500,000 ISK, and offer 2,
+    /// which has no spread, arranged with spreads above 50% hidden, a budget of 4,000 LP, and
+    /// the budget sort.
+    fn filtered_report(hiding: bool) -> Report {
+        let mut sold = offer(1, 30486, 1627.78, true);
+        sold.buy_orders = vec![crate::expenses::BookOrder {
+            price: 500_000.0,
+            volume_remain: 25,
+        }]
+        .into();
+        let mut report = Report::new(
+            &[],
+            vec![Store::new(
+                vec![1000002],
+                vec![1, 2],
+                vec![Arc::new(sold), Arc::new(offer(2, 1, 900.0, false))],
+            )],
+            Vec::new(),
+            10,
+        );
+        let mut arrangement = Arrangement::depth(10);
+        arrangement.filter.max_spread = Some(50.0);
+        arrangement.lp_budget = Some(4000);
+        arrangement.sort = GroupSort::BudgetIsk;
+        arrangement.hiding = hiding;
+        report.arrange(&arrangement);
+        report
+    }
+
+    #[test]
+    fn a_filtered_export_lists_only_the_passing_offers_with_the_group_figures() {
+        let report = filtered_report(true);
+        let context = ExportContext::new("The Forge (10000002)", "none", report.arrangement());
+        let rows: Vec<Vec<String>> = csv(&report, &context, &no_names())
+            .lines()
+            .skip(1)
+            .map(csv_fields)
+            .collect();
+        // Offer 2 has no spread, so the filter hides it. Offer 1 is redeemed twice, each time
+        // selling 10 units at 500,000 for a cost of 1,649,000, and the 5 units left take no
+        // further redemption.
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let cell = |name: &str| row[column(name)].as_str();
+        assert_eq!(cell("type_id"), "30486");
+        assert_eq!(cell("best_isk_per_lp"), "1627.78");
+        assert_eq!(cell("profit_within_10_percent_total"), "3980000000");
+        assert_eq!(cell("budget_isk"), "6702000");
+        assert_eq!(cell("budget_lp_spent"), "3600");
+        assert_eq!(cell("budget_isk_per_lp"), "1861.67");
+        assert_eq!((cell("min_hidden"), cell("max_hidden")), ("1", "1"));
+        assert_eq!(offer_count(&report, context.depth), 1);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
+        assert_eq!(parsed["sort"], "budget");
+        assert_eq!(parsed["lp_budget"], 4000);
+        assert_eq!(parsed["hiding"], true);
+        let group = &parsed["groups"][0];
+        assert_eq!(group["offers"].as_array().unwrap().len(), 1);
+        assert_eq!(group["budget_isk"], 6_702_000.0);
+        assert_eq!(group["budget_lp_spent"], 3600);
+        assert_eq!(group["min_hidden"], 1);
+    }
+
+    #[test]
+    fn with_hiding_off_the_export_lists_every_offer_in_ranking_order() {
+        let report = filtered_report(false);
+        let context = ExportContext::new("The Forge (10000002)", "none", report.arrangement());
+        let rows: Vec<Vec<String>> = csv(&report, &context, &no_names())
+            .lines()
+            .skip(1)
+            .map(csv_fields)
+            .collect();
+        let offers: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row[column("rank")].as_str(),
+                    row[column("type_id")].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(offers, [("1", "30486"), ("2", "1")]);
+        assert_eq!(rows[0][column("max_hidden")], "0");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
+        assert_eq!(parsed["hiding"], false);
+    }
+
+    #[test]
+    fn without_a_budget_or_buy_orders_the_budget_figures_are_empty() {
+        let report = report();
+        let context = context(10);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
+        assert_eq!(parsed["sort"], "avg");
+        assert_eq!(parsed["lp_budget"], 1000);
+        // The offers carry no buy orders, so nothing can be redeemed.
+        assert!(parsed["groups"][0]["budget_isk"].is_null());
+        assert!(parsed["groups"][0]["budget_isk_per_lp"].is_null());
+        let row = csv_fields(csv(&report, &context, &no_names()).lines().nth(1).unwrap());
+        assert_eq!(row[column("budget_lp_spent")], "");
+
+        let mut report = report;
+        let mut arrangement = Arrangement::depth(10);
+        arrangement.lp_budget = None;
+        report.arrange(&arrangement);
+        let context = ExportContext::new("The Forge (10000002)", "none", report.arrangement());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json(&report, &context, &no_names())).unwrap();
+        assert!(parsed["lp_budget"].is_null());
     }
 
     #[test]

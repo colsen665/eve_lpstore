@@ -1,8 +1,10 @@
 use eve_lpstore::StaticData;
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number, format_optional, group_digits};
-use eve_lpstore::report::{Event, Report, Resolved};
+use eve_lpstore::report::budget::Stop;
+use eve_lpstore::report::{Event, Group, Report, Resolved};
 use eve_lpstore::static_data::AgentFilter;
+use std::fmt::Write;
 
 /// The text for one event, and whether it is an error.
 pub struct Message {
@@ -179,26 +181,49 @@ pub fn status_text(s: &ClientStats) -> String {
     )
 }
 
-/// Prints the offers that failed, each once, then the groups with up to `depth` offers each. The
-/// best group prints last.
+/// Prints the offers that failed, each once, to standard error, then [`report_text`].
 pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
     for e in &report.errors {
         eprintln!("Failed to price offer {}: {}", e.offer_id, e.error);
     }
+    print!("{}", report_text(report, resolved, sdata));
+}
+
+/// The groups in the order the report's arrangement sorts them, with the best group last, each
+/// with up to the arrangement's depth of offers. When a threshold is set, the heading says the
+/// offers listed are the ones that pass, and a group whose stores hide offers says how many.
+pub fn report_text(report: &Report, resolved: &Resolved, sdata: &StaticData) -> String {
+    let mut out = String::new();
     let multiple = resolved.corp_ids.len() > 1;
-    let depth = resolved.depth;
+    let arrangement = report.arrangement();
+    let depth = arrangement.depth;
+    let filtered = !arrangement.filter.is_empty();
+    // Writing to a String cannot fail, so the results of `writeln!` are ignored.
     for group in report.groups.iter().rev() {
         if multiple {
-            println!("\n=== Processing corporations ===");
+            let _ = writeln!(out, "\n=== Processing corporations ===");
             for &id in &group.corp_ids {
-                println!("{}", corp_line(sdata, id, &resolved.agent_filter));
+                let _ = writeln!(out, "{}", corp_line(sdata, id, &resolved.agent_filter));
             }
         }
-        println!("Loyalty offers: {} found", group.offer_count_text());
+        let _ = writeln!(out, "Loyalty offers: {} found", group.offer_count_text());
+        if group.hidden_range().1 > 0 {
+            let _ = writeln!(out, "Hidden by filters: {}", group.hidden_count_text());
+        }
+        if let Some(line) = budget_line(group, arrangement.lp_budget) {
+            let _ = writeln!(out, "{}", line);
+        }
 
-        println!(
-            "Top {} offers by ISK per LP (descending):",
-            group.results.len().min(depth)
+        let passing = if filtered {
+            " that pass the filters,"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "Top {} offers{} by ISK per LP (descending):",
+            group.results.len().min(depth),
+            passing
         );
         for (rank, r) in group.results.iter().take(depth).enumerate() {
             let item_name = sdata
@@ -217,7 +242,8 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 .imbalance
                 .map(|v| format!("{:+.2}%", v))
                 .unwrap_or_else(|| "n/a".to_string());
-            println!(
+            let _ = writeln!(
+                out,
                 "{}. {}: LP={}, units per redemption={}, reward={}, unit cost={}, profit per unit={}, ISK/LP={}, spread={}, imbalance={}",
                 rank + 1,
                 item_name,
@@ -230,20 +256,25 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
                 spread_str,
                 imbalance_str
             );
-            match r.within_10 {
-                Some((volume, profit)) => println!(
+            let _ = match r.within_10 {
+                Some((volume, profit)) => writeln!(
+                    out,
                     "   Volume within 10% of best bid: {}, total profit: {}",
                     format_number(volume as f64, 0),
                     format_isk(profit)
                 ),
-                None => println!("   Volume within 10% of best bid: n/a, total profit: n/a"),
-            }
+                None => writeln!(
+                    out,
+                    "   Volume within 10% of best bid: n/a, total profit: n/a"
+                ),
+            };
             for item in &r.breakdown.item_expenses {
                 let name = sdata
                     .type_name(item.type_id)
                     .cloned()
                     .unwrap_or_else(|| format!("Type {}", item.type_id));
-                println!(
+                let _ = writeln!(
+                    out,
                     "   {}: {} x {} ISK = {} ISK",
                     name,
                     format_number(item.quantity as f64, 0),
@@ -253,12 +284,187 @@ pub fn print_report(report: &Report, resolved: &Resolved, sdata: &StaticData) {
             }
         }
     }
+    out
+}
+
+/// What spending `lp_budget` on the group's listed offers realizes, as one line, or `None` when
+/// no budget is set. The view's details pane shows the same line.
+pub(crate) fn budget_line(group: &Group, lp_budget: Option<u64>) -> Option<String> {
+    let lp_budget = lp_budget?;
+    let budget = format_number(lp_budget as f64, 0);
+    let Some(fill) = group.budget else {
+        return Some(format!(
+            "LP budget {budget}: n/a, no buy orders take a whole redemption of these offers"
+        ));
+    };
+    Some(format!(
+        "LP budget {budget}: {} for {} LP, {} ISK/LP realized, {} redemptions ({})",
+        format_isk(fill.isk),
+        format_number(fill.lp_spent as f64, 0),
+        format_optional(fill.isk_per_lp(), 2),
+        format_number(fill.redemptions as f64, 0),
+        stop_text(fill.stopped)
+    ))
+}
+
+/// Why the ladder stopped, in words.
+fn stop_text(stopped: Stop) -> &'static str {
+    match stopped {
+        Stop::Budget => "budget spent",
+        Stop::Book => "book exhausted",
+        Stop::Unprofitable => "rest unprofitable",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eve_lpstore::OfferResult;
     use eve_lpstore::esi::Budget;
+    use eve_lpstore::expenses::BookOrder;
+    use eve_lpstore::report::{LpStoreOptions, Store};
+    use std::sync::Arc;
+
+    /// An offer of one unit for 100 LP and no ISK, with this ISK per LP and spread, whose reward
+    /// sells into `book`, given as (price, volume) best first.
+    fn offer(offer_id: i32, isk_per_lp: f64, spread: f64, book: &[(f64, i32)]) -> Arc<OfferResult> {
+        let mut result = OfferResult {
+            isk_per_lp: Some(isk_per_lp),
+            spread: Some(spread),
+            ..Default::default()
+        };
+        result.offer.offer_id = offer_id;
+        result.offer.type_id = offer_id;
+        result.offer.quantity = 1;
+        result.offer.lp_cost = 100;
+        result.buy_orders = book
+            .iter()
+            .map(|&(price, volume_remain)| BookOrder {
+                price,
+                volume_remain,
+            })
+            .collect();
+        Arc::new(result)
+    }
+
+    /// The report text for `stores`, run with `options` on an empty `StaticData`, so
+    /// corporations and items print as their IDs.
+    fn text(stores: Vec<Store>, options: LpStoreOptions) -> String {
+        let sdata = StaticData::default();
+        let resolved = options.resolve(&sdata).expect("valid options");
+        let mut report = Report::new(&resolved.corp_ids, stores, Vec::new(), resolved.depth);
+        report.arrange(&resolved.arrangement());
+        report_text(&report, &resolved, &sdata)
+    }
+
+    /// One corporation's store holding offer 1, which pays 10 ISK per LP with a spread of 80%
+    /// and five units of buy orders, and offer 2, which pays 6 with a spread of 5% and a deep book.
+    fn one_store() -> Vec<Store> {
+        vec![Store::new(
+            vec![1000002],
+            vec![1, 2],
+            vec![
+                offer(1, 10.0, 80.0, &[(1000.0, 5)]),
+                offer(2, 6.0, 5.0, &[(600.0, 100)]),
+            ],
+        )]
+    }
+
+    fn one_corporation() -> LpStoreOptions {
+        LpStoreOptions {
+            lpstore: Some("1000002".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn without_filters_the_report_lists_every_offer_and_the_budget_fill() {
+        let text = text(one_store(), one_corporation());
+        let lines: Vec<&str> = text.lines().take(3).collect();
+        // Five redemptions of offer 1 empty its book, then five of offer 2 spend the rest.
+        assert_eq!(
+            lines,
+            [
+                "Loyalty offers: 2 found",
+                "LP budget 1,000: 8,000.00 ISK for 1,000 LP, 8.00 ISK/LP realized, 10 \
+                 redemptions (budget spent)",
+                "Top 2 offers by ISK per LP (descending):",
+            ]
+        );
+        assert!(!text.contains("Hidden"), "{text}");
+    }
+
+    #[test]
+    fn with_a_filter_the_heading_says_so_and_the_hidden_offers_are_counted() {
+        let options = LpStoreOptions {
+            max_spread: Some("50".to_string()),
+            lp_budget: Some("2k".to_string()),
+            ..one_corporation()
+        };
+        let text = text(one_store(), options);
+        let lines: Vec<&str> = text.lines().take(5).collect();
+        // Offer 1 fails the spread filter, so only offer 2 is listed or redeemed.
+        assert_eq!(
+            lines,
+            [
+                "Loyalty offers: 2 found",
+                "Hidden by filters: 1",
+                "LP budget 2,000: 12,000.00 ISK for 2,000 LP, 6.00 ISK/LP realized, 20 \
+                 redemptions (budget spent)",
+                "Top 1 offers that pass the filters, by ISK per LP (descending):",
+                "1. Type 2: LP=100, units per redemption=1, reward=n/a, unit cost=n/a, profit per \
+                 unit=n/a, ISK/LP=6.00, spread=5.00%, imbalance=n/a",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_nobody_buys_from_says_its_budget_has_no_fill() {
+        let stores = vec![Store::new(
+            vec![1000002],
+            vec![1],
+            vec![offer(1, 10.0, 5.0, &[])],
+        )];
+        let text = text(stores, one_corporation());
+        assert_eq!(
+            text.lines().nth(1),
+            Some("LP budget 1,000: n/a, no buy orders take a whole redemption of these offers")
+        );
+    }
+
+    #[test]
+    fn groups_print_in_the_sorts_order_with_the_best_last() {
+        // 1000002 has the better ISK per LP, 1000003 the more ISK for the budget: 5,000 against
+        // 6,000.
+        let stores = || {
+            vec![
+                Store::new(
+                    vec![1000002],
+                    vec![1],
+                    vec![offer(1, 10.0, 5.0, &[(1000.0, 5)])],
+                ),
+                Store::new(
+                    vec![1000003],
+                    vec![2],
+                    vec![offer(2, 6.0, 5.0, &[(600.0, 100)])],
+                ),
+            ]
+        };
+        let corporations = |sort: Option<&str>| {
+            let options = LpStoreOptions {
+                lpstore: Some("1000002,1000003".to_string()),
+                sort: sort.map(str::to_string),
+                ..Default::default()
+            };
+            text(stores(), options)
+                .lines()
+                .filter(|line| line.starts_with("100000"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(corporations(None), ["1000003", "1000002"]);
+        assert_eq!(corporations(Some("budget")), ["1000002", "1000003"]);
+    }
 
     #[test]
     fn the_limits_read_as_the_budget_and_the_error_limit() {

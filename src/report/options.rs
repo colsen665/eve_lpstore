@@ -1,4 +1,4 @@
-use super::{Event, RunEvent};
+use super::{Arrangement, DEFAULT_LP_BUDGET, Event, GroupSort, OfferFilter, RunEvent};
 use crate::esi::EsiClient;
 use crate::static_data::{AgentFilter, SecurityFilter, StaticData};
 use std::collections::HashSet;
@@ -42,6 +42,20 @@ pub enum Field {
     Tasks,
     MaxInflight,
     Depth,
+    /// The LP spent on each group to work out the ISK it realizes.
+    LpBudget,
+    /// The least ISK per LP an offer needs to be listed.
+    MinIskPerLp,
+    /// The widest bid/ask spread, in percent, an offer can have and be listed.
+    MaxSpread,
+    /// The least order-book imbalance, in percent, an offer needs to be listed.
+    MinImbalance,
+    /// The least volume within 10% of the best bid an offer needs to be listed.
+    MinVolume,
+    /// The least profit within 10% of the best bid an offer needs to be listed.
+    MinProfit,
+    /// What the groups are ordered by.
+    Sort,
     CacheDir,
 }
 
@@ -50,8 +64,9 @@ pub struct FieldSpec {
     pub flag: &'static str,
     /// How the value is written, as the usage line and the help show it.
     pub value_name: &'static str,
-    /// The label in the view's filter form, or `None` for an option only the command line sets.
-    /// The form's fields are also exactly the ones `filters.json` remembers.
+    /// The label in one of the view's two forms, or `None` for an option only the command line
+    /// sets. [`Field::changes_fetch`] decides which form. The forms' fields are also exactly the
+    /// ones `filters.json` remembers.
     pub form_label: Option<&'static str>,
     /// The option's name in `filters.json`, which is also its field in [`LpStoreOptions`].
     pub key: &'static str,
@@ -60,9 +75,11 @@ pub struct FieldSpec {
 }
 
 impl Field {
-    /// Every option, in the order the view's form shows them, then the ones only the command line
-    /// sets. The form, the filter summary, and the usage line follow this order.
-    pub const ALL: [Field; 15] = [
+    /// Every option, in the order the view's forms show them, then the ones only the command line
+    /// sets. The forms, the filter summary, and the usage line follow this order. The LP budget and
+    /// the thresholds stand beside the depth, since like it they only arrange what was priced, and
+    /// the view's display filters form shows the three kinds together.
+    pub const ALL: [Field; 22] = [
         Field::Lpstore,
         Field::Security,
         Field::AgentRegion,
@@ -74,9 +91,16 @@ impl Field {
         Field::Region,
         Field::System,
         Field::Depth,
+        Field::LpBudget,
+        Field::MinIskPerLp,
+        Field::MaxSpread,
+        Field::MinImbalance,
+        Field::MinVolume,
+        Field::MinProfit,
         Field::CacheMinutes,
         Field::Tasks,
         Field::MaxInflight,
+        Field::Sort,
         Field::CacheDir,
     ];
 
@@ -175,6 +199,62 @@ impl Field {
                 get: |options| &options.depth,
                 get_mut: |options| &mut options.depth,
             },
+            Field::LpBudget => FieldSpec {
+                flag: "--lp-budget",
+                value_name: "<lp>",
+                form_label: Some("LP budget"),
+                key: "lp_budget",
+                get: |options| &options.lp_budget,
+                get_mut: |options| &mut options.lp_budget,
+            },
+            Field::MinIskPerLp => FieldSpec {
+                flag: "--min-isk-per-lp",
+                value_name: "<isk>",
+                form_label: Some("Min ISK/LP"),
+                key: "min_isk_per_lp",
+                get: |options| &options.min_isk_per_lp,
+                get_mut: |options| &mut options.min_isk_per_lp,
+            },
+            Field::MaxSpread => FieldSpec {
+                flag: "--max-spread",
+                value_name: "<percent>",
+                form_label: Some("Max spread %"),
+                key: "max_spread",
+                get: |options| &options.max_spread,
+                get_mut: |options| &mut options.max_spread,
+            },
+            Field::MinImbalance => FieldSpec {
+                flag: "--min-imbalance",
+                value_name: "<percent>",
+                form_label: Some("Min imbalance"),
+                key: "min_imbalance",
+                get: |options| &options.min_imbalance,
+                get_mut: |options| &mut options.min_imbalance,
+            },
+            Field::MinVolume => FieldSpec {
+                flag: "--min-volume",
+                value_name: "<units>",
+                form_label: Some("Min volume"),
+                key: "min_volume",
+                get: |options| &options.min_volume,
+                get_mut: |options| &mut options.min_volume,
+            },
+            Field::MinProfit => FieldSpec {
+                flag: "--min-profit",
+                value_name: "<isk>",
+                form_label: Some("Min profit"),
+                key: "min_profit",
+                get: |options| &options.min_profit,
+                get_mut: |options| &mut options.min_profit,
+            },
+            Field::Sort => FieldSpec {
+                flag: "--sort",
+                value_name: "<avg|budget|best|profit>",
+                form_label: None,
+                key: "sort",
+                get: |options| &options.sort,
+                get_mut: |options| &mut options.sort,
+            },
             Field::CacheMinutes => FieldSpec {
                 flag: "--cache-minutes",
                 value_name: "<n>",
@@ -219,9 +299,29 @@ impl Field {
         Field::ALL.into_iter().find(|field| field.flag() == flag)
     }
 
-    /// Whether the view's form shows this option, which is also whether `filters.json` keeps it.
+    /// Whether one of the view's forms shows this option, which is also whether `filters.json`
+    /// keeps it.
     pub fn in_form(self) -> bool {
         self.spec().form_label.is_some()
+    }
+
+    /// Whether a new value for this option needs offers fetched and priced again. The depth, the
+    /// LP budget, the thresholds, and the sort do not: they only decide which priced offers each
+    /// group lists and in what order the groups go, which [`Report::arrange`](super::Report::arrange)
+    /// redoes from the report on hand. Every other option changes which corporations are read or
+    /// where prices come from, or how the run talks to ESI.
+    pub fn changes_fetch(self) -> bool {
+        !matches!(
+            self,
+            Field::Depth
+                | Field::LpBudget
+                | Field::MinIskPerLp
+                | Field::MaxSpread
+                | Field::MinImbalance
+                | Field::MinVolume
+                | Field::MinProfit
+                | Field::Sort
+        )
     }
 }
 
@@ -261,6 +361,18 @@ pub struct LpStoreOptions {
     pub tasks: Option<String>,
     pub max_inflight: Option<String>,
     pub depth: Option<String>,
+    /// LP spent on each group to work out the ISK it realizes. A whole number, with an optional
+    /// K, M, or B. Defaults to [`DEFAULT_LP_BUDGET`].
+    pub lp_budget: Option<String>,
+    /// The thresholds of [`OfferFilter`], each a number. ISK and volume take an optional K, M, or
+    /// B; spread and imbalance are percents.
+    pub min_isk_per_lp: Option<String>,
+    pub max_spread: Option<String>,
+    pub min_imbalance: Option<String>,
+    pub min_volume: Option<String>,
+    pub min_profit: Option<String>,
+    /// A [`GroupSort::name`]. Defaults to the average ISK per LP.
+    pub sort: Option<String>,
     /// Where to keep ESI responses instead of the platform cache directory. The static data does
     /// not move with it: this names a cache.
     pub cache_dir: Option<String>,
@@ -278,6 +390,9 @@ pub struct Parsed {
     pub tasks: usize,
     pub max_inflight: usize,
     pub depth: usize,
+    pub filter: OfferFilter,
+    pub lp_budget: u64,
+    pub sort: GroupSort,
 }
 
 /// A run of `--lpstores` with every option checked and every name resolved to an ID.
@@ -301,6 +416,10 @@ pub struct Resolved {
     pub tasks: usize,
     pub max_inflight: usize,
     pub depth: usize,
+    /// The thresholds offers must meet to be listed.
+    pub filter: OfferFilter,
+    pub lp_budget: u64,
+    pub sort: GroupSort,
     pub expire: bool,
     pub verbose: bool,
 }
@@ -542,6 +661,9 @@ impl LpStoreOptions {
             tasks: parsed.tasks,
             max_inflight: parsed.max_inflight,
             depth: parsed.depth,
+            filter: parsed.filter,
+            lp_budget: parsed.lp_budget,
+            sort: parsed.sort,
             expire: self.expire,
             verbose: self.verbose,
         })
@@ -578,11 +700,65 @@ impl LpStoreOptions {
             .unwrap_or(DEFAULT_MAX_INFLIGHT),
             depth: parse_option(self.depth.as_deref(), Field::Depth, errors, parse_count)
                 .unwrap_or(DEFAULT_DEPTH),
+            filter: OfferFilter {
+                min_isk_per_lp: parse_option(
+                    self.min_isk_per_lp.as_deref(),
+                    Field::MinIskPerLp,
+                    errors,
+                    parse_isk,
+                ),
+                max_spread: parse_option(
+                    self.max_spread.as_deref(),
+                    Field::MaxSpread,
+                    errors,
+                    parse_percent,
+                ),
+                min_imbalance: parse_option(
+                    self.min_imbalance.as_deref(),
+                    Field::MinImbalance,
+                    errors,
+                    parse_percent,
+                ),
+                min_volume: parse_option(
+                    self.min_volume.as_deref(),
+                    Field::MinVolume,
+                    errors,
+                    parse_units,
+                ),
+                min_profit: parse_option(
+                    self.min_profit.as_deref(),
+                    Field::MinProfit,
+                    errors,
+                    parse_isk,
+                ),
+            },
+            lp_budget: parse_option(
+                self.lp_budget.as_deref(),
+                Field::LpBudget,
+                errors,
+                parse_budget,
+            )
+            .unwrap_or(DEFAULT_LP_BUDGET),
+            sort: parse_option(self.sort.as_deref(), Field::Sort, errors, |text| {
+                text.parse::<GroupSort>()
+            })
+            .unwrap_or_default(),
         }
     }
 }
 
 impl Resolved {
+    /// How the run's report is grouped and sorted: the depth, the thresholds, the LP budget, and
+    /// the sort, with hiding on, nothing excluded, and the best group first.
+    pub fn arrangement(&self) -> Arrangement {
+        Arrangement {
+            filter: self.filter,
+            sort: self.sort,
+            lp_budget: Some(self.lp_budget),
+            ..Arrangement::depth(self.depth)
+        }
+    }
+
     /// Builds the ESI client for this run. Verbose log lines go to `events` as
     /// `Event::Log`, tagged with `run_id`.
     pub fn client(
@@ -650,6 +826,78 @@ fn parse_minutes(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| "expected a whole number".to_string())
+}
+
+/// `value` with a K, M, or B suffix, in either case, written out as the plain decimal it stands
+/// for, so `1.5k` is `1500` and `2.25M` is `2250000`. The decimal point is moved rather than the
+/// number multiplied, so the result is exact. Without a suffix `value` is returned trimmed, and
+/// with one the number before it has to be digits with at most one point and an optional sign.
+fn expand_suffix(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let zeros = match value.chars().last().map(|last| last.to_ascii_uppercase()) {
+        Some('K') => 3,
+        Some('M') => 6,
+        Some('B') => 9,
+        _ => return Ok(value.to_string()),
+    };
+    let number = &value[..value.len() - 1];
+    let (sign, digits) = match number.strip_prefix(['-', '+']) {
+        Some(rest) => (&number[..1], rest),
+        None => ("", number),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let is_digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    if whole.len() + fraction.len() == 0 || !is_digits(whole) || !is_digits(fraction) {
+        return Err("expected a number before the K, M, or B".to_string());
+    }
+    let mut plain = format!("{sign}{whole}");
+    if fraction.len() <= zeros {
+        plain.push_str(fraction);
+        plain.push_str(&"0".repeat(zeros - fraction.len()));
+    } else {
+        plain.push_str(&fraction[..zeros]);
+        plain.push('.');
+        plain.push_str(&fraction[zeros..]);
+    }
+    Ok(plain)
+}
+
+/// An amount of ISK, or of ISK per LP: any finite number, with an optional K, M, or B.
+fn parse_isk(value: &str) -> Result<f64, String> {
+    match expand_suffix(value)?.parse::<f64>() {
+        Ok(isk) if isk.is_finite() => Ok(isk),
+        _ => Err("expected a number, with an optional K, M, or B".to_string()),
+    }
+}
+
+/// A whole number of units, 0 or more, with an optional K, M, or B.
+fn parse_units(value: &str) -> Result<i64, String> {
+    expand_suffix(value)?
+        .parse::<i64>()
+        .ok()
+        .filter(|&units| units >= 0)
+        .ok_or_else(|| {
+            "expected a whole number of 0 or more, with an optional K, M, or B".to_string()
+        })
+}
+
+/// A whole number of LP, 1 or more, with an optional K, M, or B.
+fn parse_budget(value: &str) -> Result<u64, String> {
+    expand_suffix(value)?
+        .parse::<u64>()
+        .ok()
+        .filter(|&lp| lp >= 1)
+        .ok_or_else(|| {
+            "expected a whole number of at least 1, with an optional K, M, or B".to_string()
+        })
+}
+
+/// A percent: any finite number, without a suffix.
+fn parse_percent(value: &str) -> Result<f64, String> {
+    match value.trim().parse::<f64>() {
+        Ok(percent) if percent.is_finite() => Ok(percent),
+        _ => Err("expected a number of percent".to_string()),
+    }
 }
 
 fn parse_agent_level(value: &str) -> Result<i32, String> {
@@ -768,6 +1016,13 @@ mod tests {
             tasks: Some("tasks".to_string()),
             max_inflight: Some("max_inflight".to_string()),
             depth: Some("depth".to_string()),
+            lp_budget: Some("lp_budget".to_string()),
+            min_isk_per_lp: Some("min_isk_per_lp".to_string()),
+            max_spread: Some("max_spread".to_string()),
+            min_imbalance: Some("min_imbalance".to_string()),
+            min_volume: Some("min_volume".to_string()),
+            min_profit: Some("min_profit".to_string()),
+            sort: Some("sort".to_string()),
             cache_dir: Some("cache_dir".to_string()),
             expire: false,
             verbose: false,
@@ -846,5 +1101,147 @@ mod tests {
         assert_eq!((parsed.max_inflight, parsed.depth), (4, 10));
         assert_eq!(parsed.tasks, 64);
         assert!(parsed.cache_minutes.is_none());
+        assert!(parsed.filter.is_empty());
+        assert_eq!(parsed.lp_budget, 1000);
+        assert_eq!(parsed.sort, GroupSort::AverageIskPerLp);
+    }
+
+    #[test]
+    fn amounts_take_a_k_m_or_b_suffix_in_either_case_exactly() {
+        let cases = [
+            ("1500", "1500"),
+            (" 1.5k ", "1500"),
+            ("2.25M", "2250000"),
+            ("1.1m", "1100000"),
+            ("3B", "3000000000"),
+            ("1.0001K", "1000.1"),
+            ("-2k", "-2000"),
+            ("+.5K", "+500"),
+            ("1e3", "1e3"),
+        ];
+        for (typed, plain) in cases {
+            assert_eq!(expand_suffix(typed).as_deref(), Ok(plain), "{typed}");
+        }
+        for typed in ["K", "-M", "1.2.3K", "1e3K", "x1K", " k"] {
+            assert!(expand_suffix(typed).is_err(), "{typed}");
+        }
+        assert_eq!(parse_isk("1.1M"), Ok(1_100_000.0));
+        assert_eq!(parse_isk("-250"), Ok(-250.0));
+        assert_eq!(parse_isk("1e3"), Ok(1000.0));
+        assert!(parse_isk("inf").is_err());
+        assert!(parse_isk("NaN").is_err());
+        assert_eq!(parse_units("2.5k"), Ok(2500));
+        assert_eq!(parse_units("0"), Ok(0));
+        assert!(parse_units("1.0001K").is_err(), "not whole");
+        assert!(parse_units("-1").is_err());
+        assert_eq!(parse_budget("1M"), Ok(1_000_000));
+        assert!(parse_budget("0").is_err());
+        assert!(parse_budget("100000000000B").is_err(), "past u64");
+        assert_eq!(parse_percent("-12.5"), Ok(-12.5));
+        assert!(parse_percent("12%").is_err());
+        assert!(parse_percent("5k").is_err(), "no suffix on a percent");
+    }
+
+    #[test]
+    fn each_bad_arrangement_value_is_reported_on_its_own_field() {
+        let options = LpStoreOptions {
+            lp_budget: Some("0".to_string()),
+            min_isk_per_lp: Some("lots".to_string()),
+            max_spread: Some("inf".to_string()),
+            min_imbalance: Some("1k".to_string()),
+            min_volume: Some("1.5".to_string()),
+            min_profit: Some("1.5Q".to_string()),
+            sort: Some("spread".to_string()),
+            ..Default::default()
+        };
+        let errors = options.parse().unwrap_err();
+        let fields: Vec<Field> = errors.iter().map(|e| e.field).collect();
+        assert_eq!(
+            fields,
+            [
+                Field::MinIskPerLp,
+                Field::MaxSpread,
+                Field::MinImbalance,
+                Field::MinVolume,
+                Field::MinProfit,
+                Field::LpBudget,
+                Field::Sort,
+            ]
+        );
+        assert_eq!(
+            errors[5].message,
+            "Invalid --lp-budget value '0': expected a whole number of at least 1, with an \
+             optional K, M, or B"
+        );
+        assert_eq!(
+            errors[6].message,
+            "Invalid --sort value 'spread': unknown sort 'spread'; use avg, budget, best, profit"
+        );
+    }
+
+    #[test]
+    fn the_arrangement_carries_the_depth_thresholds_budget_and_sort() {
+        let options = LpStoreOptions {
+            lpstore: Some("1000002".to_string()),
+            depth: Some("3".to_string()),
+            lp_budget: Some("2.5k".to_string()),
+            min_isk_per_lp: Some("1.2K".to_string()),
+            max_spread: Some("20".to_string()),
+            min_imbalance: Some("-10".to_string()),
+            min_volume: Some("1k".to_string()),
+            min_profit: Some("50M".to_string()),
+            sort: Some("Budget".to_string()),
+            ..Default::default()
+        };
+        let arrangement = options
+            .resolve(&StaticData::default())
+            .expect("every value is valid")
+            .arrangement();
+        assert_eq!(
+            arrangement,
+            Arrangement {
+                depth: 3,
+                filter: OfferFilter {
+                    min_isk_per_lp: Some(1200.0),
+                    max_spread: Some(20.0),
+                    min_imbalance: Some(-10.0),
+                    min_volume: Some(1000),
+                    min_profit: Some(50e6),
+                },
+                hiding: true,
+                excluded: Arc::default(),
+                sort: GroupSort::BudgetIsk,
+                reverse: false,
+                lp_budget: Some(2500),
+            }
+        );
+
+        let plain = LpStoreOptions::default()
+            .resolve(&StaticData::default())
+            .expect("defaults are valid")
+            .arrangement();
+        assert_eq!(plain, Arrangement::depth(DEFAULT_DEPTH));
+        assert_eq!(plain.lp_budget, Some(1000));
+    }
+
+    #[test]
+    fn only_the_fetch_options_change_the_fetch() {
+        let arranging: Vec<Field> = Field::ALL
+            .into_iter()
+            .filter(|field| !field.changes_fetch())
+            .collect();
+        assert_eq!(
+            arranging,
+            [
+                Field::Depth,
+                Field::LpBudget,
+                Field::MinIskPerLp,
+                Field::MaxSpread,
+                Field::MinImbalance,
+                Field::MinVolume,
+                Field::MinProfit,
+                Field::Sort,
+            ]
+        );
     }
 }

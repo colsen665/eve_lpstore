@@ -22,7 +22,8 @@ Modes:
   --lpstores             Calculate expenses, profit, and ISK per LP for LP store offers and show the top 10, as text on standard output.
   --tui                  Show --lpstores in a full-screen view that updates while it runs. Asks for
                          the filters first, and for the static data if it is not on disk. Remembers
-                         the filters it applies in a file in the platform config directory.
+                         the filters it applies, and the offers excluded with x, in files in the
+                         platform config directory.
                          This is the default when no mode is given and standard output is a terminal;
                          with no terminal it prints the usage line instead.
   --help                 Show this help and exit.
@@ -50,6 +51,16 @@ Options:
   --max-inflight <n>     Maximum ESI requests in flight at once across the whole run. Default 4.
   --single-thread        Run every task on one thread, instead of on a worker thread per CPU core. File reads, DNS lookups, and the full-screen view still use tokio's blocking threads.
   --depth <n>            Offers listed per group with --lpstores. Corporations whose top n offers are the same are listed as one group. Default 10.
+  --lp-budget <lp>       LP spent on each group with --lpstores, to show the ISK its listed offers realize when the rewards are sold into the buy orders on the book, best price first, so each further redemption sells lower. Each step takes the whole redemption with the best ISK per LP at that moment, which is not guaranteed to give the most ISK for the whole budget. Required items are always bought at the best sell price, and each group is worked out on its own. Takes K, M, or B, as in 1M. Default 1,000.
+  --sort <avg|budget|best|profit>  Order of the groups with --lpstores: the average ISK per LP of their listed offers (avg, the default), the ISK for --lp-budget (budget), the ISK per LP of their best offer (best), or the profit within 10% of the best bid summed over their listed offers (profit). The best group prints last, and a group without a value prints before the rest.
+
+Offer thresholds (apply to --lpstores):
+  --min-isk-per-lp <isk> List only offers with at least this ISK per LP. Takes K, M, or B.
+  --max-spread <percent> List only offers whose bid/ask spread is at most this percent of the best bid.
+  --min-imbalance <percent>  List only offers whose imbalance is at least this: the units bid within 10% of the best bid less the units offered within 10% of the best ask, as a percent of both, from -100 to +100.
+  --min-volume <units>   List only offers with at least this many units on buy orders within 10% of the best bid. Takes K, M, or B.
+  --min-profit <isk>     List only offers that make at least this profit when the reward is sold into every buy order within 10% of the best bid. Takes K, M, or B.
+  An offer that lacks the figure a threshold reads fails it. Thresholds apply before grouping: a group lists its top --depth offers that pass, its average and budget cover only those, and it says how many offers in its corporations' stores fail.
   --verbose              Print cache hits, misses, and writes, with reasons and file names, and the cache and data directories. In the full-screen view, the default when no mode is given, they go to the log, which names the two directories with or without this flag.
   --clear-cache          Delete the cached ESI responses, and the static data archive if one is on disk. The four extracted static data files stay. With no other mode this stops there rather than opening the full-screen view.
 
@@ -72,6 +83,10 @@ Examples:
 
   eve_lpstore --lpstores --security 0.5..0.7
       Show the top 10 offers for corporations with an agent in a system whose rounded security is between 0.5 and 0.7, both included.
+
+  eve_lpstore --lpstores --max-spread 20 --min-volume 1k --sort budget --lp-budget 1M
+      Leave out offers whose spread is above 20% or that have fewer than 1,000 units bid within
+      10% of the best bid, and order the groups by the ISK that 1,000,000 LP realizes.
 
   eve_lpstore --lpstores --expire --verbose
       Refresh cached responses and show cache activity.

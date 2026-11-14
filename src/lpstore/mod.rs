@@ -2,7 +2,7 @@ use crate::esi::EsiClient;
 use crate::esi::error::EsiError;
 use crate::esi::loyalty::{LoyaltyOffer, RequiredItem};
 use crate::expenses::{
-    ExpenseBreakdown, ItemExpense, ItemPrices, MarketQuote, PricingError, breakdown_from,
+    BookOrder, ExpenseBreakdown, ItemExpense, ItemPrices, MarketQuote, PricingError, breakdown_from,
 };
 use crate::tasks::Slot;
 use std::collections::HashSet;
@@ -29,6 +29,11 @@ pub struct OfferResult {
     /// How lopsided that volume is, from -100 to +100, or `None` when either side is empty.
     pub imbalance: Option<f64>,
     pub within_10: Option<(i64, f64)>,
+    /// The buy orders for the reward in the run's region and stations, highest price first, with
+    /// orders at the same price in the order ESI listed them. Empty when nobody buys the reward.
+    /// They are the orders the reward quote already fetched, kept for the LP-budget ladder
+    /// (`report::budget`), which sells into them.
+    pub buy_orders: Arc<[BookOrder]>,
 }
 
 impl OfferResult {
@@ -188,6 +193,7 @@ async fn price_offer(
         _ => None,
     };
     let imbalance = book_depth.and_then(|(bid, ask)| imbalance_percent(bid, ask));
+    let buy_orders = best_bids_first(quote.buy_orders);
 
     Ok(OfferResult {
         offer,
@@ -200,7 +206,15 @@ async fn price_offer(
         book_depth,
         imbalance,
         within_10,
+        buy_orders,
     })
+}
+
+/// The buy orders sorted by price, highest first. The sort is stable, so orders at the same price
+/// keep the order they were listed in.
+fn best_bids_first(mut orders: Vec<BookOrder>) -> Arc<[BookOrder]> {
+    orders.sort_by(|a, b| b.price.total_cmp(&a.price));
+    orders.into()
 }
 
 /// ISK per LP for one redemption. The reward is per unit, so it is multiplied by the units the
@@ -248,6 +262,33 @@ mod tests {
             isk_cost: 0.0,
             required_items: Vec::new(),
         }
+    }
+
+    fn order(price: f64, volume_remain: i32) -> BookOrder {
+        BookOrder {
+            price,
+            volume_remain,
+        }
+    }
+
+    #[test]
+    fn buy_orders_are_sorted_best_first() {
+        let sorted = best_bids_first(vec![
+            order(90.0, 1),
+            order(120.0, 2),
+            order(100.0, 3),
+            order(120.0, 4),
+        ]);
+        assert_eq!(
+            &sorted[..],
+            &[
+                order(120.0, 2),
+                order(120.0, 4),
+                order(100.0, 3),
+                order(90.0, 1)
+            ]
+        );
+        assert!(best_bids_first(Vec::new()).is_empty());
     }
 
     #[test]

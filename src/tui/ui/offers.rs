@@ -21,7 +21,15 @@ pub(super) const SPREAD_WIDE: f64 = 50.0;
 pub(super) const IMBALANCE_STRONG: f64 = 25.0;
 
 pub(super) fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
-    let block = pane_block("Groups", app.focus == Focus::Groups, app);
+    let block = pane_block(
+        &groups_title(app, usize::from(area.width.saturating_sub(2))),
+        app.focus == Focus::Groups,
+        app,
+    );
+    let block = match search_title(app, usize::from(area.width.saturating_sub(2))) {
+        Some(title) => block.title_bottom(title),
+        None => block,
+    };
     let groups = app.groups();
     if groups.is_empty() {
         frame.render_widget(
@@ -34,7 +42,7 @@ pub(super) fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &Stat
     let names_width = usize::from(area.width.saturating_sub(4));
     let items: Vec<ListItem> = groups
         .iter()
-        .map(|group| group_item(group, app.depth, sdata, names_width))
+        .map(|group| group_item(group, &app.arrangement, sdata, names_width))
         .collect();
     let list = List::new(items)
         .block(block)
@@ -44,15 +52,63 @@ pub(super) fn draw_groups(frame: &mut Frame, area: Rect, app: &App, sdata: &Stat
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A group takes two lines: its average ISK per LP over the offers it lists, its offer count,
-/// then its corporations.
+/// The groups pane's title, before [`pane_block`] marks it stale: what the groups are sorted by,
+/// and an arrow pointing down when the best go first and up when the worst do. It names the sort
+/// by its `--sort` word, which keeps it inside the pane at 80 columns, where the pane is 26 cells
+/// wide with 24 between its corners. When the stale mark would not fit beside it in `room`
+/// cells, the pane's name is left out so the sort and the mark stay whole.
+pub(super) fn groups_title(app: &App, room: usize) -> String {
+    let arrangement = &app.arrangement;
+    let arrow = if arrangement.reverse { '▲' } else { '▼' };
+    let sort = format!("{} {}", arrangement.sort.name(), arrow);
+    let title = format!("Groups: {sort}");
+    // The stale mark adds " (stale)", and the padding a space on either side.
+    if app.stale && title.chars().count() + 10 > room {
+        sort
+    } else {
+        title
+    }
+}
+
+/// The groups pane's bottom title while a search is set: ` /query `, or ` /query: no match `
+/// in red after `n` or `N` found nothing. The query is cut to fit `room` cells.
+pub(super) fn search_title(app: &App, room: usize) -> Option<Line<'static>> {
+    let search = app.search.as_ref()?;
+    let note = if search.missed { ": no match" } else { "" };
+    // The slash, the note, and a space on either side.
+    let query = truncate(&search.query, room.saturating_sub(note.chars().count() + 3));
+    let text = format!(" /{query}{note} ");
+    Some(if search.missed {
+        Line::from(text).red()
+    } else {
+        Line::from(text).dark_gray()
+    })
+}
+
+/// The value a group shows for `sort`, with the words after it: the ISK per LP figures with two
+/// decimals, the ISK amounts shortened the way the offers table shortens them.
+pub(super) fn sort_value_text(group: &Group, arrangement: &Arrangement) -> String {
+    let value = group.sort_value(arrangement.sort, arrangement.depth);
+    match arrangement.sort {
+        GroupSort::AverageIskPerLp => format!("{} avg ISK/LP", optional(value)),
+        GroupSort::BestOffer => format!("{} best ISK/LP", optional(value)),
+        GroupSort::BudgetIsk => format!("{} ISK for budget", short_optional(value)),
+        GroupSort::ProfitWithin10 => format!("{} profit ±10%", short_optional(value)),
+    }
+}
+
+/// [`short_isk`] for a value that may be unknown, which reads `n/a`.
+fn short_optional(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), short_isk)
+}
+
+/// A group takes two lines: the value it is sorted by, its offer count, then its corporations.
 fn group_item(
     group: &Group,
-    depth: usize,
+    arrangement: &Arrangement,
     sdata: &StaticData,
     names_width: usize,
 ) -> ListItem<'static> {
-    let isk = optional(group.average_isk_per_lp(depth));
     let names: Vec<String> = group
         .corp_ids
         .iter()
@@ -60,8 +116,8 @@ fn group_item(
         .collect();
     ListItem::new(vec![
         Line::from(format!(
-            "{} avg ISK/LP | {} offers",
-            isk,
+            "{} | {} offers",
+            sort_value_text(group, arrangement),
             group.offer_count_text()
         )),
         Line::from(Span::styled(
@@ -71,23 +127,59 @@ fn group_item(
     ])
 }
 
+/// The offers pane's title, before [`pane_block`] marks it stale. It names the table's sort
+/// unless that is the ranking, with an arrow as the groups title has it. With hiding on it counts
+/// the offers the filters hide in the selected group's stores, when there are any. With hiding off
+/// it says so, and counts the offers the filters would hide, which are the rows drawn dim. When
+/// the title and the stale mark would not fit in `room` cells, the pane's name is left out.
+pub(super) fn offers_title(app: &App, room: usize) -> String {
+    let mut parts = Vec::new();
+    let sort = app.offer_sort;
+    if sort != OfferSort::default() {
+        parts.push(format!("{} {}", sort.key.name(), sort.arrow()));
+    }
+    if let (Some(report), Some(group)) = (app.report.as_ref(), app.selected_group()) {
+        let (_, most) = report.hideable_range(group);
+        let count = report.hideable_count_text(group);
+        match (app.arrangement.hiding, most) {
+            (true, 0) => {}
+            (true, _) => parts.push(format!("{count} hidden")),
+            (false, 0) => parts.push("hiding off".to_string()),
+            (false, _) => parts.push(format!("hiding off, {count} would hide")),
+        }
+    }
+    if parts.is_empty() {
+        return "Offers".to_string();
+    }
+    let state = parts.join(", ");
+    let title = format!("Offers: {state}");
+    // The padding is a space on either side, and the stale mark adds " (stale)".
+    let marks = if app.stale { 10 } else { 2 };
+    if title.chars().count() + marks > room {
+        state
+    } else {
+        title
+    }
+}
+
 pub(super) fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &StaticData) {
-    let block = pane_block("Offers", app.focus == Focus::Offers, app);
-    let Some(group) = app.selected_group() else {
+    let title = offers_title(app, usize::from(area.width.saturating_sub(2)));
+    let block = pane_block(&title, app.focus == Focus::Offers, app);
+    if app.selected_group().is_none() {
         frame.render_widget(Paragraph::new("").block(block), area);
         return;
-    };
+    }
     let wide = area.width >= WIDE_OFFERS;
-    let rows: Vec<Row> = group
-        .results
-        .iter()
-        .take(app.depth)
-        .enumerate()
+    let arrangement = &app.arrangement;
+    // In the table's order; the `#` column keeps each offer's place in the ranking.
+    let rows: Vec<Row> = app
+        .offer_rows()
+        .into_iter()
         .map(|(rank, result)| {
             let item = item_name(sdata, result.offer.type_id);
             let cells = offer_cells(rank, result, item, wide)
                 .into_iter()
-                .map(|(text, style)| Cell::from(text).style(style));
+                .map(|(text, style)| Cell::from(text).style(row_style(arrangement, result, style)));
             Row::new(cells)
         })
         .collect();
@@ -101,6 +193,24 @@ pub(super) fn draw_offers(frame: &mut Frame, area: Rect, app: &App, sdata: &Stat
         .highlight_symbol("> ");
     let mut state = TableState::default().with_selected(Some(app.offer));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+/// The style of a cell of `result`'s row, given the cell's own `style`. With hiding off, a row the
+/// filters would hide is dim throughout, its coloured cells too, so it reads as set aside rather
+/// than as a market warning, and an excluded row is struck through as well, so it reads as the one
+/// `x` set aside. With hiding on neither is listed, and every cell keeps its own style.
+pub(super) fn row_style(arrangement: &Arrangement, result: &OfferResult, style: Style) -> Style {
+    if arrangement.hiding {
+        return style;
+    }
+    let excluded = arrangement.excluded.contains(&result.offer.offer_id);
+    if excluded {
+        Style::new().dark_gray().crossed_out()
+    } else if !arrangement.filter.passes(result) {
+        Style::new().dark_gray()
+    } else {
+        style
+    }
 }
 
 /// One column of the offers table: its title, its width in each layout, and what a row shows in

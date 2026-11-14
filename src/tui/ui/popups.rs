@@ -145,6 +145,27 @@ pub(super) fn draw_export(frame: &mut Frame, area: Rect, prompt: &ExportPrompt) 
     popup(frame, area, " Export ", POPUP_WIDTH, lines);
 }
 
+/// The search prompt: the text to find among the corporation and item names, and why the last
+/// attempt found nothing. Like the export name, a query too long for the popup shows its end.
+pub(super) fn draw_search(frame: &mut Frame, area: Rect, prompt: &SearchPrompt) {
+    let inner = POPUP_TEXT;
+    let mut lines = vec![
+        Line::from("Find a corporation or item name".dark_gray()),
+        Line::from(tail(&prompt.query, inner)).bold(),
+    ];
+    if let Some(error) = &prompt.error {
+        lines.push(Line::from(truncate(error, inner)).red());
+    }
+    lines.push(Line::from(
+        truncate(
+            "Enter jumps to the next match  Esc cancels  Ctrl+U clears",
+            inner,
+        )
+        .dark_gray(),
+    ));
+    popup(frame, area, " Search ", POPUP_WIDTH, lines);
+}
+
 /// The keys, then what the figures in the offers table are and how they are worked out. Taller
 /// than the screen can be, so it scrolls: `scroll` is how many lines are above the window, and the
 /// result is the help's total lines and how many showed, which the keys scroll against.
@@ -156,7 +177,26 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect, scroll: usize) -> (usize,
             "move the selection, or scroll the details and this help",
         ),
         ("PgUp, PgDn", "move a page at a time"),
-        ("f", "edit the filters; Enter runs them, Esc cancels"),
+        ("f", "edit the fetch filters; Enter fetches, Esc cancels"),
+        ("v", "edit depth, LP budget, thresholds; Enter re-arranges"),
+        ("s, S", "cycle the group sort, or reverse its direction"),
+        (
+            "F",
+            "show offers the thresholds hide, dimmed, or hide them again",
+        ),
+        (
+            "x",
+            "exclude or restore the selected offer; F shows excluded ones",
+        ),
+        (
+            "o, O",
+            "cycle the offer table's sort, or reverse its direction",
+        ),
+        (
+            "/",
+            "search corporation and item names; Enter jumps to a match",
+        ),
+        ("n, N", "jump to the next or previous match of the search"),
         ("e", "write the view to a .csv or .json file"),
         (
             "m",
@@ -198,8 +238,9 @@ pub(super) fn draw_help(frame: &mut Frame, area: Rect, scroll: usize) -> (usize,
 const HELP_WIDTH: u16 = MIN_WIDTH;
 
 /// What each figure in the offers table means, as the code works it out: the reward and the
-/// stations in `lpstore`, and the colour bands beside `SPREAD_WIDE` and `IMBALANCE_STRONG`.
-pub(super) const HELP_FIGURES: [(&str, &str); 11] = [
+/// stations in `lpstore`, the colour bands beside `SPREAD_WIDE` and `IMBALANCE_STRONG`, and the LP
+/// budget's fill in `report::budget`, with its limits.
+pub(super) const HELP_FIGURES: [(&str, &str); 15] = [
     (
         "ISK/LP",
         "(reward × units − ISK cost − items) ÷ LP cost, per redemption;",
@@ -233,6 +274,19 @@ pub(super) const HELP_FIGURES: [(&str, &str); 11] = [
         "selling them: (price − unit cost) × units, unit cost being",
     ),
     ("", "(ISK cost + items) ÷ units"),
+    (
+        "LP budget",
+        "the ISK it realizes on a group's listed offers: one whole",
+    ),
+    (
+        "",
+        "redemption at a time, the best next ISK/LP first, each sold",
+    ),
+    (
+        "",
+        "into the buy orders left. Greedy, so not always the most ISK,",
+    ),
+    ("", "and items are always bought at the best sell price"),
     (
         "n/a",
         "a side of the market is missing, or nothing to compute from",

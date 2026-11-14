@@ -14,17 +14,37 @@ Started out as a quick console prototype. Then I added a vibe coded UI. ESI laye
   each required item is bought at the best sell order. ISK per LP is the reward times the units,
   less the ISK cost and the items, divided by the LP cost.
 - Lists corporations whose top offers are the same as one group, best first by their average ISK
-  per LP. `--depth` sets how many offers each group lists, 10 by default.
+  per LP. `--depth` sets how many offers each group lists, 10 by default. `--sort` orders the
+  groups by that average (`avg`), the ISK an LP budget realizes (`budget`), their best offer
+  (`best`), or their profit within 10% of the best bid (`profit`).
+- Works out what an LP budget, 1,000 LP unless `--lp-budget` says otherwise, realizes on each
+  group's listed offers when the rewards are sold into the buy orders on the book, one whole
+  redemption at a time, always the one with the best ISK per LP. A redemption uses up the buy
+  orders it sells into, so the next one of the same reward sells lower. The choice is greedy and
+  not guaranteed to be the best, items are always bought at the best sell price, and each group is
+  worked out on its own.
 - Filters corporations by their agents: system security, level, division, type, region, system,
   and faction. `--system` prices from one system's NPC stations only.
 - Shows how far a price can be trusted: the bid/ask spread, the volume within 10% of the best bid,
   and how lopsided the order book is near the top.
+- Leaves out offers by those markers: `--max-spread`, `--min-imbalance`, `--min-volume`, and
+  `--min-profit`, with `--min-isk-per-lp` beside them. An offer missing a figure fails its filter,
+  and a group then lists its top offers that pass and says how many its stores hide.
 - In the full-screen view, `e` writes what is on screen to a `.csv` or `.json` file, and `m` shows
-  where missions from the selected group's agents can take you.
+  where missions from the selected group's agents can take you. `f` edits the filters that decide
+  what is fetched, and `v` the display filters: the depth, the LP budget, and the thresholds above,
+  which re-arrange the groups without fetching again. `s` steps through the group sorts and `S`
+  reverses the order. `x` excludes the selected offer wherever it is held, also in later
+  sessions. `F` turns the thresholds and exclusions off and on; while they are off, the offers they
+  would hide are shown dimmed, excluded ones struck through, and `x` on one restores it. The
+  offers pane says how many offers are hidden. `o` steps the offers table through its sorts, by
+  rank, spread, imbalance, volume and profit, and `O` reverses it; the `#` column keeps each
+  offer's rank. `/` searches the corporation and item names and jumps to the next match, and `n`
+  and `N` go to the next and previous one.
 
 ## What it does not do (yet)
 
-- It shows some crude spread and order book balance markers, they could obviously be used for filtering but for now you have to evaluate them manually and scroll down to SOE and verify that Lan is still there.
+- Search the offers: you still have to scroll down to SOE and verify that Lan is still there.
 
 - (bug) There seem to be a bug in the ESI implementation where it calculates hisec routes wrong for some systems that have a trusec of <0.5 that should be rounded to 0.5, the tell is burners that show more than 10 jumps. I have notified Eve support but they did not want to forward  my bug report to the devs, since ESI  was not their desk.
 
@@ -52,6 +72,7 @@ eve_lpstore                       # full-screen view: asks for filters, then run
 eve_lpstore --lpstores            # the same report as text on standard output
 eve_lpstore --lpstores --lpstore "Caldari Navy" --region Domain --depth 20
 eve_lpstore --lpstores --security 0.5..0.7 --agent-level 4
+eve_lpstore --lpstores --max-spread 20 --min-volume 1k --sort budget --lp-budget 1M
 eve_lpstore --help                # every option, with examples
 ```
 
@@ -82,7 +103,10 @@ Inspired by BBG terminal
 - `~/.local/share/eve_lpstore`: names and locations from CCP's static data export. The first run
   downloads the whole export from developers.eveonline.com and keeps four extracted files. The view
   asks before downloading; `--lpstores` downloads it on its own.
-- `~/.config/eve_lpstore/filters.json`: the filters the view last applied.
+- `~/.config/eve_lpstore/filters.json`: the filters and display filters the view last applied.
+  The group sort is not kept.
+- `~/.config/eve_lpstore/excluded_offers.json`: the offers excluded with `x` in the view, by offer
+  ID, each with its item's name for reading. `--lpstores` does not read it.
 
 Windows and macOS use their own cache, data, and config directories.
 

@@ -1,13 +1,15 @@
 //! Drawing the `--tui` view. These functions read the app state and draw it, and they change
 //! nothing. `draw` returns how the details pane was laid out, so the app can scroll it.
 
-use super::app::{App, ExportPrompt, Focus, LogLine, Overlay, Stage, StaticDataDialog};
+use super::app::{
+    App, ExportPrompt, Focus, LogLine, OfferSort, Overlay, SearchPrompt, Stage, StaticDataDialog,
+};
 use super::form::FormField;
 use super::qr;
 use crate::output;
 use eve_lpstore::esi::ClientStats;
 use eve_lpstore::format::{format_isk, format_number, format_optional};
-use eve_lpstore::report::{Field, Group};
+use eve_lpstore::report::{Arrangement, Field, Group, GroupSort};
 use eve_lpstore::{OfferResult, StaticData};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -111,7 +113,7 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
             draw_log(frame, body, app);
             PaneLayout::default()
         }
-        Overlay::Filters => {
+        Overlay::Filters | Overlay::DisplayFilters => {
             draw_form(frame, body, app, sdata);
             PaneLayout::default()
         }
@@ -131,6 +133,7 @@ pub fn draw(frame: &mut Frame, app: &App, sdata: &StaticData, stats: &ClientStat
         }
         Overlay::Donate => draw_donate(frame, area),
         Overlay::Export(prompt) => draw_export(frame, area, prompt),
+        Overlay::Search(prompt) => draw_search(frame, area, prompt),
         Overlay::StaticData(dialog) => draw_static_data(frame, area, dialog, &app.data_dir),
         _ => {}
     }
@@ -173,14 +176,16 @@ fn pane_block(name: &str, focused: bool, app: &App) -> Block<'static> {
         .border_style(Style::new().fg(color))
 }
 
-fn corp_name(sdata: &StaticData, corp_id: i32) -> String {
+/// A corporation's name as the panes show it, or its ID when the static data lacks it.
+pub(crate) fn corp_name(sdata: &StaticData, corp_id: i32) -> String {
     sdata
         .corporation_name(corp_id)
         .cloned()
         .unwrap_or_else(|| corp_id.to_string())
 }
 
-fn item_name(sdata: &StaticData, type_id: i32) -> String {
+/// An item's name as the panes show it, or `Type <id>` when the static data lacks it.
+pub(crate) fn item_name(sdata: &StaticData, type_id: i32) -> String {
     sdata
         .type_name(type_id)
         .cloned()
@@ -189,10 +194,16 @@ fn item_name(sdata: &StaticData, type_id: i32) -> String {
 
 fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, app: &App) {
     let keys = match &app.overlay {
+        // Each form says what its Enter does: the filters fetch, the display filters only
+        // re-arrange what was fetched.
         Overlay::Filters => {
-            "Tab/Shift+Tab field  Enter apply  Esc cancel  Ctrl+U clear  Ctrl+C quit"
+            "Tab/Shift+Tab field  Enter fetch  Esc cancel  Ctrl+U clear  Ctrl+C quit"
+        }
+        Overlay::DisplayFilters => {
+            "Tab/Shift+Tab field  Enter re-arrange  Esc cancel  Ctrl+U clear  Ctrl+C quit"
         }
         Overlay::Export(_) => "Enter write  Esc cancel  Ctrl+U clear  Ctrl+C quit",
+        Overlay::Search(_) => "Enter find  Esc cancel  Ctrl+U clear  Ctrl+C quit",
         Overlay::Destinations => "Up/Down scroll  Esc close  Ctrl+C quit",
         Overlay::StaticData(dialog) => {
             if dialog.downloading {
@@ -201,9 +212,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, stats: &ClientStats, app: &App) {
                 "Enter or d download  Esc exit"
             }
         }
-        _ => {
-            "Tab panes  Up/Down move  f filters  e export  m missions  d donate  l log  ? help  q quit"
-        }
+        // Fits 80 columns. `e`, `d`, `l` and the other keys are only in the help, which `?` opens.
+        _ => "Tab panes  ↑↓ move  f filters  v display  s/S sort  m missions  ? help  q quit",
     };
     let lines = vec![
         // The errors come before the limits, so a narrow footer cuts the limits, not the errors.

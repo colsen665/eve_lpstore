@@ -13,7 +13,8 @@ use tokio::task::JoinSet;
 
 /// Fetches the loyalty offers of every corporation in `resolved`, puts the corporations whose
 /// offers are identical in one store, prices each distinct offer once, and groups the stores that
-/// list the same top `resolved.depth` offers.
+/// list the same top offers under [`Resolved::arrangement`]: the top `resolved.depth` of those
+/// that meet its thresholds, with the groups in its sort order.
 ///
 /// Progress goes to `events` as it happens, tagged with `run_id`.
 pub async fn run(
@@ -163,7 +164,9 @@ pub async fn run(
             Store::new(corp_ids, offer_ids, results)
         })
         .collect();
-    Report::new(&resolved.corp_ids, stores, errors, resolved.depth)
+    let mut report = Report::new(&resolved.corp_ids, stores, errors, resolved.depth);
+    report.arrange(&resolved.arrangement());
+    report
 }
 
 /// A store waiting for its offers to be priced: its offer ids, sorted, which is what makes two

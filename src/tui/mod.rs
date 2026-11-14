@@ -9,10 +9,11 @@ mod test_support;
 mod ui;
 
 use crate::output;
-use app::{Action, App, LogLine, RunInfo};
+use app::{Action, App, Direction, LogLine, RunInfo};
 use crossterm::event::{self, Event as TermEvent};
 use eve_lpstore::StaticData;
 use eve_lpstore::esi::EsiClient;
+use eve_lpstore::exclusions;
 use eve_lpstore::export;
 use eve_lpstore::paths::Paths;
 use eve_lpstore::report::{self, Field, LpStoreOptions, OptionError, Report, Resolved, RunEvent};
@@ -125,11 +126,7 @@ fn default_region(sdata: &StaticData) -> String {
 
 /// The filters form as the startup dialog shows it.
 fn startup_form(app: &App, sdata: &StaticData) -> form::FilterForm {
-    form::FilterForm::from_options_with_defaults(
-        &app.applied,
-        &default_region(sdata),
-        report::DEFAULT_DEPTH,
-    )
+    form::FilterForm::from_options_with_defaults(&app.applied, &default_region(sdata))
 }
 
 /// What the view does about the static data before it draws anything.
@@ -172,8 +169,19 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
         .reason()
         .map(|reason| format!("Ignoring the saved filters: {}", reason));
     let mut app = App::new(remembered.merge(cli));
-    if let Some(note) = &ignored {
-        // The run still starts from the command line alone, so this is worth saying but not fatal.
+    // The offers excluded with `x` in earlier sessions, read the same way. An unusable file
+    // excludes nothing, and is left as it is until an exclusion changes, so a file damaged by a
+    // hand edit can still be repaired; the next `x` replaces it with the offers excluded since.
+    let excluded = exclusions::load(&paths.config);
+    let ignored_exclusions = excluded.reason().map(|reason| {
+        format!(
+            "Ignoring the excluded offers until the next x replaces the file: {}",
+            reason
+        )
+    });
+    app.set_excluded(excluded.into_offers());
+    for note in [&ignored, &ignored_exclusions].into_iter().flatten() {
+        // The run still starts without them, so this is worth saying but not fatal.
         app.push_log(LogLine {
             text: note.clone(),
             is_error: true,
@@ -198,8 +206,12 @@ pub async fn run(cli: LpStoreOptions, paths: Paths) -> io::Result<()> {
             let mut form = startup_form(&app, &sdata);
             // The form owns the keyboard and the log panel cannot be opened over it, so a file that
             // could not be read has to be said here or the user never learns their filters were
-            // dropped.
-            form.set_note(ignored);
+            // dropped. Both notes share the place a field error would take, one per line.
+            let notes: Vec<String> = [ignored, ignored_exclusions]
+                .into_iter()
+                .flatten()
+                .collect();
+            form.set_note((!notes.is_empty()).then(|| notes.join("\n")));
             app.show_filters(form);
         }
         Some(reason) => app.open_static_data(reason),
@@ -293,7 +305,15 @@ fn ui_loop(
                 Action::Continue => {}
                 Action::Quit => return Ok(()),
                 Action::Apply => apply(app, session),
+                Action::Arrange => arrange(app, &saved_filters::path(&session.paths.config)),
                 Action::Export => write_export(app, &session.sdata),
+                Action::Find | Action::FindNext => app.find(Direction::Next, &session.sdata),
+                Action::FindPrevious => app.find(Direction::Previous, &session.sdata),
+                Action::SaveExclusions => save_exclusions(
+                    app,
+                    &exclusions::path(&session.paths.config),
+                    &session.sdata,
+                ),
                 Action::Download => {
                     app.start_download();
                     spawn_download(session);
@@ -472,9 +492,9 @@ fn pair_outside_region(pair: Pair, resolved: &Resolved, sdata: &StaticData) -> O
     )
 }
 
-/// Checks every field of the form. If they are all valid, a change to the depth only
-/// re-renders, and any other change replaces the current run with one using the new filters.
-/// Otherwise the errors are shown beside their fields and nothing runs.
+/// Checks every field of the fetch form. If they are all valid and none of them changed, the
+/// report on screen is only re-arranged, and any change replaces the current run with one using
+/// the new filters. Otherwise the errors are shown beside their fields and nothing runs.
 fn apply(app: &mut App, session: &mut Session) {
     let mut options = app.form.to_options(&app.applied);
     let mut resolved = match options.resolve(&session.sdata) {
@@ -497,10 +517,15 @@ fn apply(app: &mut App, session: &mut Session) {
         }
     }
     if is_repeat(app.run.is_some(), &options, &app.applied) {
-        app.apply_depth(resolved.depth);
+        let settings = resolved.arrangement();
+        app.rearrange(|arrangement| {
+            arrangement.depth = settings.depth;
+            arrangement.filter = settings.filter;
+            arrangement.lp_budget = settings.lp_budget;
+        });
     } else {
         let info = run_info(&resolved);
-        let depth = resolved.depth;
+        let arrangement = resolved.arrangement();
         let id = session.next_id;
         session.next_id += 1;
         let next = spawn_run(
@@ -513,15 +538,25 @@ fn apply(app: &mut App, session: &mut Session) {
         if let Some(pipeline) = session.current.replace(next).and_then(|run| run.pipeline) {
             pipeline.abort();
         }
-        app.start_run(info, filter_summary(&options), depth);
+        app.start_run(info, filter_summary(&options), arrangement);
     }
     app.applied = options;
     app.close_form();
     remember(app, &saved_filters::path(&session.paths.config));
 }
 
-/// Keeps the filters this run was applied with, so the next session's dialog starts from them. Both
-/// branches reach it, including a depth-only apply, because "applied" is what the user pressed.
+/// Applies the display form to the report on hand and, when its values were valid, remembers the
+/// options the way [`apply`] does. It never starts a run. Split from the loop and given its path
+/// so it can be tested without a terminal or a runtime.
+fn arrange(app: &mut App, file: &Path) {
+    if app.apply_display_form() {
+        remember(app, file);
+    }
+}
+
+/// Keeps the filters this run was applied with, so the next session's dialog starts from them.
+/// Every apply reaches it, including one that only re-arranges, because "applied" is what the
+/// user pressed.
 ///
 /// A failure is only worth a log line. The run is already going, and being unable to remember it is
 /// not a reason to stop the view. Split from the loop and given its path so the write can be tested
@@ -530,6 +565,21 @@ fn remember(app: &mut App, file: &Path) {
     if let Err(error) = saved_filters::save_to(file, &app.applied) {
         app.push_log(LogLine {
             text: format!("Could not save the filters: {}", error),
+            is_error: true,
+        });
+    }
+}
+
+/// Keeps the offers excluded with `x`, so the next session starts with them, each named by its
+/// item for a reader of the file. Like [`remember`], a failure is only a log line: the exclusion
+/// already applies to the view, and only its keeping failed. Split from the loop and given its
+/// path so the write can be tested without a terminal.
+fn save_exclusions(app: &mut App, file: &Path, sdata: &StaticData) {
+    if let Err(error) =
+        exclusions::save_to(file, &app.excluded, |type_id| ui::item_name(sdata, type_id))
+    {
+        app.push_log(LogLine {
+            text: format!("Could not save the excluded offers: {}", error),
             is_error: true,
         });
     }
@@ -545,12 +595,8 @@ fn write_export(app: &mut App, sdata: &StaticData) {
     let Some(report) = app.report.as_ref() else {
         return;
     };
-    let context = export::ExportContext {
-        region: app.region(),
-        filters: &app.filters,
-        depth: app.depth,
-    };
-    let offers = export::offer_count(report, app.depth);
+    let context = export::ExportContext::new(app.region(), &app.filters, report.arrangement());
+    let offers = export::offer_count(report, context.depth);
     let text = match request.format {
         export::ExportFormat::Csv => export::csv(report, &context, sdata),
         export::ExportFormat::Json => export::json(report, &context, sdata),
@@ -577,31 +623,44 @@ fn run_info(resolved: &Resolved) -> RunInfo {
     }
 }
 
-/// Whether two sets of options start the same run. Depth only changes what is shown.
+/// Whether two sets of options start the same run. The options [`Field::changes_fetch`] leaves
+/// out, the depth, the LP budget, the thresholds, and the sort, only change what is shown.
 fn same_run(a: &LpStoreOptions, b: &LpStoreOptions) -> bool {
-    let mut a = a.clone();
-    let mut b = b.clone();
-    a.depth = None;
-    b.depth = None;
-    a == b
+    let fetched = |options: &LpStoreOptions| {
+        let mut options = options.clone();
+        for field in Field::ALL
+            .into_iter()
+            .filter(|field| !field.changes_fetch())
+        {
+            *options.value_mut(field) = None;
+        }
+        options
+    };
+    fetched(a) == fetched(b)
 }
 
 /// Whether applying `options` only changes what is already on screen. The first Enter is never a
 /// repeat, even when the form holds exactly the options the view started with, because nothing has
-/// been fetched yet: matching on `same_run` alone would take the depth-only branch and leave the
+/// been fetched yet: matching on `same_run` alone would take the re-arrange branch and leave the
 /// view with no run at all.
 fn is_repeat(has_run: bool, options: &LpStoreOptions, applied: &LpStoreOptions) -> bool {
     has_run && same_run(options, applied)
 }
 
-/// The filters the run was started with, written the way they are on the command line, in the
-/// form's order. The market region has its own place in the header, and depth and the cache
-/// minutes change no corporation or price, so those three are left out.
+/// The filters in force, written the way they are on the command line, in the forms' order. The
+/// market region has its own place in the header, and the depth, the LP budget, and the cache
+/// minutes change no corporation, price, or listed offer, so those four are left out. The
+/// thresholds stay, since they hide offers.
 fn filter_summary(options: &LpStoreOptions) -> String {
     let set: Vec<String> = Field::ALL
         .into_iter()
         .filter(|field| field.in_form())
-        .filter(|field| !matches!(field, Field::Region | Field::Depth | Field::CacheMinutes))
+        .filter(|field| {
+            !matches!(
+                field,
+                Field::Region | Field::Depth | Field::LpBudget | Field::CacheMinutes
+            )
+        })
         .filter_map(|field| {
             let value = options.value(field).as_ref()?;
             Some(format!("{} {}", field.flag(), value))
@@ -619,8 +678,10 @@ mod tests {
     use super::*;
     use crate::tui::app::{Overlay, Stage};
     use crate::tui::test_support::{
-        forge_run, open_prompt, open_prompt_mut, priced_offer, results_app,
+        forge_run, open_prompt, open_prompt_mut, press, priced_offer, results_app,
     };
+    use crossterm::event::KeyCode;
+    use eve_lpstore::report::Arrangement;
     use eve_lpstore::static_data::AgentFilter;
     use std::path::PathBuf;
 
@@ -972,7 +1033,7 @@ mod tests {
     fn a_failed_remember_is_only_a_log_line() {
         // The run is already going, so a file that cannot be written must not stop the view.
         let mut app = App::new(LpStoreOptions::default());
-        app.start_run(forge_run(1), "none".to_string(), 10);
+        app.start_run(forge_run(1), "none".to_string(), Arrangement::depth(10));
         let (path, blocker) = unwritable_path("blocked_remember");
         remember(&mut app, &path);
         assert_eq!(app.stage, Stage::Starting, "the run is untouched");
@@ -980,6 +1041,44 @@ mod tests {
         assert!(line.is_error);
         assert!(
             line.text.contains("Could not save the filters"),
+            "{}",
+            line.text
+        );
+        std::fs::remove_file(&blocker).unwrap();
+    }
+
+    #[test]
+    fn an_exclusion_is_saved_with_its_item_name_and_read_back() {
+        let file = PathBuf::from(format!("{}.json", temp_path("exclusions")));
+        let mut app = results_app(vec![priced_offer(Some(12.5), None, None)], 10);
+        assert_eq!(
+            app.on_key(press(KeyCode::Char('x'))),
+            Action::SaveExclusions
+        );
+        save_exclusions(&mut app, &file, &StaticData::default());
+        assert!(app.log.back().is_none(), "a save that worked says nothing");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("\"item\": \"Type 30486\""), "{text}");
+        let loaded = exclusions::load_from(&file).into_offers();
+        assert_eq!(loaded, exclusions::Excluded::from([(1, 30486)]));
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn a_failed_exclusion_save_is_only_a_log_line() {
+        let mut app = results_app(vec![priced_offer(Some(12.5), None, None)], 10);
+        app.on_key(press(KeyCode::Char('x')));
+        let (path, blocker) = unwritable_path("blocked_exclusions");
+        save_exclusions(&mut app, &path, &StaticData::default());
+        assert_eq!(
+            app.excluded,
+            exclusions::Excluded::from([(1, 30486)]),
+            "the exclusion still applies"
+        );
+        let line = app.log.back().expect("the failure is reported");
+        assert!(line.is_error);
+        assert!(
+            line.text.contains("Could not save the excluded offers"),
             "{}",
             line.text
         );
@@ -1007,7 +1106,16 @@ mod tests {
             "Caldari Navy",
             "the file fills the rest"
         );
-        assert_eq!(form.value(Field::Depth), "20");
+        assert_eq!(
+            form.value(Field::Depth),
+            "",
+            "the depth is on the display form"
+        );
+        assert_eq!(
+            form::FilterForm::display(&app.applied).value(Field::Depth),
+            "20",
+            "which the file fills too"
+        );
         assert_eq!(
             app.filters, "--lpstore Caldari Navy",
             "the remembered filter shows in the header"
@@ -1032,6 +1140,82 @@ mod tests {
     }
 
     #[test]
+    fn no_display_field_changes_the_run() {
+        let base = LpStoreOptions::default();
+        for field in Field::ALL
+            .into_iter()
+            .filter(|field| !field.changes_fetch())
+        {
+            let mut changed = base.clone();
+            *changed.value_mut(field) = Some("5".to_string());
+            assert!(same_run(&changed, &base), "{field:?} started a run");
+            assert!(is_repeat(true, &changed, &base), "{field:?}");
+        }
+        for field in Field::ALL.into_iter().filter(|field| field.changes_fetch()) {
+            let mut changed = base.clone();
+            *changed.value_mut(field) = Some("5".to_string());
+            assert!(!same_run(&changed, &base), "{field:?} did not start a run");
+        }
+    }
+
+    #[test]
+    fn the_header_summary_keeps_the_thresholds_and_leaves_out_the_depth_and_budget() {
+        let options = LpStoreOptions {
+            faction: Some("caldari".to_string()),
+            depth: Some("5".to_string()),
+            lp_budget: Some("1M".to_string()),
+            max_spread: Some("20".to_string()),
+            min_volume: Some("1k".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            filter_summary(&options),
+            "--faction caldari --max-spread 20 --min-volume 1k"
+        );
+    }
+
+    #[test]
+    fn applying_the_display_form_re_arranges_without_a_run_and_is_remembered() {
+        let file = PathBuf::from(format!("{}.json", temp_path("arrange")));
+        let mut wide = priced_offer(Some(80.0), None, None);
+        wide.offer.offer_id = 2;
+        wide.isk_per_lp = Some(2000.0);
+        let mut app = results_app(vec![priced_offer(Some(12.5), None, None), wide], 10);
+        let stage = app.stage;
+        assert_eq!(app.offer_count(), 2);
+        app.open_display_form();
+        app.form.set_value(Field::MaxSpread, "20");
+        arrange(&mut app, &file);
+        assert_eq!(app.overlay, Overlay::None, "the form closed");
+        assert_eq!(app.stage, stage, "no run started");
+        assert!(!app.stale, "nothing on screen was superseded");
+        assert_eq!(app.offer_count(), 1, "the wide offer is hidden");
+        assert_eq!(app.arrangement.filter.max_spread, Some(20.0));
+        assert_eq!(app.applied.max_spread.as_deref(), Some("20"));
+        assert_eq!(app.filters, "--max-spread 20", "the header names it");
+        let loaded = saved_filters::load_from(&file);
+        let saved_filters::Loaded::Filters(filters) = &loaded else {
+            panic!("expected the display filters to be remembered");
+        };
+        assert_eq!(filters.value(Field::MaxSpread).as_deref(), Some("20"));
+        assert_eq!(filters.value(Field::LpBudget).as_deref(), Some("1000"));
+        std::fs::remove_file(&file).unwrap();
+
+        // A bad value stays on the form beside its field, and nothing is written.
+        app.open_display_form();
+        app.form.set_value(Field::MinVolume, "lots");
+        arrange(&mut app, &file);
+        assert_eq!(app.overlay, Overlay::DisplayFilters);
+        assert!(
+            app.form
+                .error_for(form::FormField::Text(Field::MinVolume))
+                .is_some()
+        );
+        assert!(!file.exists(), "an invalid form is not remembered");
+        assert_eq!(app.applied.min_volume, None);
+    }
+
+    #[test]
     fn the_first_enter_starts_a_run_even_unchanged() {
         let base = LpStoreOptions::default();
         let deeper = LpStoreOptions {
@@ -1042,9 +1226,9 @@ mod tests {
             region: Some("Domain".to_string()),
             ..Default::default()
         };
-        // The startup form holds the command line options with two defaults filled in, so an
+        // The startup form holds the command line options with the default region filled in, so an
         // unchanged Enter matches `same_run` against `applied`. Without the has_run guard the view
-        // would take the depth-only branch and never fetch anything.
+        // would take the re-arrange branch and never fetch anything.
         assert!(!is_repeat(false, &base, &base), "nothing has run yet");
         assert!(!is_repeat(false, &deeper, &base));
         assert!(is_repeat(true, &base, &base), "a repeat re-renders");
@@ -1335,6 +1519,9 @@ mod tests {
             tasks: 2,
             max_inflight: 4,
             depth: 10,
+            filter: Default::default(),
+            lp_budget: 1000,
+            sort: Default::default(),
             expire: false,
             verbose: false,
         }
@@ -1357,7 +1544,11 @@ mod tests {
         let form = startup_form(&app, &StaticData::default());
         assert_eq!(form.value(Field::Faction), "caldari");
         assert_eq!(form.value(Field::Region), "10000002");
-        assert_eq!(form.value(Field::Depth), "10");
+        assert_eq!(
+            form.value(Field::Depth),
+            "",
+            "the depth is on the display form"
+        );
         assert_eq!(
             form.value(Field::Lpstore),
             "",

@@ -46,6 +46,7 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
             lines.push((output::corporation_label(sdata, id), plain));
         }
         lines.push((String::new(), plain));
+        lines.extend(group_entries(group, &app.arrangement));
         return lines;
     }
     for &id in &group.corp_ids {
@@ -163,6 +164,39 @@ fn detail_entries(app: &App, sdata: &StaticData) -> Vec<(String, Style)> {
             }
         }
         None => lines.push(("No offers were priced for this group.".to_string(), plain)),
+    }
+    // After the offer, so the offer's figures stay in view on a small terminal.
+    lines.extend(group_entries(group, &app.arrangement));
+    lines
+}
+
+/// The Group block: the figures the groups can be sorted by, and what the LP budget realizes on
+/// the offers the group lists, as the text report prints it.
+fn group_entries(group: &Group, arrangement: &Arrangement) -> Vec<(String, Style)> {
+    let plain = Style::new();
+    let mut lines = vec![
+        (String::new(), plain),
+        ("Group".to_string(), Style::new().bold()),
+        (
+            format!(
+                "Average ISK/LP: {} | Best ISK/LP: {}",
+                optional(group.average_isk_per_lp(arrangement.depth)),
+                optional(group.best_isk_per_lp())
+            ),
+            plain,
+        ),
+        (
+            format!(
+                "Profit ±10%, listed offers: {}",
+                group
+                    .profit_within_10()
+                    .map_or_else(|| "n/a".to_string(), format_isk)
+            ),
+            plain,
+        ),
+    ];
+    if let Some(line) = output::budget_line(group, arrangement.lp_budget) {
+        lines.push((line, plain));
     }
     lines
 }

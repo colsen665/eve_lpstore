@@ -451,6 +451,54 @@ mod tests {
     }
 
     #[test]
+    fn the_display_filters_round_trip_and_an_older_file_loads_without_them() {
+        let options = LpStoreOptions {
+            region: Some("Domain".to_string()),
+            depth: Some("5".to_string()),
+            lp_budget: Some("1M".to_string()),
+            min_isk_per_lp: Some("1.2k".to_string()),
+            max_spread: Some("20".to_string()),
+            min_imbalance: Some("-10".to_string()),
+            min_volume: Some("1k".to_string()),
+            min_profit: Some("50M".to_string()),
+            sort: Some("budget".to_string()),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&SavedFilters::from(&options)).unwrap();
+        for key in [
+            "lp_budget",
+            "min_isk_per_lp",
+            "max_spread",
+            "min_imbalance",
+            "min_volume",
+            "min_profit",
+        ] {
+            assert!(
+                text.contains(&format!("\"{key}\"")),
+                "{key} is not kept: {text}"
+            );
+        }
+        assert!(
+            !text.contains("\"sort\""),
+            "the sort is the session's, not the file's"
+        );
+        let back: SavedFilters = serde_json::from_str(&text).unwrap();
+        let without_sort = LpStoreOptions {
+            sort: None,
+            ..options
+        };
+        assert_eq!(back, SavedFilters::from(&without_sort));
+        assert_eq!(back.overlay(&LpStoreOptions::default()), without_sort);
+
+        // The file the previous version wrote, before the display filters had keys.
+        let older = r#"{"lpstore": null, "region": "Domain", "depth": "25"}"#;
+        let filters: SavedFilters = serde_json::from_str(older).unwrap();
+        assert_eq!(filters.value(Field::Depth).as_deref(), Some("25"));
+        assert_eq!(*filters.value(Field::LpBudget), None);
+        assert_eq!(*filters.value(Field::MaxSpread), None);
+    }
+
+    #[test]
     fn a_field_missing_from_the_file_loads_as_absent() {
         // A file from an older version, or one edited by hand, must still load.
         let filters: SavedFilters = serde_json::from_str("{\"region\": \"Domain\"}").unwrap();

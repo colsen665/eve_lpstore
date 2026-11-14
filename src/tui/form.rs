@@ -1,9 +1,51 @@
-//! The filter form of the `--tui` view. It holds the text the user types and turns it into
-//! `LpStoreOptions`. Whether the values name real things is decided later, by `resolve`.
+//! The two forms of the `--tui` view: the filters, which decide what a run fetches and prices, and
+//! the display filters, which only arrange what was priced. Each holds the text the user types and
+//! turns it into `LpStoreOptions`. Whether the values name real things is decided later, by
+//! `resolve` or `parse`.
 
-use eve_lpstore::report::{Field, LpStoreOptions, OptionError};
+use eve_lpstore::report::{DEFAULT_DEPTH, DEFAULT_LP_BUDGET, Field, LpStoreOptions, OptionError};
 
-/// A field of the form: one of the options [`Field::in_form`] names, or the expire toggle.
+/// Which of the two forms a [`FilterForm`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormKind {
+    /// The fields that change what is fetched, opened with `f` and at startup. Enter starts a run.
+    Fetch,
+    /// The fields that only arrange the priced offers: the depth, the LP budget, and the
+    /// thresholds. Opened with `v`. Enter re-arranges the report on hand and never fetches.
+    Display,
+}
+
+impl FormKind {
+    /// The fields of this form, in the order it shows them and Tab moves through them, which is
+    /// the order of [`Field::ALL`]. The fetch form ends with `Expire`, so the space toggle is always
+    /// its final stop.
+    pub fn fields(self) -> Vec<FormField> {
+        let texts = Field::ALL
+            .into_iter()
+            .filter(|&field| self.holds(field))
+            .map(FormField::Text);
+        match self {
+            FormKind::Fetch => texts.chain([FormField::Expire]).collect(),
+            FormKind::Display => texts.collect(),
+        }
+    }
+
+    /// Whether this form has a box for `field`: a field some form shows, on the side of
+    /// [`Field::changes_fetch`] this form stands for.
+    pub fn holds(self, field: Field) -> bool {
+        field.in_form() && field.changes_fetch() == (self == FormKind::Fetch)
+    }
+
+    /// The form's title, as its border shows it.
+    pub fn title(self) -> &'static str {
+        match self {
+            FormKind::Fetch => " Filters ",
+            FormKind::Display => " Display filters ",
+        }
+    }
+}
+
+/// A field of a form: one of the options [`Field::in_form`] names, or the expire toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormField {
     Text(Field),
@@ -11,35 +53,18 @@ pub enum FormField {
 }
 
 impl FormField {
-    /// The fields in the order the dialog shows them and Tab moves through them, which is the
-    /// order of [`Field::ALL`]: which corporations and agents, then where the prices are read from,
-    /// then how the results are shown. `Expire` stays last so the space toggle is always the final
-    /// stop.
-    pub fn all() -> Vec<FormField> {
-        Field::ALL
-            .into_iter()
-            .filter(|field| field.in_form())
-            .map(FormField::Text)
-            .chain([FormField::Expire])
-            .collect()
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             FormField::Text(field) => field.spec().form_label.unwrap_or_else(|| field.flag()),
             FormField::Expire => "Expire cache",
         }
     }
-
-    /// The form field an option error about `field` belongs to, if one does.
-    fn of(field: Field) -> Option<FormField> {
-        field.in_form().then_some(FormField::Text(field))
-    }
 }
 
-/// The filters and depth being edited, and the problems found when they were last applied.
+/// The fields being edited in one form, and the problems found when they were last applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterForm {
+    pub kind: FormKind,
     pub focus: FormField,
     /// The text of every field, held as the options it stands for. A field typed empty is
     /// `Some("")` here and becomes unset in [`to_options`](Self::to_options).
@@ -49,46 +74,71 @@ pub struct FilterForm {
 }
 
 impl FilterForm {
+    /// The fetch form, holding the values `options` gives its fields.
     pub fn from_options(options: &LpStoreOptions) -> Self {
+        Self::of_kind(FormKind::Fetch, options)
+    }
+
+    /// The display form, holding the values `options` gives its fields. The depth and the LP
+    /// budget carry the values the view uses when they are not set, so the form shows what is in
+    /// force; the thresholds stay empty, since an empty threshold is no threshold.
+    pub fn display(options: &LpStoreOptions) -> Self {
+        let mut form = Self::of_kind(FormKind::Display, options);
+        form.typed
+            .depth
+            .get_or_insert_with(|| DEFAULT_DEPTH.to_string());
+        form.typed
+            .lp_budget
+            .get_or_insert_with(|| DEFAULT_LP_BUDGET.to_string());
+        form
+    }
+
+    fn of_kind(kind: FormKind, options: &LpStoreOptions) -> Self {
         let mut typed = LpStoreOptions {
             expire: options.expire,
             ..Default::default()
         };
-        for field in Field::ALL.into_iter().filter(|field| field.in_form()) {
+        for field in Field::ALL.into_iter().filter(|&field| kind.holds(field)) {
             *typed.value_mut(field) = options.value(field).clone();
         }
         Self {
-            focus: FormField::all()[0],
+            kind,
+            focus: kind.fields()[0],
             typed,
             errors: Vec::new(),
             general_error: None,
         }
     }
 
-    /// The form as the startup dialog shows it: region and depth carry the values the run would
-    /// use when they are not set, so the user sees what is about to happen instead of two blank
-    /// fields standing for invisible defaults. Every other field stays empty, because for those
-    /// an empty field is the default, meaning all corporations or any security status, and
-    /// writing one out would suggest a filter is in force when none is.
-    pub fn from_options_with_defaults(
-        options: &LpStoreOptions,
-        region: &str,
-        depth: usize,
-    ) -> Self {
+    /// The fetch form as the startup dialog shows it: the region carries the value the run would
+    /// use when it is not set, so the user sees what is about to happen instead of a blank field
+    /// standing for an invisible default. Every other field stays empty, because for those an
+    /// empty field is the default, meaning all corporations or any security status, and writing
+    /// one out would suggest a filter is in force when none is.
+    pub fn from_options_with_defaults(options: &LpStoreOptions, region: &str) -> Self {
         let mut form = Self::from_options(options);
         form.typed.region.get_or_insert_with(|| region.to_string());
-        form.typed.depth.get_or_insert_with(|| depth.to_string());
         form
+    }
+
+    /// The fields this form shows, in order.
+    pub fn fields(&self) -> Vec<FormField> {
+        self.kind.fields()
     }
 
     /// The options the form describes. Blank fields are unset. The options the form does not
     /// show come from `base`.
     pub fn to_options(&self, base: &LpStoreOptions) -> LpStoreOptions {
         let mut options = base.clone();
-        for field in Field::ALL.into_iter().filter(|field| field.in_form()) {
+        for field in Field::ALL
+            .into_iter()
+            .filter(|&field| self.kind.holds(field))
+        {
             *options.value_mut(field) = blank_to_none(self.value(field));
         }
-        options.expire = self.typed.expire;
+        if self.kind == FormKind::Fetch {
+            options.expire = self.typed.expire;
+        }
         options
     }
 
@@ -123,13 +173,12 @@ impl FilterForm {
     }
 
     pub fn next_field(&mut self) {
-        self.focus = step(self.focus, 1);
+        self.focus = step(&self.fields(), self.focus, 1);
     }
 
     pub fn previous_field(&mut self) {
-        self.focus = step(self.focus, -1);
+        self.focus = step(&self.fields(), self.focus, -1);
     }
-
     /// Types `c` into the focused field. On the expire option, a space toggles it instead.
     pub fn type_char(&mut self, c: char) {
         let focus = self.focus;
@@ -171,9 +220,11 @@ impl FilterForm {
         self.errors.clear();
         self.general_error = None;
         for error in errors {
-            match FormField::of(error.field) {
-                Some(field) => self.errors.push((field, error.message)),
-                None => self.general_error = Some(error.message),
+            if self.kind.holds(error.field) {
+                self.errors
+                    .push((FormField::Text(error.field), error.message));
+            } else {
+                self.general_error = Some(error.message);
             }
         }
     }
@@ -216,8 +267,7 @@ impl FilterForm {
     }
 }
 
-fn step(field: FormField, delta: isize) -> FormField {
-    let all = FormField::all();
+fn step(all: &[FormField], field: FormField, delta: isize) -> FormField {
     let index = all
         .iter()
         .position(|&candidate| candidate == field)
@@ -269,12 +319,98 @@ mod tests {
         let options = FilterForm::from_options(&built_from).to_options(&base);
         assert_eq!(options.tasks.as_deref(), Some("2"));
         assert_eq!(options.cache_dir, None);
-        for field in FormField::all() {
-            assert_ne!(field.label(), "", "{field:?} has a label");
-            if let FormField::Text(field) = field {
-                assert!(field.in_form());
+        for kind in [FormKind::Fetch, FormKind::Display] {
+            for field in kind.fields() {
+                assert_ne!(field.label(), "", "{field:?} has a label");
+                if let FormField::Text(field) = field {
+                    assert!(field.in_form());
+                    assert!(kind.holds(field));
+                }
             }
         }
+    }
+
+    #[test]
+    fn the_two_forms_split_the_fields_by_whether_they_change_the_fetch() {
+        let labels = |kind: FormKind| -> Vec<&str> {
+            kind.fields().iter().map(|field| field.label()).collect()
+        };
+        assert_eq!(
+            labels(FormKind::Display),
+            [
+                "Depth",
+                "LP budget",
+                "Min ISK/LP",
+                "Max spread %",
+                "Min imbalance",
+                "Min volume",
+                "Min profit",
+            ]
+        );
+        let fetch = FormKind::Fetch.fields();
+        assert_eq!(fetch.len(), 12);
+        assert!(!fetch.contains(&FormField::Text(Field::Depth)));
+        for field in Field::ALL.into_iter().filter(|field| field.in_form()) {
+            assert_ne!(
+                FormKind::Fetch.holds(field),
+                FormKind::Display.holds(field),
+                "{field:?} is on exactly one form"
+            );
+        }
+        assert!(
+            !Field::Sort.in_form(),
+            "the sort is set on the command line and with s"
+        );
+    }
+
+    #[test]
+    fn the_display_form_shows_the_depth_and_budget_in_force_and_carries_only_its_own_fields() {
+        let applied = LpStoreOptions {
+            region: Some("Domain".to_string()),
+            max_spread: Some("20".to_string()),
+            expire: true,
+            ..Default::default()
+        };
+        let mut form = FilterForm::display(&applied);
+        assert_eq!(form.focus, FormField::Text(Field::Depth));
+        assert_eq!(form.value(Field::Depth), "10");
+        assert_eq!(form.value(Field::LpBudget), "1000");
+        assert_eq!(form.value(Field::MaxSpread), "20");
+        assert_eq!(form.value(Field::MinVolume), "", "no threshold is invented");
+        assert_eq!(form.value(Field::Region), "", "not a display field");
+        form.set_value(Field::MinVolume, "1k");
+        form.set_value(Field::MaxSpread, " ");
+        let options = form.to_options(&applied);
+        assert_eq!(options.region.as_deref(), Some("Domain"));
+        assert!(options.expire, "the fetch form's toggle is left alone");
+        assert_eq!(options.min_volume.as_deref(), Some("1k"));
+        assert_eq!(options.max_spread, None);
+        assert_eq!(options.lp_budget.as_deref(), Some("1000"));
+        form.previous_field();
+        assert_eq!(
+            form.focus,
+            FormField::Text(Field::MinProfit),
+            "Tab wraps within the display form"
+        );
+        form.set_errors(vec![
+            OptionError {
+                field: Field::MinVolume,
+                message: "bad volume".to_string(),
+            },
+            OptionError {
+                field: Field::Region,
+                message: "bad region".to_string(),
+            },
+        ]);
+        assert_eq!(
+            form.error_for(FormField::Text(Field::MinVolume)).as_deref(),
+            Some("bad volume")
+        );
+        assert_eq!(
+            form.general_error(),
+            Some("bad region"),
+            "a field this form has no box for is a general error"
+        );
     }
 
     #[test]
@@ -361,14 +497,14 @@ mod tests {
     }
 
     #[test]
-    fn defaults_fill_region_and_depth_only() {
+    fn defaults_fill_the_region_only() {
         let options = LpStoreOptions {
             faction: Some("caldari".to_string()),
             ..Default::default()
         };
-        let form = FilterForm::from_options_with_defaults(&options, "The Forge", 10);
+        let form = FilterForm::from_options_with_defaults(&options, "The Forge");
         assert_eq!(form.value(Field::Region), "The Forge");
-        assert_eq!(form.value(Field::Depth), "10");
+        assert_eq!(form.value(Field::Depth), "", "the depth is a display field");
         // The filters keep their meaning of "no filter", so an empty field is not a value.
         assert_eq!(form.value(Field::Lpstore), "");
         assert_eq!(form.value(Field::Security), "");
@@ -390,17 +526,17 @@ mod tests {
             depth: Some("25".to_string()),
             ..Default::default()
         };
-        let form = FilterForm::from_options_with_defaults(&options, "The Forge", 10);
+        let form = FilterForm::from_options_with_defaults(&options, "The Forge");
         assert_eq!(form.value(Field::Region), "Domain");
-        assert_eq!(form.value(Field::Depth), "25");
+        assert_eq!(FilterForm::display(&options).value(Field::Depth), "25");
     }
 
     #[test]
     fn the_prefilled_defaults_round_trip_back_to_options() {
         // Pre-filling must not invent a filter: the form has to give back options whose only
-        // additions over the command line are the two defaults it was handed.
+        // addition over the command line is the default region it was handed.
         let blank = LpStoreOptions::default();
-        let form = FilterForm::from_options_with_defaults(&blank, "The Forge", 10);
+        let form = FilterForm::from_options_with_defaults(&blank, "The Forge");
         let applied = form.to_options(&blank);
         assert_eq!(applied.lpstore, None);
         assert_eq!(applied.security, None);
@@ -410,7 +546,7 @@ mod tests {
         assert_eq!(applied.faction, None);
         assert_eq!(applied.system, None);
         assert_eq!(applied.region.as_deref(), Some("The Forge"));
-        assert_eq!(applied.depth.as_deref(), Some("10"));
+        assert_eq!(applied.depth, None);
     }
 
     #[test]
@@ -469,7 +605,11 @@ mod tests {
         assert_eq!(FormField::Text(Field::System).label(), "Market system");
         // Both names fit the dialog's label column, so grouping costs no layout change.
         let column = crate::tui::ui::LABEL_WIDTH;
-        for field in FormField::all() {
+        for field in FormKind::Fetch
+            .fields()
+            .into_iter()
+            .chain(FormKind::Display.fields())
+        {
             assert!(
                 field.label().chars().count() <= column,
                 "{:?} does not fit {} columns",
@@ -478,7 +618,8 @@ mod tests {
             );
         }
         let position = |wanted| {
-            FormField::all()
+            FormKind::Fetch
+                .fields()
                 .iter()
                 .position(|field| *field == wanted)
                 .unwrap()
@@ -492,32 +633,40 @@ mod tests {
         assert!(
             position(FormField::Text(Field::Faction)) < position(FormField::Text(Field::Region))
         );
-        assert!(position(FormField::Text(Field::Region)) < position(FormField::Text(Field::Depth)));
+        assert!(
+            position(FormField::Text(Field::System))
+                < position(FormField::Text(Field::CacheMinutes))
+        );
     }
 
     #[test]
     fn the_two_place_filters_sit_directly_below_security() {
-        let names: Vec<&str> = FormField::all().iter().map(|field| field.label()).collect();
+        let names: Vec<&str> = FormKind::Fetch
+            .fields()
+            .iter()
+            .map(|field| field.label())
+            .collect();
         assert_eq!(
             &names[1..5],
             ["Security", "Agent region", "Agent system", "Agent level"],
             "the dialog order is what the request asked for: {names:?}"
         );
         let position = |field| {
-            FormField::all()
+            FormKind::Fetch
+                .fields()
                 .iter()
                 .position(|candidate| *candidate == field)
                 .unwrap()
         };
         assert_eq!(
-            position(FormField::Text(Field::Depth)) + 1,
+            position(FormField::Text(Field::System)) + 1,
             position(FormField::Text(Field::CacheMinutes))
         );
         assert_eq!(
             position(FormField::Text(Field::CacheMinutes)) + 1,
             position(FormField::Expire)
         );
-        assert_eq!(FormField::all().len(), 13);
+        assert_eq!(FormKind::Fetch.fields().len(), 12);
     }
 
     #[test]
